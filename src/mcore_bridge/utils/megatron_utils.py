@@ -6,6 +6,10 @@ from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.transformer.module import Float16Module
 from typing import Optional
 
+from .logger import get_logger
+
+logger = get_logger()
+
 
 def unwrap_model(models, module_instances=None):
     """Unwrap_model to return the final model instance"""

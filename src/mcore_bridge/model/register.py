@@ -11,7 +11,7 @@ from torch import nn
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from mcore_bridge.bridge import GPTBridge
-from mcore_bridge.config import ModelConfig, get_mcore_model_config
+from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
 from .constant import MLLMModelType
@@ -45,35 +45,33 @@ def register_model(model_meta: ModelMeta, *, exist_ok: bool = False):
     model_type = model_meta.model_type
     if not exist_ok and model_type in MODEL_MAPPING:
         raise ValueError(f'The `{model_type}` has already been registered in the MODEL_MAPPING.')
-    MODEL_MAPPING[model_type] = model_type
+    MODEL_MAPPING[model_type] = model_meta
 
 
 _MODEL_META_MAPPING = None
 
 
-def get_model_meta(model_type: str) -> Optional[ModelMeta]:
+def get_model_meta(hf_model_type: str) -> Optional[ModelMeta]:
     global _MODEL_META_MAPPING
     if _MODEL_META_MAPPING is None:
         _MODEL_META_MAPPING = {}
         for k, model_meta in MODEL_MAPPING.items():
             for _model_type in model_meta.model_types:
                 _MODEL_META_MAPPING[_model_type] = k
-    if model_type not in _MODEL_META_MAPPING:
+    if hf_model_type not in _MODEL_META_MAPPING:
         return
-    return MODEL_MAPPING[_MODEL_META_MAPPING[model_type]]
+    return MODEL_MAPPING[_MODEL_META_MAPPING[hf_model_type]]
 
 
 class ModelLoader:
     model_cls = None
 
-    def __init__(self, args, hf_config):
+    def __init__(self, config: ModelConfig):
         from mcore_bridge.model import GPTModel, MultimodalGPTModel
-        self.args = args
-        self.hf_config = hf_config
-        self.config = get_mcore_model_config(args, hf_config)
         self.mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
+        self.config = config
         if self.model_cls is None:
-            self.model_cls = MultimodalGPTModel if self.args.is_multimodal else GPTModel
+            self.model_cls = MultimodalGPTModel if config.is_multimodal else GPTModel
 
     def _replace_spec_dsa(self, layer_spec):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -106,7 +104,7 @@ class ModelLoader:
         kwargs = {'qk_l2_norm': config.qk_l2_norm} if self.mcore_013 else {}
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             config.num_moe_experts,
-            self.args.moe_grouped_gemm,
+            config.moe_grouped_gemm,
             config.qk_layernorm,
             config.multi_latent_attention,
             **kwargs,
@@ -142,7 +140,7 @@ class ModelLoader:
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
         self._set_shared_expert_gate(transformer_layer_spec)
         mtp_block_spec = None
-        if self.args.mtp_num_layers is not None:
+        if self.config.mtp_num_layers is not None:
             mtp_block_spec = self.get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)
         model = self.model_cls(
             config=self.config,

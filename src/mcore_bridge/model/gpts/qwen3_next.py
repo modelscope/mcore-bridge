@@ -88,7 +88,7 @@ class Qwen3NextRMSNorm(torch.nn.Module):
 
 class Qwen3NextSelfAttention(SelfAttention):
 
-    def __init__(self, config: MegatronModelConfig, submodules: SelfAttentionSubmodules, *args, **kwargs):
+    def __init__(self, config: ModelConfig, submodules: SelfAttentionSubmodules, *args, **kwargs):
         super(SelfAttention, self).__init__(config, submodules, *args, attention_type='self', **kwargs)
         kwargs = {}
         if mcore_015:

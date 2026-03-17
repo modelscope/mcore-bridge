@@ -111,6 +111,7 @@ peft_models = [get_peft_model(mg_model, lora_config) for mg_model in mg_models]
 print(f'peft_model: {peft_models[0]}')
 # Load LoRA (Optional)
 # bridge.load_weights(peft_models, 'adapter-path', peft_format=True)
+
 # Export weights
 for name, parameter in bridge.export_weights(peft_models, peft_format=True):
     pass

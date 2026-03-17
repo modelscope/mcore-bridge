@@ -45,15 +45,10 @@ class GPTBridge:
         self._peft_modules_to_save = set()
         self._peft_format = False
         self._adapter_name = 'default'
-        self.model_type = config.model_type
-        self.model_dir = config.model_dir
+        self.model_type = config.hf_model_type
         self.is_multimodal = config.is_multimodal
-        self.module_mapping = {}
         self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
-
-        model_meta = config.model_meta
-        if self.is_multimodal and model_meta.visual_cls is not None:
-            self.module_mapping = model_meta.visual_cls.module_mapping
+        self.module_mapping = config.model_meta.visual_cls.module_mapping if self.is_multimodal else {}
         self.tp_size = self.config.tensor_model_parallel_size
         self.pp_size = self.config.pipeline_model_parallel_size
         self.etp_size = self.config.expert_tensor_parallel_size
