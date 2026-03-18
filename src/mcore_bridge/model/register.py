@@ -14,8 +14,6 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
-from .constant import MLLMModelType
-
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
     from .mm_gpt_model import MultimodalGPTModel
@@ -35,7 +33,7 @@ class ModelMeta:
     loader: Optional[Type['ModelLoader']] = None
 
     def __post_init__(self):
-        if self.model_type in MLLMModelType.__dict__:
+        if self.visual_cls is not None:
             self.is_multimodal = True
         if self.loader is None:
             self.loader = ModelLoader
@@ -48,19 +46,21 @@ def register_model(model_meta: ModelMeta, *, exist_ok: bool = False):
     MODEL_MAPPING[model_type] = model_meta
 
 
-_MODEL_META_MAPPING = None
+model_type_mapping = None
 
 
-def get_model_meta(hf_model_type: str) -> Optional[ModelMeta]:
-    global _MODEL_META_MAPPING
-    if _MODEL_META_MAPPING is None:
-        _MODEL_META_MAPPING = {}
+def get_mcore_model_type(hf_model_type: str) -> Optional[str]:
+    global model_type_mapping
+    if model_type_mapping is None:
+        model_type_mapping = {}
         for k, model_meta in MODEL_MAPPING.items():
             for _model_type in model_meta.model_types:
-                _MODEL_META_MAPPING[_model_type] = k
-    if hf_model_type not in _MODEL_META_MAPPING:
-        return
-    return MODEL_MAPPING[_MODEL_META_MAPPING[hf_model_type]]
+                model_type_mapping[_model_type] = k
+    return model_type_mapping.get(hf_model_type)
+
+
+def get_model_meta(mcore_model_type: str) -> ModelMeta:
+    return MODEL_MAPPING[mcore_model_type]
 
 
 class ModelLoader:
@@ -156,7 +156,7 @@ class ModelLoader:
 def get_mcore_model(config: ModelConfig) -> List[nn.Module]:
     loader = config.model_meta.loader(config)
     model_type = ModelType.encoder_or_decoder
-    if (mpu.get_pipeline_model_parallel_world_size() > 1 and config.virtual_pipeline_model_parallel_size is not None):
+    if mpu.get_pipeline_model_parallel_world_size() > 1 and config.virtual_pipeline_model_parallel_size is not None:
         models = []
         for i in range(config.virtual_pipeline_model_parallel_size):
             pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)

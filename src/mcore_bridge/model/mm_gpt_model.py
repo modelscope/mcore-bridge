@@ -38,8 +38,8 @@ class MultimodalGPTModel(MegatronModule):
             skip_validation = get_env_args('SKIP_MULTIMODAL_MTP_VALIDATION', bool, False)
             if not skip_validation:
                 raise ValueError('MTP currently does not support multimodal models.')
-        if pre_process and self.megatron_model_meta.visual_cls is not None:
-            self.visual = self.megatron_model_meta.visual_cls(config)
+        if pre_process and self.model_meta.visual_cls is not None:
+            self.visual = self.model_meta.visual_cls(config)
 
     @contextmanager
     def _patch_word_embeddings(self, kwargs):

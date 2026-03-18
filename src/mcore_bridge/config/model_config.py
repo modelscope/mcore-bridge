@@ -111,10 +111,7 @@ def tuple_type(x):
 
 @dataclass
 class ModelConfig(TransformerConfig):
-    """
-    During Megatron training, multiple models may be created. This class is used to
-    distinguish the configurations of different models.
-    """
+    mcore_model_type: Optional[str] = None  # Inferred from hf_model_type by default
     hf_model_type: Optional[str] = None
     llm_model_type: Optional[str] = None
     padded_vocab_size: Optional[int] = None
@@ -224,6 +221,7 @@ class ModelConfig(TransformerConfig):
     # other
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = None
     num_labels: Optional[int] = None
+    mlp_padding_free: bool = False
 
     _mindspeed_defaults_cache = None
 
@@ -264,7 +262,7 @@ class ModelConfig(TransformerConfig):
                 setattr(self, name, value)
 
     def __post_init__(self):
-        from mcore_bridge.model import get_model_meta
+        from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
         if self.experimental_attention_variant is not None:
@@ -310,7 +308,9 @@ class ModelConfig(TransformerConfig):
         self.rotary_interleaved = _origin_rotary_interleaved
 
         self._check_npu()
-        self.model_meta = get_model_meta(self.hf_model_type)
+        if self.mcore_model_type is None:
+            self.mcore_model_type = get_mcore_model_type(self.hf_model_type)
+        self.model_meta = get_model_meta(self.mcore_model_type)
         self.is_multimodal = self.model_meta.visual_cls is not None
         self.is_moe_model = self.num_moe_experts is not None
         self.bridge = self.model_meta.bridge_cls(self)

@@ -11,7 +11,7 @@ from packaging import version
 from peft import PeftModel
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
-from typing import List, Literal, Optional, Union
+from typing import List, Optional, Union
 
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr,
@@ -35,6 +35,13 @@ class GPTBridge:
     hf_lm_head_key = 'lm_head.weight'
     hf_score_key = 'score.weight'
     hf_state_dict_mapping = {}
+    # HF Keys
+    hf_q_norm_key = 'q_norm.weight'
+    hf_k_norm_key = 'k_norm.weight'
+    hf_mlp_prefix = 'mlp'
+    hf_gate_key = 'gate.weight'
+    hf_shared_expert_key = 'shared_expert'
+    hf_expert_bias_key = 'gate.e_score_correction_bias'
 
     def __init__(self, config):
         self.config = config
@@ -498,19 +505,11 @@ class GPTBridge:
             return state_dict
         return {k: v for k, v in state_dict.items() if k.startswith(prefix)}
 
-    @staticmethod
-    def _is_moe(state_dict):
-        for k, v in state_dict.items():
-            if 'experts.' in k:
-                return True
-        return False
-
     def _set_attn_state(self, mg_attn, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         else:
             hf_state_dict = {}
-        hf_attn = self.hf_layers[layer_idx].self_attn
         config = self.config
         num_query_groups = (
             config.num_query_groups if config.num_query_groups is not None else config.num_attention_heads)
@@ -553,8 +552,8 @@ class GPTBridge:
                 self._set_weight(
                     mg_attn.linear_qkv.weight, linear_qkv_weight, 'linear_qkv.weight', hf_scale_inv=qkv_scale_inv)
         else:
-            q_dim, kv_dim = hf_attn.q_proj.weight.shape[0] // num_query_groups, hf_attn.k_proj.weight.shape[
-                0] // num_query_groups
+            q_dim = self.config.kv_channels * self.config.num_attention_heads // self.config.num_query_groups
+            kv_dim = self.config.kv_channels
             q_block = q_dim // self.fp8_block_size
             kv_block = kv_dim // self.fp8_block_size
             is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
@@ -624,25 +623,16 @@ class GPTBridge:
         if getattr(config, 'softmax_type', 'vanilla') == 'learnable':
             self._set_state_dict(mg_attn, 'core_attention.softmax_offset', hf_state_dict, 'sinks', to_mcore)
         if config.qk_layernorm:
-            self._set_qk_layernorm(mg_attn, hf_attn, hf_state_dict, to_mcore)
+            self._set_qk_layernorm(mg_attn, hf_state_dict, to_mcore)
         if to_mcore:
             hf_state_dict = {}
         else:
             hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
         return hf_state_dict
 
-    def _set_qk_layernorm(self, mg_attn, hf_attn, hf_state_dict, to_mcore):
-        hf_q_norm_key = 'q_norm.weight' if hasattr(hf_attn, 'q_norm') else 'query_layernorm.weight'
-        hf_k_norm_key = 'k_norm.weight' if hasattr(hf_attn, 'k_norm') else 'key_layernorm.weight'
-        self._set_state_dict(mg_attn, 'q_layernorm.weight', hf_state_dict, hf_q_norm_key, to_mcore)
-        self._set_state_dict(mg_attn, 'k_layernorm.weight', hf_state_dict, hf_k_norm_key, to_mcore)
-
-    def get_e_score_correction_bias_key(self, hf_mlp):
-        if hasattr(hf_mlp, 'moe_statics'):
-            hf_bias_key = 'moe_statics.e_score_correction_bias'
-        else:
-            hf_bias_key = 'gate.e_score_correction_bias'
-        return hf_bias_key
+    def _set_qk_layernorm(self, mg_attn, hf_state_dict, to_mcore):
+        self._set_state_dict(mg_attn, 'q_layernorm.weight', hf_state_dict, self.hf_q_norm_key, to_mcore)
+        self._set_state_dict(mg_attn, 'k_layernorm.weight', hf_state_dict, self.hf_k_norm_key, to_mcore)
 
     def _set_moe_state(
         self,
@@ -657,34 +647,18 @@ class GPTBridge:
         else:
             hf_state_dict = {}
         config = self.config
-        hf_mlp = self._get_hf_mlp(layer_idx)
-        if hasattr(hf_mlp, 'router'):
-            hf_gate_key = 'router.weight'
-        elif hasattr(hf_mlp.gate, 'wg'):
-            hf_gate_key = 'gate.wg.weight'
-        else:
-            hf_gate_key = 'gate.weight'
-        self._set_state_dict(mg_mlp, 'router.weight', hf_state_dict, hf_gate_key, to_mcore)
+        self._set_state_dict(mg_mlp, 'router.weight', hf_state_dict, self.hf_gate_key, to_mcore)
         if config.add_bias_linear:
-            self._set_state_dict(mg_mlp, 'router.bias', hf_state_dict, hf_gate_key.replace('weight', 'bias'), to_mcore)
+            self._set_state_dict(mg_mlp, 'router.bias', hf_state_dict, self.hf_gate_key.replace('weight', 'bias'),
+                                 to_mcore)
         if config.moe_router_enable_expert_bias:
-            hf_bias_key = self.get_e_score_correction_bias_key(hf_mlp)
-            self._set_state_dict(mg_mlp, 'router.expert_bias', hf_state_dict, hf_bias_key, to_mcore)
+            self._set_state_dict(mg_mlp, 'router.expert_bias', hf_state_dict, self.hf_expert_bias_key, to_mcore)
 
         if config.moe_shared_expert_intermediate_size:
-            for key in ['shared_expert', 'shared_experts', 'shared_mlp']:
-                if hasattr(hf_mlp, key):
-                    hf_shared_expert_prefix = f'{key}.'
-                    shared_expert = getattr(hf_mlp, key)
             hf_state_dict.update(
-                self._set_mlp_state(
-                    None if mg_mlp is None else mg_mlp.shared_experts,
-                    hf_state_dict,
-                    hf_shared_expert_prefix,
-                    layer_idx,
-                    to_mcore,
-                    hf_mlp=shared_expert))
-            if hasattr(hf_mlp, 'shared_expert_gate'):
+                self._set_mlp_state(None if mg_mlp is None else mg_mlp.shared_experts, hf_state_dict,
+                                    f'{self.hf_shared_expert_key}.', layer_idx, to_mcore))
+            if config.moe_shared_expert_gate:
                 self._set_state_dict(mg_mlp, 'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
                                      to_mcore)
         for ep_rank in range(self.ep_size):
@@ -710,16 +684,21 @@ class GPTBridge:
             hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
         return hf_state_dict
 
-    def _get_hf_grouped(self):
+    def _get_hf_experts_attr(self):
+        # return hf_grouped, is_gate_up
         if self.model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
                 'glm4_moe_lite', 'glm4v_moe', 'minimax_m2', 'olmoe', 'qwen3_next', 'kimi_vl', 'qwen3_omni_moe',
                 'qwen3_5_moe', 'glm_moe_dsa', 'deepseek_v32'
         }:
             return False, False
-        return None, None
+        elif self.model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
+            return True, True
+        else:
+            # default
+            return False, False
 
-    def _get_transpose(self):
+    def _get_need_transpose(self):
         if self.model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
             return True
         else:
@@ -733,42 +712,25 @@ class GPTBridge:
         layer_idx: int,
         to_mcore: bool,
         ep_rank: Optional[int] = None,
-        hf_mlp=None,
     ):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
-        if hf_mlp is None:
-            hf_mlp = self._get_hf_mlp(layer_idx)
         is_expert = ep_rank is not None
-        num_local_experts = 1
-        hf_grouped = False
         config = self.config
-        if is_expert:
-            hf_mlp = hf_mlp.experts
-            # When converting to_mcore, hf_grouped is determined by default from the hf_state_dict condition.
-            # When converting to_hf, it is determined by default from the hf_mlp condition.
-            if to_mcore:
+        num_local_experts = 1 if config.num_moe_experts is None else config.num_moe_experts // self.ep_size
+        hf_grouped = False
+        is_gate_up = False
+        if to_mcore:
+            if is_expert:
                 pattern = r'\d+\.down_proj'
                 hf_grouped = not any(re.match(pattern, k) is not None for k in hf_state_dict.keys())
-            else:
-                hf_grouped = not hasattr(hf_mlp, '__len__')
-            if hasattr(hf_mlp, '__len__'):
-                hf_mlp = hf_mlp[0]
-            num_local_experts = config.num_moe_experts // self.ep_size
-        if to_mcore:
             is_gate_up = any('gate_up_proj' in k for k in hf_state_dict.keys())
-        else:
-            is_gate_up = hasattr(hf_mlp, 'gate_up_proj')
         # transformers 5.0 compatibility
-        if self.is_transformers_5 and not to_mcore and is_expert:
-            _hf_grouped, _is_gate_up = self._get_hf_grouped()
-            if _hf_grouped is not None:
-                hf_grouped = _hf_grouped
-            if _is_gate_up is not None:
-                is_gate_up = _is_gate_up
-        need_transpose = True
+        if not to_mcore and is_expert:
+            hf_grouped, is_gate_up = self._get_hf_experts_attr()
+        need_transpose = False
         if self.is_transformers_5 and hf_grouped:
-            need_transpose = self._get_transpose()
+            need_transpose = self._get_need_transpose()
 
         if hf_grouped and not to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
@@ -1428,16 +1390,20 @@ class GPTBridge:
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
-        hf_mlp_prefix = self.get_hf_mlp_prefix(layer_idx)
-        hf_mlp = self._get_hf_mlp(layer_idx)
-        is_moe = self._is_moe(hf_mlp.state_dict())
         mg_mlp = None if mg_layer is None else mg_layer.mlp
+        is_moe = True if hasattr(mg_mlp, 'experts') else False
+        if not to_mcore:
+            is_moe = torch.tensor([is_moe], dtype=torch.bool, device='cuda')
+            if self.pp_size > 1:
+                dist.all_reduce(is_moe, group=self.pp_group)
         if is_moe:
-            hf_state_dict.update(self._set_moe_state(mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore))
+            hf_state_dict.update(
+                self._set_moe_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict, 'post_attention_layernorm.weight',
                                  to_mcore)
         else:
-            hf_state_dict.update(self._set_mlp_state(mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore))
+            hf_state_dict.update(
+                self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
                                  'post_attention_layernorm.weight', to_mcore)
         return hf_state_dict
