@@ -32,7 +32,7 @@ class Qwen2_5VL_Vit(HuggingFaceVit):
         super().__init__(config, ignore_init_model_cls)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return Template._get_inputs_embeds_hf(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
+        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
 
 
 class Qwen2_5VLBridge(MultimodalGPTBridge):
@@ -45,30 +45,24 @@ class Qwen2_5VLBridge(MultimodalGPTBridge):
     }
 
 
-register_megatron_model(
-    MegatronModelMeta(
-        MegatronModelType.qwen2_5_vl,
-        [
-            ModelType.qwen2_5_vl,
-        ],
-        bridge_cls=Qwen2_5VLBridge,
-        visual_cls=Qwen2_5VL_Vit,
-    ))
+register_model(ModelMeta(
+    ModelType.qwen2_5_vl,
+    ['qwen2_5_vl'],
+    bridge_cls=Qwen2_5VLBridge,
+    visual_cls=Qwen2_5VL_Vit,
+))
 
 
 class Qwen2VL_Vit(Qwen2_5VL_Vit):
     version = 'v2'
 
 
-register_megatron_model(
-    MegatronModelMeta(
-        MegatronModelType.qwen2_vl,
-        [
-            ModelType.qwen2_vl,
-        ],
-        bridge_cls=Qwen2_5VLBridge,
-        visual_cls=Qwen2VL_Vit,
-    ))
+register_model(ModelMeta(
+    ModelType.qwen2_vl,
+    ['qwen2_vl'],
+    bridge_cls=Qwen2_5VLBridge,
+    visual_cls=Qwen2VL_Vit,
+))
 
 
 class Qwen2_5OmniBridge(GPTBridge):

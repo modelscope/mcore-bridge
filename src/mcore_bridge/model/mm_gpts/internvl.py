@@ -61,8 +61,8 @@ class Internvl3Vit(HuggingFaceVit):
 
 register_model(
     ModelMeta(
-        ModelType.internvl3,
-        ['internvl3', 'internvl3_5', 'internvl3_5_gpt'],
+        ModelType.internvl_chat,
+        ['internvl_chat'],
         bridge_cls=Internvl3Bridge,
         visual_cls=Internvl3Vit,
     ))
@@ -125,10 +125,9 @@ class InternvlHfVit(HuggingFaceVit):
         return inputs_embeds
 
 
-register_model(
-    ModelMeta(
-        ModelType.internvl_hf,
-        ['internvl_hf', 'internvl_gpt_hf'],
-        bridge_cls=InternvlHfBridge,
-        visual_cls=InternvlHfVit,
-    ))
+register_model(ModelMeta(
+    ModelType.internvl,
+    ['internvl'],
+    bridge_cls=InternvlHfBridge,
+    visual_cls=InternvlHfVit,
+))
