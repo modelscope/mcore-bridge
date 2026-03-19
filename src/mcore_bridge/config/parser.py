@@ -171,7 +171,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             # https://github.com/modelscope/ms-swift/pull/8085
             # res['rotary_interleaved'] = False
     elif llm_model_type == 'qwen3_next' or hf_model_type in {'qwen3_5', 'qwen3_5_moe'}:
-        use_mcore_gdn = get_env_args('MCORE_BRIDGE_USE_MCORE_GDN', bool, True)
+        use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
         if use_mcore_gdn and llm_model_type == 'qwen3_next':
             raise ValueError('qwen3_next is not supported for using the megatron-core implementation of GDN.')
         if use_mcore_gdn:

@@ -520,9 +520,8 @@ class Qwen3NextBridge(GPTBridge):
         if self.model_type != 'qwen3_5':
             return super()._set_layer_mlp(mg_layer, hf_state_dict, layer_idx, to_mcore)
         # dense
-        hf_mlp_prefix = self.get_hf_mlp_prefix(layer_idx)
         mg_mlp = None if mg_layer is None else mg_layer.mlp
-        hf_state_dict.update(self._set_mlp_state(mg_mlp, hf_state_dict, f'{hf_mlp_prefix}.', layer_idx, to_mcore))
+        hf_state_dict.update(self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
         self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict, 'post_attention_layernorm.weight',
                              to_mcore)
         return hf_state_dict
@@ -542,12 +541,11 @@ class Qwen3NextLoader(ModelLoader):
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         config = self.config
-        args = self.args
         config.hetereogenous_dist_checkpoint = True
         # compat Qwen3NextGatedDeltaNet
         config.hidden_act = 'silu'
         config.rms_norm_eps = config.layernorm_epsilon
-        config.dtype = args.torch_dtype
+        config.dtype = config.params_dtype
 
         # Use Zero-Centered RMSNorm to match HuggingFace exactly (no +1/-1 conversion needed)
         layer_norm_impl = Qwen3NextRMSNorm

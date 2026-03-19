@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
 from PIL import Image
-from transformers import PreTrainedConfig, dynamic_module_utils
+from transformers import PretrainedConfig, dynamic_module_utils
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import safe_ddp_context, to_device
@@ -25,40 +25,28 @@ def patch_get_dynamic_module():
         dynamic_module_utils.get_cached_module_file = origin_get_cached_module_file
 
 
-@contextmanager
-def patch_device_map_meta(model_cls):
-    __origin_init__ = model_cls.__init__
-
-    def __init__(self, *args, **kwargs):
-        with torch.device('meta'):
-            __origin_init__(self, *args, **kwargs)
-
-    model_cls.__init__ = __init__
-
-    try:
-        yield
-    finally:
-        model_cls.__init__ = __origin_init__
-
-
 class HuggingFaceVit(_HuggingFaceModule, ABC):
     module_mapping = {}  # hf -> mcore
 
     def __init__(self, config: ModelConfig, ignore_init_model_cls=None):
         super().__init__(config)
-        attn_impl = config.vit_attn_impl or 'flash_attention_2'
         hf_config = config.hf_config
         hf_config.torch_dtype = config.params_dtype
-        if config.attention_backend.name == 'flash':
-            hf_config._attn_implementation = attn_impl
+        self.hf_config = hf_config
+        self.prepare_attn_impl()
         with patch_get_dynamic_module():
             self.prepare_model(hf_config)
-        self.hf_config = hf_config
         self.processor = config.processor
-        self.to('cuda')
+        self.to(device='cuda')
 
-    def prepare_model(self, hf_config: PreTrainedConfig):
+    @abstractmethod
+    def prepare_model(self, hf_config: PretrainedConfig):
         pass
+
+    def prepare_attn_impl(self):
+        vit_attn_impl = self.config.vit_attn_impl or 'flash_attention_2'
+        if self.config.attention_backend.name == 'flash':
+            self.hf_config._attn_implementation = vit_attn_impl
 
     @abstractmethod
     def get_inputs_embeds(self, inputs_embeds, **kwargs):

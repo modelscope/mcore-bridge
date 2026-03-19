@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 
@@ -14,8 +14,9 @@ class Glm4vVit(HuggingFaceVit):
     _vision_tower = ['visual']
     _aligner = ['visual.merger']
 
-    def prepare_model(self, hf_config: PreTrainedConfig):
-        pass
+    def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers.models.glm4v_moe import Glm4vMoeVisionModel
+        self.visual = Glm4vMoeVisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)

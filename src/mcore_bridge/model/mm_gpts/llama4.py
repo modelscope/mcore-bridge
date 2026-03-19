@@ -5,6 +5,7 @@ from copy import deepcopy
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from packaging import version
+from transformers import PretrainedConfig
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -21,9 +22,10 @@ class Llama4Vit(HuggingFaceVit):
     _vision_tower = ['vision_model']
     _aligner = ['multi_modal_projector']
 
-    def __init__(self, config):
-        from transformers.models.llama4 import Llama4TextModel
-        super().__init__(config, Llama4TextModel)
+    def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector, Llama4VisionModel
+        self.vision_model = Llama4VisionModel._from_config(hf_config.vision_config)
+        self.multi_modal_projector = Llama4MultiModalProjector(hf_config).to(self.vision_model.dtype)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         pixel_values = kwargs.get('pixel_values')

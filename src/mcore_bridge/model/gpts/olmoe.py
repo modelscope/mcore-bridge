@@ -118,7 +118,7 @@ class OLMoEBridge(GPTBridge):
         else:
             hf_state_dict = {}
         hf_attn = self.hf_layers[layer_idx].self_attn
-        args = self.args
+        config = self.config
         if to_mcore:
             if isinstance(mg_attn.linear_qkv, LoraParallelLinear):
                 lora_A = hf_state_dict['q_proj.lora_A.weight'].load()
@@ -188,7 +188,7 @@ class OLMoEBridge(GPTBridge):
                     hf_state_dict['v_proj.weight_scale_inv'] = scale_inv[-kv_block:, :].clone()
                 del mg_attn_weight
         self._set_state_dict(mg_attn, 'linear_proj.weight', hf_state_dict, 'o_proj.weight', to_mcore)
-        if args.add_qkv_bias and not self._is_peft_format:
+        if config.add_qkv_bias and not self._is_peft_format:
             if to_mcore:
                 linear_qkv_bias = torch.cat([
                     hf_state_dict['q_proj.bias'].load(),

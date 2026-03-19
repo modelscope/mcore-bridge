@@ -1,5 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+from collections import namedtuple
+from functools import partial
+from torch import nn
+from transformers import AutoModel, PretrainedConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from mcore_bridge.bridge import GPTBridge, MultimodalGPTBridge
 
@@ -15,48 +20,58 @@ class Internvl3Bridge(GPTBridge):
     hf_lm_head_key = 'language_model.lm_head.weight'
     hf_score_key = 'language_model.score.weight'
 
-    def _init_meta_hf_model(self):
-        internvl3_vit = Internvl3Vit(None)
-        self.hf_model = internvl3_vit._hf_model[0]
-        self.hf_model.vision_model = None
-        self.processor = internvl3_vit.processor
-
 
 class Internvl3Vit(HuggingFaceVit):
     module_mapping = {'vision_model': 'vision_model', 'mlp1': 'mlp1'}
     _vision_tower = ['vision_model']
     _aligner = ['mlp1']
 
-    def __init__(self, config):
-        model_cls = []
-        from transformers.models.qwen2 import Qwen2ForCausalLM
-        model_cls.append(Qwen2ForCausalLM)
-        try:
-            from transformers.models import Qwen3ForCausalLM
-            model_cls.append(Qwen3ForCausalLM)
-        except ImportError:
-            pass
-        try:
-            from transformers.models import Qwen3MoeForCausalLM
-            model_cls.append(Qwen3MoeForCausalLM)
-        except ImportError:
-            pass
-        super().__init__(config, model_cls)
+    def prepare_attn_impl(self):
+        vit_attn_impl = self.config.vit_attn_impl or 'flash_attention_2'
+        if self.config.attention_backend.name == 'flash' and 'flash' in vit_attn_impl:
+            use_flash_attn = True
+        else:
+            use_flash_attn = False
+        self.hf_config.vision_config.use_flash_attn = use_flash_attn
+
+    def prepare_model(self, hf_config: PretrainedConfig):
+        InternVisionModel = get_class_from_dynamic_module('modeling_internvl_chat.InternVisionModel',
+                                                          hf_config.name_or_path)
+        self.model_cls = get_class_from_dynamic_module('modeling_internvl_chat.InternVLChatModel',
+                                                       hf_config.name_or_path)
+
+        self.vision_model = InternVisionModel._from_config(hf_config.vision_config)
+        vit_hidden_size = hf_config.vision_config.hidden_size
+        llm_hidden_size = hf_config.llm_config.hidden_size
+        self.mlp1 = nn.Sequential(
+            nn.LayerNorm(vit_hidden_size * int(1 / hf_config.downsample_ratio)**2),
+            nn.Linear(vit_hidden_size * int(1 / hf_config.downsample_ratio)**2, llm_hidden_size), nn.GELU(),
+            nn.Linear(llm_hidden_size, llm_hidden_size)).to(self.vision_model.dtype)
+        self.dummy_model = namedtuple(
+            'InternVLDummyModel',
+            ['vision_model', 'mlp1', 'select_layer', 'downsample_ratio', 'pixel_shuffle', 'ps_version'])(
+                self.vision_model, self.mlp1, hf_config.select_layer, hf_config.downsample_ratio, self.pixel_shuffle,
+                hf_config.ps_version)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        model = self._hf_model[0]
         input_ids = kwargs['input_ids']
         pixel_values = kwargs.get('pixel_values')
         if pixel_values is None:
             dummy_pixel_values = torch.zeros((1, 3, 32, 32), dtype=self.vision_model.dtype, device=inputs_embeds.device)
-            vit_embeds = model.extract_feature(dummy_pixel_values)
+            vit_embeds = self.extract_feature(dummy_pixel_values)
             inputs_embeds = inputs_embeds + vit_embeds.mean() * 0.
         else:
-            vit_embeds = model.extract_feature(pixel_values)
+            vit_embeds = self.extract_feature(pixel_values.to(self.vision_model.dtype))
             selected = (input_ids == self.processor.encode('<IMG_CONTEXT>', add_special_tokens=False)[0])
             inputs_embeds = inputs_embeds.clone()
             inputs_embeds[selected] = vit_embeds.reshape(-1, vit_embeds.shape[-1]).to(dtype=inputs_embeds.dtype)
         return inputs_embeds
+
+    def extract_feature(self, pixel_values):
+        return self.model_cls.extract_feature(self.dummy_model, pixel_values)
+
+    def pixel_shuffle(self, x, scale_factor=0.5):
+        return self.model_cls.pixel_shuffle(self.dummy_model, x, scale_factor=scale_factor)
 
 
 register_model(
@@ -82,30 +97,22 @@ class InternvlHfVit(HuggingFaceVit):
     _vision_tower = ['vision_tower']
     _aligner = ['multi_modal_projector']
 
-    def __init__(self, config):
-        model_cls = []
-        from transformers.models import Qwen2Model
-        model_cls.append(Qwen2Model)
-        try:
-            from transformers.models import Qwen3Model
-            model_cls.append(Qwen3Model)
-        except ImportError:
-            pass
-        try:
-            from transformers.models import Qwen3MoeModel
-            model_cls.append(Qwen3MoeModel)
-        except ImportError:
-            pass
-        super().__init__(config, model_cls)
+    def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers.models.internvl.modeling_internvl import InternVLModel, InternVLMultiModalProjector
+        self.vision_tower = AutoModel.from_config(hf_config.vision_config)
+        self.multi_modal_projector = InternVLMultiModalProjector(hf_config).to(self.vision_tower.dtype)
+        self.model_cls = InternVLModel
+        self.dummy_model = namedtuple('InternVLDummyModel',
+                                      ['vision_tower', 'multi_modal_projector', 'config', 'pixel_shuffle'])(
+                                          self.vision_tower, self.multi_modal_projector, hf_config, self.pixel_shuffle)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
         pixel_values = kwargs.get('pixel_values')
-        model = self._hf_model[0]
         device = self.vision_tower.device
         if pixel_values is not None:
             pixel_values = pixel_values.to(device=device)
-            image_features = model.model.get_image_features(
+            image_features = self.get_image_features(
                 pixel_values,
                 vision_feature_layer=self.hf_config.vision_feature_layer,
                 vision_feature_select_strategy=self.hf_config.vision_feature_select_strategy,
@@ -116,13 +123,19 @@ class InternvlHfVit(HuggingFaceVit):
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, image_features)
         else:
             dummy_pixel_values = torch.zeros((1, 3, 32, 32), device=device, dtype=self.vision_tower.dtype)
-            image_features = model.model.get_image_features(
+            image_features = self.get_image_features(
                 dummy_pixel_values,
                 vision_feature_layer=self.hf_config.vision_feature_layer,
                 vision_feature_select_strategy=self.hf_config.vision_feature_select_strategy,
             )
             inputs_embeds = inputs_embeds + image_features.mean() * 0.
         return inputs_embeds
+
+    def get_image_features(self, *args, **kwargs):
+        return self.model_cls.get_image_features(self.dummy_model, *args, **kwargs)
+
+    def pixel_shuffle(self, x, scale_factor=0.5):
+        return self.model_cls.pixel_shuffle(self.dummy_model, x, scale_factor=scale_factor)
 
 
 register_model(ModelMeta(

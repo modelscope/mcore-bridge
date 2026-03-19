@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.transformer.attention import SelfAttention
-from transformers import PreTrainedConfig
+from transformers import PretrainedConfig
 from typing import Optional
 
 from mcore_bridge.bridge import MultimodalGPTBridge
@@ -9,7 +9,7 @@ from mcore_bridge.utils import get_env_args
 from ..constant import ModelType
 from ..modules import GatedDeltaNet, GatedSelfAttention
 from ..register import ModelLoader, ModelMeta, register_model
-from .qwen3_5 import Qwen3NextBridge
+from .qwen3_5 import Qwen3_5Vit, Qwen3NextBridge
 from .utils import HuggingFaceVit
 
 
@@ -32,16 +32,6 @@ class Qwen3_5Bridge(MultimodalGPTBridge):
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
         return Qwen3NextBridge._convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
-
-
-class Qwen3_5Vit(HuggingFaceVit):
-
-    def prepare_model(self, hf_config: PreTrainedConfig):
-        from transformers.models.qwen3_5 import Qwen3_5VisionModel
-        self.visual = Qwen3_5VisionModel._from_config(hf_config.vision_config)
-
-    def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
 
 
 class Qwen3_5Loader(ModelLoader):
@@ -73,7 +63,7 @@ class Qwen3_5Loader(ModelLoader):
         return model
 
 
-use_mcore_gdn = get_env_args('MCORE_BRIDGE_USE_MCORE_GDN', bool, True)
+use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
 
 if use_mcore_gdn:
     register_model(

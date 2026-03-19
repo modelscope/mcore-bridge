@@ -16,6 +16,7 @@ from mcore_bridge.utils import split_cp_inputs, to_device
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
+from .utils import HuggingFaceVit
 
 te_checkpoint = None
 
@@ -305,15 +306,18 @@ class Qwen3VLTransformerBlock(gpt_model.TransformerBlock):
         return hidden_states
 
 
-class Qwen3VL_Vit(HuggingFaceModule):
+class Qwen3VL_Vit(HuggingFaceVit):
     module_mapping = {'model.visual': 'visual'}
     _vision_tower = ['visual']
     _aligner = ['visual.merger', 'visual.deepstack_merger_list']
 
-    def __init__(self, config):
-        from transformers.models.qwen3_vl import Qwen3VLTextModel
-        from transformers.models.qwen3_vl_moe import Qwen3VLMoeTextModel
-        super().__init__(config, [Qwen3VLTextModel, Qwen3VLMoeTextModel])
+    def prepare_model(self, hf_config):
+        hf_model_type = self.config.hf_model_type
+        if hf_model_type == 'qwen3_vl':
+            from transformers.models.qwen3_vl import Qwen3VLVisionModel as VisionModel
+        elif hf_model_type == 'qwen3_vl_moe':
+            from transformers.models.qwen3_vl_moe import Qwen3VLMoeVisionModel as VisionModel
+        self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         return self._get_inputs_embeds(self, inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)

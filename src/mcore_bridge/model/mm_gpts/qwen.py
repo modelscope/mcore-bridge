@@ -1,6 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 from PIL import Image
+from torch import nn
+from transformers import AutoModel, PretrainedConfig
+from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from mcore_bridge.bridge import GPTBridge, MultimodalGPTBridge
 from mcore_bridge.utils import get_env_args
@@ -16,20 +19,14 @@ class Qwen2_5VL_Vit(HuggingFaceVit):
     _aligner = ['visual.merger']
     version = 'v2_5'
 
-    def __init__(self, config):
+    def prepare_model(self, hf_config: PretrainedConfig):
         if self.version == 'v2_5':
-            try:
-                from transformers.models.qwen2_5_vl import Qwen2_5_VLTextModel
-            except ImportError:
-                from transformers.models.qwen2_5_vl import Qwen2_5_VLModel as Qwen2_5_VLTextModel
-            ignore_init_model_cls = Qwen2_5_VLTextModel
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
+                Qwen2_5_VisionTransformerPretrainedModel as VisionModel
         elif self.version == 'v2':
-            try:
-                from transformers.models.qwen2_vl import Qwen2VLTextModel
-            except ImportError:
-                from transformers.models.qwen2_vl import Qwen2VLModel as Qwen2VLTextModel
-            ignore_init_model_cls = Qwen2VLTextModel
-        super().__init__(config, ignore_init_model_cls)
+            from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+                Qwen2VisionTransformerPretrainedModel as VisionModel
+        self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
@@ -74,18 +71,15 @@ class Qwen2_5OmniBridge(GPTBridge):
 
 
 class Qwen2_5Omni_Vit(HuggingFaceVit):
-    module_mapping = {'thinker': 'thinker', 'talker': 'talker', 'token2wav': 'token2wav'}
-    _vision_tower = ['thinker.audio_tower', 'thinker.visual']
-    _aligner = ['thinker.audio_tower.proj', 'thinker.visual.merger']
+    module_mapping = {'thinker.audio_tower': 'audio_tower', 'thinker.visual': 'visual'}
+    _vision_tower = ['audio_tower', 'visual']
+    _aligner = ['audio_tower.proj', 'visual.merger']
     _generator = ['talker', 'token2wav']
 
-    def __init__(self, config):
-        from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerTextModel
-        super().__init__(config, [Qwen2_5OmniThinkerTextModel])
-
     def prepare_model(self, hf_model):
-        del self.thinker.model
-        del self.thinker.lm_head
+        from transformers.models.qwen2_5_omni import Qwen2_5OmniAudioEncoder, Qwen2_5OmniVisionEncoder
+        self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
+        self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         thinker_config = self.hf_config.thinker_config
@@ -135,15 +129,23 @@ class Ovis2_5Bridge(GPTBridge):
 
 
 class Ovis2_5Vit(HuggingFaceVit):
-    module_mapping = {'visual_tokenizer': 'visual_tokenizer', 'vte': 'vte'}
-    _vision_tower = ['visual_tokenizer.vit', 'vte']
-    _aligner = ['visual_tokenizer.head']
+    module_mapping = {'visual_tokenizer.vit': 'vit', 'visual_tokenizer.head': 'head', 'vte': 'vte'}
+    _vision_tower = ['vit', 'vte']
+    _aligner = ['head']
 
-    def __init__(self, config):
-        from transformers.models import Qwen3ForCausalLM
-        super().__init__(config, Qwen3ForCausalLM)
+    def prepare_model(self, hf_config):
         self.min_pixels = get_env_args('min_pixels', int, 448 * 448)
         self.max_pixels = get_env_args('max_pixels', int, 1344 * 1792)
+        VisualEmbedding = get_class_from_dynamic_module('modeling_ovis2_5.VisualEmbedding', hf_config.name_or_path)
+        INDICATOR_IDS = get_class_from_dynamic_module('modeling_ovis2_5.INDICATOR_IDS', hf_config.name_or_path)
+        head_dim = hf_config.visual_vocab_size - len(INDICATOR_IDS)
+        self.vit = AutoModel.from_config(hf_config.vit_config)
+        self.head = nn.Sequential(
+            nn.Linear(self.vit.config.hidden_size * self.vit.config.hidden_stride**2, head_dim, bias=False),
+            nn.LayerNorm(head_dim)).to(dtype=self.vit.dtype)
+
+        self.vte = VisualEmbedding(
+            hf_config.visual_vocab_size, hf_config.hidden_size, device=self.vit.device, dtype=self.vit.dtype)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         model = self._hf_model[0]

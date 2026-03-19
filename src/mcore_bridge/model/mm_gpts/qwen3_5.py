@@ -31,15 +31,15 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
         self.to(dtype=extra_kwargs['params_dtype'], device=extra_kwargs['device'])
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
-        args = self.config.args
-        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+        config = self.config
+        if config.sequence_parallel and config.tensor_model_parallel_size > 1:
             hidden_states = gather_from_sequence_parallel_region(hidden_states)
         seq_len = hidden_states.shape[0]
         packed_seq_params = kwargs.get('packed_seq_params')
         thd_format = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         # Note: for packed inputs, we do not perform padding_free unpadding.
         # Doing so would allow different sequences to see each other; for efficiency we keep this implementation.
-        if thd_format and not args.packing:
+        if thd_format:
             new_hidden_states = hidden_states.new_zeros(
                 (packed_seq_params.num_samples, packed_seq_params.max_seqlen_q.item(), hidden_states.shape[-1]))
             attention_mask = hidden_states.new_zeros(
@@ -56,14 +56,14 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
             if attention_mask is not None:
                 attention_mask = (~attention_mask).sum(dim=(1, 2)) > 0
         res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
-        if thd_format and not args.packing:
+        if thd_format:
             res = res[attention_mask][:, None]
             res = torch.concat([res, res.new_zeros(seq_len - res.shape[0], 1, res.shape[2])])
         else:
             res = res.transpose(0, 1).contiguous()
-        if args.sequence_parallel and args.tensor_model_parallel_size > 1:
+        if config.sequence_parallel and config.tensor_model_parallel_size > 1:
             # Quick fix for dropout issue, awaiting ms-swift 4.0 refactor
-            res = reduce_scatter_to_sequence_parallel_region(res) / args.tensor_model_parallel_size
+            res = reduce_scatter_to_sequence_parallel_region(res) / config.tensor_model_parallel_size
         return res, None
 
 
@@ -72,10 +72,9 @@ class Qwen3_5Vit(HuggingFaceVit):
     _vision_tower = ['visual']
     _aligner = ['visual.merger']
 
-    def __init__(self, config):
-        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextModel
-        from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeTextModel
-        super().__init__(config, [Qwen3_5TextModel, Qwen3_5MoeTextModel])
+    def prepare_model(self, hf_config):
+        from transformers.models.qwen3_5 import Qwen3_5VisionModel
+        self.visual = Qwen3_5VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
@@ -91,7 +90,7 @@ class Qwen3_5Loader(Qwen3NextLoader):
     gated_delta_net = Qwen3_5MoeGatedDeltaNet
 
 
-use_mcore_gdn = get_env_args('SWIFT_USE_MCORE_GDN', bool, True)
+use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
 
 if not use_mcore_gdn:
     register_model(

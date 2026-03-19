@@ -18,20 +18,15 @@ class Qwen3OmniBridge(GPTBridge):
 
 
 class Qwen3Omni_Vit(HuggingFaceVit):
-    module_mapping = {'thinker': 'thinker', 'talker': 'talker', 'code2wav': 'code2wav'}
-    _vision_tower = ['thinker.audio_tower', 'thinker.visual']
-    _aligner = [
-        'thinker.audio_tower.proj1', 'thinker.audio_tower.proj2', 'thinker.visual.merger', 'thinker.visual.merger_list'
-    ]
+    module_mapping = {'thinker.audio_tower': 'audio_tower', 'thinker.visual': 'visual'}
+    _vision_tower = ['audio_tower', 'visual']
+    _aligner = ['audio_tower.proj1', 'audio_tower.proj2', 'visual.merger', 'visual.merger_list']
     _generator = ['talker', 'code2wav']
 
-    def __init__(self, config):
-        from transformers.models.qwen3_omni_moe import Qwen3OmniMoeThinkerTextModel
-        super().__init__(config, [Qwen3OmniMoeThinkerTextModel])
-
     def prepare_model(self, hf_model):
-        del self.thinker.model
-        del self.thinker.lm_head
+        from transformers.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder, Qwen3OmniMoeVisionEncoder
+        self.audio_tower = Qwen3OmniMoeAudioEncoder._from_config(config.audio_config)
+        self.visual = Qwen3OmniMoeVisionEncoder._from_config(config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
