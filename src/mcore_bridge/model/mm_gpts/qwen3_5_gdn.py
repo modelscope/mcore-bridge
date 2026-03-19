@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.transformer.attention import SelfAttention
-from transformers import PretrainedConfig
 from typing import Optional
 
 from mcore_bridge.bridge import MultimodalGPTBridge
@@ -10,7 +9,6 @@ from ..constant import ModelType
 from ..modules import GatedDeltaNet, GatedSelfAttention
 from ..register import ModelLoader, ModelMeta, register_model
 from .qwen3_5 import Qwen3_5Vit, Qwen3NextBridge
-from .utils import HuggingFaceVit
 
 
 class Qwen3_5Bridge(MultimodalGPTBridge):
