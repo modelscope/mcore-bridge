@@ -5,5 +5,5 @@ from .import_utils import _LazyModule
 from .logger import get_logger
 from .megatron_utils import split_cp_inputs, unwrap_model
 from .safetensors import SafetensorLazyLoader, StreamingSafetensorSaver
-from .torch_utils import gc_collect, get_current_device
+from .torch_utils import disable_safe_ddp_context_use_barrier, gc_collect, get_current_device
 from .utils import deep_getattr, get_env_args, json_parse_to_dict

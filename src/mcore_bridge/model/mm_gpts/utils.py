@@ -26,6 +26,21 @@ def patch_hf_initialize_weight():
 
 
 @contextmanager
+def patch_get_dynamic_module():
+    origin_get_cached_module_file = dynamic_module_utils.get_cached_module_file
+
+    def new_get_cached_module_file(pretrained_model_name_or_path, *args, **kwargs):
+        with safe_ddp_context(hash_id=str(pretrained_model_name_or_path)):
+            return origin_get_cached_module_file(pretrained_model_name_or_path, *args, **kwargs)
+
+    dynamic_module_utils.get_cached_module_file = new_get_cached_module_file
+    try:
+        yield
+    finally:
+        dynamic_module_utils.get_cached_module_file = origin_get_cached_module_file
+
+
+@contextmanager
 def patch_device_map_meta(model_cls):
     __origin_init__ = model_cls.__init__
 
@@ -46,27 +61,18 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
 
     def __init__(self, config: ModelConfig, ignore_init_model_cls=None):
         super().__init__(config)
-        attn_impl = config.vit_attn_impl or 'flash_attn'
-        kwargs = {'attn_impl': attn_impl} if config.attention_backend.name == 'flash' else {}
-        ignore_init_model_cls = ignore_init_model_cls or []
-        if not isinstance(ignore_init_model_cls, list):
-            ignore_init_model_cls = [ignore_init_model_cls]
-        context_list = [patch_device_map_meta(model_cls) for model_cls in ignore_init_model_cls]
-        context_list.append(patch_hf_initialize_weight())
-        kwargs['model_type'] = args.model_type
-        with ContextManagers(context_list), disable_safe_ddp_context_use_barrier():
-            model, self.processor = get_model_processor(
-                args.model_dir, torch_dtype=args.torch_dtype, return_dummy_model=True, **kwargs)
-        self.hf_config = model.config
-        for hf_prefix, mg_prefix in self.module_mapping.items():
-            setattr(self, mg_prefix, deep_getattr(model, hf_prefix))
-        self._hf_model = [model]
-        self.prepare_model(model)
+        attn_impl = config.vit_attn_impl or 'flash_attention_2'
+        config.hf_config.torch_dtype = config.params_dtype
+        if config.attention_backend.name == 'flash':
+            config.hf_config._attn_implementation = attn_impl
+        from transformers.models.qwen3_5 import Qwen3_5VisionModel
+        hf_config = config.hf_config
+        self.visual = Qwen3_5VisionModel._from_config(hf_config.vision_config)
         self.to('cuda')
 
     def prepare_model(self, hf_model):
         pass
 
-    @abstractmethod
-    def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        pass
+    # @abstractmethod
+    # def get_inputs_embeds(self, inputs_embeds, **kwargs):
+    #     pass

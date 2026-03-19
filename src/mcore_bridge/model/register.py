@@ -162,12 +162,13 @@ def get_mcore_model(config: ModelConfig) -> List[nn.Module]:
             pre_process = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=i)
             post_process = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=i)
             model = loader.build_model(pre_process, post_process, vp_stage=i)
-            model.model_type = model_type
             models.append(model)
     else:
         pre_process = mpu.is_pipeline_first_stage()
         post_process = mpu.is_pipeline_last_stage()
         model = loader.build_model(pre_process=pre_process, post_process=post_process)
-        model.model_type = model_type
         models = [model]
+    for model in models:
+        model.model_type = model_type
+        model.prepare_inputs_for_generation = None
     return models

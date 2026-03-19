@@ -1647,7 +1647,7 @@ class GPTBridge:
         self._peft_modules_to_save = set()
         hf_prefix = 'base_model.model.' if peft_format else ''
         mg_models = unwrap_model(mg_models)
-        for i, mg_model in mg_models:
+        for i, mg_model in enumerate(mg_models):
             if isinstance(mg_model, PeftModel):
                 mg_models[i] = mg_model.model
         self.config = mg_models[0].config
