@@ -10,11 +10,11 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules, get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from packaging import version
-from swift.megatron.tuners import LoraParallelLinear
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
+from mcore_bridge.tuners import LoraParallelLinear
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model

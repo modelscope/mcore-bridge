@@ -39,23 +39,8 @@ def time_synchronize() -> float:
     return time.perf_counter()  # second
 
 
-_DISABLE_USE_BARRIER = False
-
-
-@contextmanager
-def disable_safe_ddp_context_use_barrier():
-    global _DISABLE_USE_BARRIER
-    _DISABLE_USE_BARRIER = True
-    try:
-        yield
-    finally:
-        _DISABLE_USE_BARRIER = False
-
-
 @contextmanager
 def safe_ddp_context(hash_id: Optional[str], use_barrier: bool = True):
-    if _DISABLE_USE_BARRIER:
-        use_barrier = False
     if use_barrier and dist.is_initialized():
         if is_dist():
             if not is_master():

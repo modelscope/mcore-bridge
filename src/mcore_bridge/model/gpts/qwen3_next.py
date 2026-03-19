@@ -17,12 +17,11 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.utils import deprecate_inference_params, is_fa_min_version
 from packaging import version
-from swift.megatron.utils import get_local_layer_specs
-from swift.utils import get_logger
 from typing import Optional, Tuple, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
+from mcore_bridge.utils import get_local_layer_specs, get_logger
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
