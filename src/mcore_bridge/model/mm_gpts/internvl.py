@@ -46,11 +46,9 @@ class Internvl3Vit(HuggingFaceVit):
             nn.LayerNorm(vit_hidden_size * int(1 / hf_config.downsample_ratio)**2),
             nn.Linear(vit_hidden_size * int(1 / hf_config.downsample_ratio)**2, llm_hidden_size), nn.GELU(),
             nn.Linear(llm_hidden_size, llm_hidden_size)).to(self.vision_model.dtype)
-        self.dummy_model = namedtuple(
-            'InternVLDummyModel',
-            ['vision_model', 'mlp1', 'select_layer', 'downsample_ratio', 'pixel_shuffle', 'ps_version'])(
-                self.vision_model, self.mlp1, hf_config.select_layer, hf_config.downsample_ratio, self.pixel_shuffle,
-                hf_config.ps_version)
+        self.select_layer = hf_config.select_layer
+        self.downsample_ratio = hf_config.downsample_ratio
+        self.ps_version = hf_config.ps_version
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
@@ -67,10 +65,12 @@ class Internvl3Vit(HuggingFaceVit):
         return inputs_embeds
 
     def extract_feature(self, pixel_values):
-        return self.model_cls.extract_feature(self.dummy_model, pixel_values)
+        with self.patch_hf_config():
+            return self.model_cls.extract_feature(self, pixel_values)
 
     def pixel_shuffle(self, x, scale_factor=0.5):
-        return self.model_cls.pixel_shuffle(self.dummy_model, x, scale_factor=scale_factor)
+        with self.patch_hf_config():
+            return self.model_cls.pixel_shuffle(self, x, scale_factor=scale_factor)
 
 
 register_model(
@@ -101,9 +101,6 @@ class InternvlHfVit(HuggingFaceVit):
         self.vision_tower = AutoModel.from_config(hf_config.vision_config)
         self.multi_modal_projector = InternVLMultiModalProjector(hf_config).to(self.vision_tower.dtype)
         self.model_cls = InternVLModel
-        self.dummy_model = namedtuple('InternVLDummyModel',
-                                      ['vision_tower', 'multi_modal_projector', 'config', 'pixel_shuffle'])(
-                                          self.vision_tower, self.multi_modal_projector, hf_config, self.pixel_shuffle)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
@@ -131,10 +128,12 @@ class InternvlHfVit(HuggingFaceVit):
         return inputs_embeds
 
     def get_image_features(self, *args, **kwargs):
-        return self.model_cls.get_image_features(self.dummy_model, *args, **kwargs)
+        with self.patch_hf_config():
+            return self.model_cls.get_image_features(self, *args, **kwargs)
 
     def pixel_shuffle(self, x, scale_factor=0.5):
-        return self.model_cls.pixel_shuffle(self.dummy_model, x, scale_factor=scale_factor)
+        with self.patch_hf_config():
+            return self.model_cls.pixel_shuffle(self, x, scale_factor=scale_factor)
 
 
 register_model(ModelMeta(

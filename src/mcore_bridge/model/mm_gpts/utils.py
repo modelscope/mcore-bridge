@@ -28,6 +28,15 @@ def patch_get_dynamic_module():
 class HuggingFaceVit(_HuggingFaceModule, ABC):
     module_mapping = {}  # hf -> mcore
 
+    @contextmanager
+    def patch_hf_config(self):
+        config = self.config
+        self.config = self.hf_config
+        try:
+            yield
+        finally:
+            self.config = config
+
     def __init__(self, config: ModelConfig, ignore_init_model_cls=None):
         super().__init__(config)
         hf_config = config.hf_config

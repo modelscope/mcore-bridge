@@ -36,10 +36,6 @@ class KimiVLVit(HuggingFaceVit):
         self.multi_modal_projector = KimiVLMultiModalProjector(hf_config).to(self.vision_tower.dtype)
         self.model_cls = get_class_from_dynamic_module('modeling_kimi_vl.KimiVLForConditionalGeneration',
                                                        hf_config.name_or_path)
-        self.dummy_model = namedtuple('DummyKimiVLModel',
-                                      ['vision_tower', 'multi_modal_projector', 'config'])(self.vision_tower,
-                                                                                           self.multi_modal_projector,
-                                                                                           hf_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
@@ -59,10 +55,12 @@ class KimiVLVit(HuggingFaceVit):
         return inputs_embeds
 
     def _extract_image_features(self, pixel_values, image_grid_hws):
-        return self.model_cls._extract_image_features(self.dummy_model, pixel_values, image_grid_hws)
+        with self.patch_hf_config():
+            return self.model_cls._extract_image_features(self, pixel_values, image_grid_hws)
 
     def _merge_with_image_features(self, inputs_embeds, input_ids, image_features):
-        return self.model_cls._merge_with_image_features(self.dummy_model, inputs_embeds, input_ids, image_features)
+        with self.patch_hf_config():
+            return self.model_cls._merge_with_image_features(self, inputs_embeds, input_ids, image_features)
 
 
 register_model(ModelMeta(
