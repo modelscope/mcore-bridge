@@ -320,7 +320,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
         self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return self._get_inputs_embeds(self, inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
+        return self._get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
 
     def _get_inputs_embeds(self, inputs_embeds, inputs, visual, processor, hf_config):
         input_ids = inputs['input_ids']
@@ -434,8 +434,8 @@ class Qwen3VLLoader(ModelLoader):
         gpt_model.OriginTransformerBlock = gpt_model.TransformerBlock
         gpt_model.TransformerBlock = Qwen3VLTransformerBlock
 
-    def __init__(self, args, hf_config):
-        super().__init__(args, hf_config)
+    def __init__(self, config):
+        super().__init__(config)
         self._patch_transformer_block()
 
 

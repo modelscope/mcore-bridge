@@ -3,6 +3,7 @@ import megatron.core
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.gpt.gpt_layer_specs import (get_gpt_decoder_block_spec,
                                                       get_gpt_layer_with_transformer_engine_spec,
                                                       get_gpt_mtp_block_spec)
@@ -150,7 +151,14 @@ class ModelLoader:
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
         )
+        self._set_linear_is_expert(model)
         return model
+
+    def _set_linear_is_expert(self, model):
+        for n, module in model.named_modules():
+            if '.local_experts.' in n and isinstance(module, (TELinear, TELayerNormColumnParallelLinear)) or isinstance(
+                    module, TEGroupedLinear):
+                module.is_expert = True
 
 
 def get_mcore_model(config: ModelConfig) -> List[nn.Module]:

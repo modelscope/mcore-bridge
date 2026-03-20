@@ -76,30 +76,32 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
     _aligner = ['audio_tower.proj', 'visual.merger']
     _generator = ['talker', 'token2wav']
 
-    def prepare_model(self, hf_model):
-        from transformers.models.qwen2_5_omni import Qwen2_5OmniAudioEncoder, Qwen2_5OmniVisionEncoder
-        self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(config.audio_config)
-        self.visual = Qwen2_5OmniVisionEncoder._from_config(config.vision_config)
+    def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (Qwen2_5OmniAudioEncoder,
+                                                                            Qwen2_5OmniForConditionalGeneration,
+                                                                            Qwen2_5OmniVisionEncoder)
+        self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(hf_config.thinker_config.audio_config)
+        self.visual = Qwen2_5OmniVisionEncoder._from_config(hf_config.thinker_config.vision_config)
+        self.model_cls = Qwen2_5OmniForConditionalGeneration
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         thinker_config = self.hf_config.thinker_config
-        inputs_embeds = self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.thinker.visual, self.processor,
-                                                   thinker_config)
+        inputs_embeds = self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, thinker_config)
         input_ids = kwargs['input_ids']
         input_features = kwargs.get('input_features')
         feature_attention_mask = kwargs.get('feature_attention_mask')
 
         if input_features is None:
-            input_features = input_ids.new_zeros([1, 128, 128], dtype=self.thinker.audio_tower.dtype)
+            input_features = input_ids.new_zeros([1, 128, 128], dtype=self.audio_tower.dtype)
             feature_attention_mask = input_ids.new_ones([1, 128], dtype=torch.bool)
-            audio_res = self.thinker.get_audio_features(input_features, feature_attention_mask)
+            audio_res = self.model_cls.get_audio_features(self, input_features, feature_attention_mask)
             if hasattr(audio_res, 'last_hidden_state'):
                 audio_embeds = audio_res.last_hidden_state
             else:
                 audio_embeds = audio_res
             inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.
         else:
-            audio_res = self.thinker.get_audio_features(input_features, feature_attention_mask)
+            audio_res = self.model_cls.get_audio_features(self, input_features, feature_attention_mask)
             if hasattr(audio_res, 'last_hidden_state'):
                 audio_embeds = audio_res.last_hidden_state
             else:

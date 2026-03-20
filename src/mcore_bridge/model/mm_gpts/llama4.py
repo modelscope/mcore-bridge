@@ -23,31 +23,40 @@ class Llama4Vit(HuggingFaceVit):
     _aligner = ['multi_modal_projector']
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector, Llama4VisionModel
+        from transformers.models.llama4.modeling_llama4 import (Llama4ForConditionalGeneration,
+                                                                Llama4MultiModalProjector, Llama4VisionModel)
         self.vision_model = Llama4VisionModel._from_config(hf_config.vision_config)
         self.multi_modal_projector = Llama4MultiModalProjector(hf_config).to(self.vision_model.dtype)
+        self.model_cls = Llama4ForConditionalGeneration
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         pixel_values = kwargs.get('pixel_values')
         input_ids = kwargs.get('input_ids')
-        model = self._hf_model[0]
         vision_feature_select_strategy = self.hf_config.vision_config.vision_feature_select_strategy
         origin_pixel_values = pixel_values
         if pixel_values is None:
             pixel_values = torch.zeros((1, 3, 336, 336), dtype=self.vision_model.dtype, device=inputs_embeds.device)
-        image_features = model.get_image_features(
+        image_features = self.get_image_features(
             pixel_values=pixel_values,
             vision_feature_select_strategy=vision_feature_select_strategy,
         )
         vision_flat = image_features.view(-1, image_features.size(-1))
-        projected_vision_flat = model.multi_modal_projector(vision_flat).to(inputs_embeds.device, inputs_embeds.dtype)
+        projected_vision_flat = self.multi_modal_projector(vision_flat).to(inputs_embeds.device, inputs_embeds.dtype)
         if origin_pixel_values is None:
             inputs_embeds = inputs_embeds + projected_vision_flat.mean() * 0.
         else:
-            special_image_mask = model.get_placeholder_mask(
+            special_image_mask = self.get_placeholder_mask(
                 input_ids, inputs_embeds=inputs_embeds, image_features=projected_vision_flat)
             inputs_embeds = inputs_embeds.masked_scatter(special_image_mask, projected_vision_flat)
         return inputs_embeds
+
+    def get_placeholder_mask(self, *args, **kwargs):
+        with self.patch_hf_config():
+            return self.model_cls.get_placeholder_mask(self, *args, **kwargs)
+
+    def get_image_features(self, *args, **kwargs):
+        with self.patch_hf_config():
+            return self.model_cls.get_image_features(self, *args, **kwargs)
 
 
 class Llama4Bridge(GPTBridge):
@@ -56,6 +65,9 @@ class Llama4Bridge(GPTBridge):
     hf_final_layernorm_key = 'language_model.model.norm.weight'
     hf_lm_head_key = 'language_model.lm_head.weight'
     hf_score_key = 'language_model.score.weight'
+
+    hf_mlp_prefix = 'feed_forward'
+    hf_gate_key = 'router.weight'
 
 
 class Llama4Loader(ModelLoader):

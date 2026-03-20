@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 class LLMModelType:
     gpt = 'gpt'
+    gpt_oss = 'gpt_oss'
+
     qwen3_next = 'qwen3_next'
     olmoe = 'olmoe'
     glm4 = 'glm4'

@@ -729,7 +729,7 @@ class GPTBridge:
         if not to_mcore and is_expert:
             hf_grouped, is_gate_up = self._get_hf_experts_attr()
         need_transpose = False
-        if self.is_transformers_5 and hf_grouped:
+        if hf_grouped:
             need_transpose = self._get_need_transpose()
 
         if hf_grouped and not to_mcore:
