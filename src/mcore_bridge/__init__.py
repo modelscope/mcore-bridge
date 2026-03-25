@@ -2,7 +2,10 @@
 import sys
 from typing import TYPE_CHECKING
 
+from .patcher import apply_patch
 from .utils import _LazyModule
+
+apply_patch()
 
 if TYPE_CHECKING:
     from .bridge import GPTBridge
