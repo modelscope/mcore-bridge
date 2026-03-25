@@ -8,7 +8,6 @@ if TYPE_CHECKING:
     from .bridge import GPTBridge
     from .config import ModelConfig, hf_to_mcore_config
     from .model import get_mcore_model
-    from .tuners import get_peft_model
     from .utils import get_logger
     from .version import __release_datetime__, __version__
 else:
@@ -16,7 +15,6 @@ else:
         'bridge': ['GPTBridge'],
         'config': ['ModelConfig', 'hf_to_mcore_config'],
         'model': ['get_mcore_model'],
-        'tuners': ['get_peft_model'],
         'version': ['__release_datetime__', '__version__'],
     }
 
