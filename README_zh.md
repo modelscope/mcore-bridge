@@ -1,10 +1,10 @@
 # MCore-Bridge: 让 Megatron 训练像 Transformers 一样简单
 
-<p align="center">
+<!-- <p align="center">
     <br>
     <img src="asset/banner.png"/>
     <br>
-<p>
+<p> -->
 
 <p align="center">
     <b>为最先进的大语言模型提供 Megatron-Core 模型定义</b>
@@ -48,7 +48,7 @@
 
 微信群 |
 :-------------------------:
-<img src="asset/wechat.png" width="200" height="200">
+<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200">
 
 ## 📝 简介
 

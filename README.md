@@ -1,10 +1,10 @@
 # MCore-Bridge: Making Megatron training as simple as Transformers
 
-<p align="center">
+<!-- <p align="center">
     <br>
     <img src="asset/banner.png"/>
     <br>
-<p>
+<p> -->
 
 <p align="center">
     <b>Providing Megatron-Core model definitions for state-of-the-art large language models</b>
@@ -49,7 +49,7 @@ You can contact us and communicate with us by adding our group:
 
 WeChat Group |
 :-------------------------:
-<img src="asset/wechat.png" width="200" height="200">
+<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200">
 
 ## 📝 Introduction
 

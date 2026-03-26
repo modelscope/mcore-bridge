@@ -120,14 +120,8 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.pop('ffn_hidden_size', None)
         if llm_model_type in {'qwen2_moe', 'qwen3_next'} or hf_model_type == 'qwen3_5_moe':
             res['moe_shared_expert_gate'] = True
-    if llm_model_type in {
-            'deepseek',
-            'deepseek_v2',
-            'deepseek_v3',
-            'kimi_k2',
-            'deepseek_v32',
-            'dots1',
-    } or hf_model_type == 'kimi_vl':
+    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1'
+                          } or hf_model_type == 'kimi_vl':
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'

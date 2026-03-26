@@ -658,11 +658,14 @@ class GPTBridge:
             self._set_state_dict(mg_mlp, 'router.expert_bias', hf_state_dict, self.hf_expert_bias_key, to_mcore)
 
         if config.moe_shared_expert_intermediate_size:
+            hf_shared_expert_key = self.hf_shared_expert_key
+            if self.llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3'}:
+                hf_shared_expert_key = 'shared_experts'
             hf_state_dict.update(
                 self._set_mlp_state(None if mg_mlp is None else mg_mlp.shared_experts, hf_state_dict,
-                                    f'{self.hf_shared_expert_key}.', layer_idx, to_mcore))
+                                    f'{hf_shared_expert_key}.', layer_idx, to_mcore))
             if config.moe_shared_expert_gate:
-                self._set_state_dict(mg_mlp, 'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
+                self._set_state_dict(mg_mlp, f'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
                                      to_mcore)
         for ep_rank in range(self.ep_size):
             mg_experts = None if mg_mlp is None else mg_mlp.experts

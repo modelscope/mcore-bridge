@@ -147,17 +147,13 @@ class Ovis2_5Vit(HuggingFaceVit):
         VisualTokenizer = get_class_from_dynamic_module('modeling_ovis2_5.VisualTokenizer', hf_config.name_or_path)
         head_dim = hf_config.visual_vocab_size - len(INDICATOR_IDS)
         vit = AutoModel.from_config(hf_config.vit_config)
-        self.visual_tokenizer = VisualTokenizer(vit=vit,
-                                                visual_vocab_size=hf_config.visual_vocab_size,
-                                                image_processor_name_or_path=hf_config.name_or_path)
+        self.visual_tokenizer = VisualTokenizer(
+            vit=vit, visual_vocab_size=hf_config.visual_vocab_size, image_processor_name_or_path=hf_config.name_or_path)
         self.visual_tokenizer.head.to(dtype=vit.dtype)
         self.vte = VisualEmbedding(
             hf_config.visual_vocab_size, hf_config.hidden_size, device=vit.device, dtype=vit.dtype)
         self.indicator_token_indices = torch.arange(
-            hf_config.visual_vocab_size - len(INDICATOR_IDS),
-            hf_config.visual_vocab_size,
-            dtype=torch.long
-        )
+            hf_config.visual_vocab_size - len(INDICATOR_IDS), hf_config.visual_vocab_size, dtype=torch.long)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']

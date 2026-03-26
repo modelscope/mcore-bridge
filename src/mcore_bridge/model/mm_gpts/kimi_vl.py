@@ -19,8 +19,6 @@ class KimiVLBridge(MultimodalGPTBridge):
     hf_lm_head_key = 'language_model.lm_head.weight'
     hf_score_key = 'language_model.score.weight'
 
-    hf_shared_expert_key = 'shared_experts'
-
 
 class KimiVLVit(HuggingFaceVit):
     module_mapping = {'vision_tower': 'vision_tower', 'multi_modal_projector': 'multi_modal_projector'}
