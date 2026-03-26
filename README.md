@@ -80,43 +80,60 @@ uv pip install -e . --torch-backend=auto
 
 ## 🚀 Quick Start
 
+You need to create the following file (test.py), then run `CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 test.py`. Below is sample code demonstrating how to use Mcore-Bridge for model creation, weight loading, export, and saving.
+
+The saved model can be used for inference by referring to the [example code in the model card](https://modelscope.cn/models/Qwen/Qwen3.5-35B-A3B).
+
 ```python
+import os
 import torch
-
-from mcore_bridge import (
-    ModelConfig, get_mcore_model, hf_to_mcore_config, get_peft_model
-)
-from transformers import AutoConfig
+import torch.distributed as dist
+from megatron.core import mpu
 from modelscope import snapshot_download
-from peft import LoraConfig
+from transformers import AutoConfig, AutoProcessor
+from mcore_bridge import ModelConfig, get_mcore_model, hf_to_mcore_config
 
-model_dir = snapshot_download('Qwen/Qwen3.5-4B')
+torch.cuda.set_device(f"cuda:{os.getenv('LOCAL_RANK')}")
+dist.init_process_group(backend='nccl')
+TP, PP, EP, ETP = 2, 2, 2, 1
+mpu.initialize_model_parallel(
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
+)
+
+model_dir = snapshot_download('Qwen/Qwen3.5-35B-A3B')
 hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 config_kwargs = hf_to_mcore_config(hf_config)
 config = ModelConfig(
-    model=model_dir,
-    torch_dtype=torch.bfloat16,
-    tensor_model_parallel_size=2,
-    pipeline_model_parallel_size=2,
+    params_dtype=torch.bfloat16,
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
     sequence_parallel=True,
+    processor=processor,
+    hf_config=hf_config,
     **config_kwargs)
+
+# Create model
 mg_models = get_mcore_model(config)
 
 # Load weights
 bridge = config.bridge
 bridge.load_weights(mg_models, model_dir)
-# Prepare LoRA
-lora_config = LoraConfig(...)
-peft_models = [get_peft_model(mg_model, lora_config) for mg_model in mg_models]
-print(f'peft_model: {peft_models[0]}')
-# Load LoRA (Optional)
-# bridge.load_weights(peft_models, 'adapter-path', peft_format=True)
 
 # Export weights
-for name, parameter in bridge.export_weights(peft_models, peft_format=True):
+for name, parameter in bridge.export_weights(mg_models):
     pass
+
 # Save weights
-bridge.save_weights(peft_models, 'output/Qwen3.5-4B-lora', peft_format=True)
+output_dir = 'Qwen3.5-35B-A3B-HF'
+bridge.save_weights(mg_models, output_dir)
+processor.save_pretrained(output_dir)
+hf_config.save_pretrained(output_dir)
 ```
 
 ## ✨ Usage

@@ -145,7 +145,6 @@ class Ovis2_5Vit(HuggingFaceVit):
         VisualEmbedding = get_class_from_dynamic_module('modeling_ovis2_5.VisualEmbedding', hf_config.name_or_path)
         INDICATOR_IDS = get_class_from_dynamic_module('modeling_ovis2_5.INDICATOR_IDS', hf_config.name_or_path)
         VisualTokenizer = get_class_from_dynamic_module('modeling_ovis2_5.VisualTokenizer', hf_config.name_or_path)
-        head_dim = hf_config.visual_vocab_size - len(INDICATOR_IDS)
         vit = AutoModel.from_config(hf_config.vit_config)
         self.visual_tokenizer = VisualTokenizer(
             vit=vit, visual_vocab_size=hf_config.visual_vocab_size, image_processor_name_or_path=hf_config.name_or_path)

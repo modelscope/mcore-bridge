@@ -553,7 +553,9 @@ class GPTBridge:
                 self._set_weight(
                     mg_attn.linear_qkv.weight, linear_qkv_weight, 'linear_qkv.weight', hf_scale_inv=qkv_scale_inv)
         else:
-            q_dim = self.config.kv_channels * self.config.num_attention_heads // self.config.num_query_groups
+            q_dim = self.config.kv_channels * self.config.num_attention_heads
+            if self.config.attention_output_gate:
+                q_dim *= 2
             kv_dim = self.config.kv_channels
             q_block = q_dim // self.fp8_block_size
             kv_block = kv_dim // self.fp8_block_size
@@ -665,7 +667,7 @@ class GPTBridge:
                 self._set_mlp_state(None if mg_mlp is None else mg_mlp.shared_experts, hf_state_dict,
                                     f'{hf_shared_expert_key}.', layer_idx, to_mcore))
             if config.moe_shared_expert_gate:
-                self._set_state_dict(mg_mlp, f'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
+                self._set_state_dict(mg_mlp, 'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
                                      to_mcore)
         for ep_rank in range(self.ep_size):
             mg_experts = None if mg_mlp is None else mg_mlp.experts
