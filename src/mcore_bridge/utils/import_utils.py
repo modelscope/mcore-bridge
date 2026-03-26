@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # code borrowed from modelscope/ms-swift
 import importlib
+import importlib.util
 import os
 from itertools import chain
 from types import ModuleType
@@ -59,3 +60,8 @@ class _LazyModule(ModuleType):
 
     def __reduce__(self):
         return self.__class__, (self._name, self.__file__, self._import_structure)
+
+
+def is_flash_attn_3_available():
+    return (importlib.util.find_spec('flash_attn_3') is not None
+            and importlib.util.find_spec('flash_attn_interface') is not None)

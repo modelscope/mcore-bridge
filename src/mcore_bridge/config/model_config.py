@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import re
 import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
+from transformers import PretrainedConfig, PreTrainedTokenizerBase
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
@@ -111,10 +113,7 @@ def tuple_type(x):
 
 @dataclass
 class ModelConfig(TransformerConfig):
-    """
-    During Megatron training, multiple models may be created. This class is used to
-    distinguish the configurations of different models.
-    """
+    mcore_model_type: Optional[str] = None  # Inferred from hf_model_type by default
     hf_model_type: Optional[str] = None
     llm_model_type: Optional[str] = None
     padded_vocab_size: Optional[int] = None
@@ -203,14 +202,30 @@ class ModelConfig(TransformerConfig):
     dsa_indexer_use_sparse_loss: bool = False
     dsa_indexer_rotary_interleaved: bool = False
 
+    # visual
+    hf_config: Optional[PretrainedConfig] = None
+    processor: Optional[PreTrainedTokenizerBase] = None
+    vit_gradient_checkpointing: Optional[bool] = None
+    vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'
+    vit_gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
+
     # Override
+    perform_initialization: bool = False
+    apply_query_key_layer_scaling: Optional[bool] = None
+    moe_router_dtype: Literal['none', 'fp32', 'fp64'] = 'fp32'
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = 'alltoall'
+    moe_grouped_gemm: bool = True
+    variable_seq_lengths: bool = True
+
+    overlap_p2p_comm: bool = True
     persist_layer_norm: bool = True
     deallocate_pipeline_outputs: bool = True
     cp_comm_type: str = 'p2p'
 
     # other
-    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = None
+    task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = 'causal_lm'
     num_labels: Optional[int] = None
+    mlp_padding_free: bool = False
 
     _mindspeed_defaults_cache = None
 
@@ -251,12 +266,13 @@ class ModelConfig(TransformerConfig):
                 setattr(self, name, value)
 
     def __post_init__(self):
+        from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
                             'experimental attention variant requires megatron-core>=0.16.0')
-        if self.moe_router_dtype.lower() == 'none':
+        if isinstance(self.moe_router_dtype, str) and self.moe_router_dtype.lower() == 'none':
             self.moe_router_dtype = None
         if self.moe_shared_expert_intermediate_size == 0:
             self.moe_shared_expert_intermediate_size = None
@@ -282,13 +298,31 @@ class ModelConfig(TransformerConfig):
             assert not self.swiglu
             self.gated_linear_unit = True
             self.activation_func = quick_gelu
+        if self.pipeline_dtype is None:
+            self.pipeline_dtype = self.params_dtype
+        if self.apply_query_key_layer_scaling is None:
+            self.apply_query_key_layer_scaling = self.fp16
+        if self.apply_query_key_layer_scaling:
+            os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
+        # patch rotary_interleaved
         _origin_rotary_interleaved = self.rotary_interleaved
         if self.multi_latent_attention and self.rotary_interleaved:
             self.rotary_interleaved = False
         super().__post_init__()
         self.rotary_interleaved = _origin_rotary_interleaved
+
         self._check_npu()
-        self.variable_seq_lengths = True
+        if self.mcore_model_type is None:
+            self.mcore_model_type = get_mcore_model_type(self.hf_model_type)
+        self.model_meta = get_model_meta(self.mcore_model_type)
+        self.is_multimodal = self.model_meta.visual_cls is not None
+        if self.is_multimodal:
+            if self.hf_config is None:
+                raise ValueError('Multimodal model must specify hf_config.')
+            if self.processor is None:
+                raise ValueError('Multimodal model must specify processor.')
+        self.is_moe_model = self.num_moe_experts is not None
+        self.bridge = self.model_meta.bridge_cls(self)
 
     def _format_config(self):
         if self.window_size is not None:

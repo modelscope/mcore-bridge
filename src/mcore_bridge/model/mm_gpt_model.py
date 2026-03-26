@@ -10,7 +10,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from packaging import version
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_env_args, split_cp_inputs
+from mcore_bridge.utils import split_cp_inputs
 
 from .gpt_model import GPTModel
 
@@ -34,12 +34,8 @@ class MultimodalGPTModel(MegatronModule):
         self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
         self.model_meta = config.model_meta
         self.visual = None
-        if self.config.mtp_num_layers:
-            skip_validation = get_env_args('SKIP_MULTIMODAL_MTP_VALIDATION', bool, False)
-            if not skip_validation:
-                raise ValueError('MTP currently does not support multimodal models.')
-        if pre_process and self.megatron_model_meta.visual_cls is not None:
-            self.visual = self.megatron_model_meta.visual_cls(config)
+        if pre_process and self.model_meta.visual_cls is not None:
+            self.visual = self.model_meta.visual_cls(config)
 
     @contextmanager
     def _patch_word_embeddings(self, kwargs):

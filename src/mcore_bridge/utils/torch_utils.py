@@ -9,7 +9,6 @@ import torch.distributed as dist
 import uuid
 from contextlib import contextmanager
 from datasets.utils.filelock import FileLock
-from datetime import timedelta
 from modelscope.hub.utils.utils import get_cache_dir
 from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
 from typing import Any, Mapping, Optional, Union
@@ -40,23 +39,8 @@ def time_synchronize() -> float:
     return time.perf_counter()  # second
 
 
-_DISABLE_USE_BARRIER = False
-
-
-@contextmanager
-def disable_safe_ddp_context_use_barrier():
-    global _DISABLE_USE_BARRIER
-    _DISABLE_USE_BARRIER = True
-    try:
-        yield
-    finally:
-        _DISABLE_USE_BARRIER = False
-
-
 @contextmanager
 def safe_ddp_context(hash_id: Optional[str], use_barrier: bool = True):
-    if _DISABLE_USE_BARRIER:
-        use_barrier = False
     if use_barrier and dist.is_initialized():
         if is_dist():
             if not is_master():
@@ -151,21 +135,6 @@ def empty_cache():
 def gc_collect() -> None:
     gc.collect()
     empty_cache()
-
-
-def init_process_group(backend: Optional[str] = None, timeout: int = 18000000):
-    if dist.is_initialized():
-        return
-    set_device()
-    if backend is None:
-        if is_torch_npu_available():
-            backend = 'hccl'
-        elif torch.cuda.is_available():
-            backend = 'nccl'
-        else:
-            backend = 'gloo'
-    timeout = timedelta(seconds=timeout)
-    dist.init_process_group(backend=backend, timeout=timeout)
 
 
 def to_float_dtype(data: Any, dtype: torch.dtype) -> Any:

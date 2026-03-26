@@ -1,10 +1,10 @@
 # MCore-Bridge: 让 Megatron 训练像 Transformers 一样简单
 
-<p align="center">
+<!-- <p align="center">
     <br>
     <img src="asset/banner.png"/>
     <br>
-<p>
+<p> -->
 
 <p align="center">
     <b>为最先进的大语言模型提供 Megatron-Core 模型定义</b>
@@ -41,7 +41,6 @@
 - [快速开始](#-快速开始)
 - [如何使用](#-如何使用)
 - [License](#-license)
-- [引用](#-引用)
 
 ## ☎ 用户群
 
@@ -49,7 +48,7 @@
 
 微信群 |
 :-------------------------:
-<img src="asset/wechat.png" width="200" height="200">
+<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200">
 
 ## 📝 简介
 
@@ -80,42 +79,61 @@ uv pip install -e . --torch-backend=auto
 
 ## 🚀 快速开始
 
+你需要创建以下文件（test.py），然后运行`CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 test.py`。以下为使用Mcore-Bridge进行创建模型、权重加载、导出、保存的示例代码。
+
+保存的模型，可以参考[模型卡片的示例代码](https://modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)进行推理。
+
 ```python
+import os
 import torch
-
-from mcore_bridge import (
-    ModelConfig, get_mcore_model, hf_to_mcore_config, get_peft_model
-)
-from transformers import AutoConfig
+import torch.distributed as dist
+from megatron.core import mpu
 from modelscope import snapshot_download
-from peft import LoraConfig
+from transformers import AutoConfig, AutoProcessor
+from mcore_bridge import ModelConfig, get_mcore_model, hf_to_mcore_config
 
-model_dir = snapshot_download('Qwen/Qwen3.5-4B')
+torch.cuda.set_device(f"cuda:{os.getenv('LOCAL_RANK')}")
+dist.init_process_group(backend='nccl')
+TP, PP, EP, ETP = 2, 2, 2, 1
+mpu.initialize_model_parallel(
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
+)
+
+model_dir = snapshot_download('Qwen/Qwen3.5-35B-A3B')
 hf_config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_dir, trust_remote_code=True)
 config_kwargs = hf_to_mcore_config(hf_config)
 config = ModelConfig(
-    model=model_dir,
-    torch_dtype=torch.bfloat16,
-    tensor_model_parallel_size=2,
-    pipeline_model_parallel_size=2,
+    params_dtype=torch.bfloat16,
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
     sequence_parallel=True,
+    mtp_num_layers=1,
+    processor=processor,
+    hf_config=hf_config,
     **config_kwargs)
+
+# 创建模型
 mg_models = get_mcore_model(config)
 
 # 加载权重
 bridge = config.bridge
 bridge.load_weights(mg_models, model_dir)
-# 准备LoRA
-lora_config = LoraConfig(...)
-peft_models = [get_peft_model(mg_model, lora_config) for mg_model in mg_models]
-print(f'peft_model: {peft_models[0]}')
-# 加载LoRA（可选）
-# bridge.load_weights(peft_models, 'adapter-path', peft_format=True)
+
 # 导出权重
-for name, parameter in bridge.export_weights(peft_models, peft_format=True):
+for name, parameter in bridge.export_weights(mg_models):
     pass
+
 # 保存权重
-bridge.save_weights(peft_models, 'output/Qwen3.5-4B-lora', peft_format=True)
+output_dir = 'Qwen3.5-35B-A3B-HF'
+bridge.save_weights(mg_models, output_dir)
+processor.save_pretrained(output_dir)
+hf_config.save_pretrained(output_dir)
 ```
 
 ## ✨ 如何使用
@@ -123,9 +141,9 @@ bridge.save_weights(peft_models, 'output/Qwen3.5-4B-lora', peft_format=True)
 
 ## 🏛 License
 
-本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-brige/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。
+本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-bridge/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。
 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/mcore-brige&type=Date)](https://star-history.com/#modelscope/mcore-brige&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/mcore-bridge&type=Date)](https://star-history.com/#modelscope/mcore-bridge&Date)

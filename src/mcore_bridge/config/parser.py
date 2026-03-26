@@ -120,14 +120,8 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.pop('ffn_hidden_size', None)
         if llm_model_type in {'qwen2_moe', 'qwen3_next'} or hf_model_type == 'qwen3_5_moe':
             res['moe_shared_expert_gate'] = True
-    if llm_model_type in {
-            'deepseek',
-            'deepseek_v2',
-            'deepseek_v3',
-            'kimi_k2',
-            'deepseek_v32',
-            'dots1',
-    } or hf_model_type == 'kimi_vl':
+    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1'
+                          } or hf_model_type == 'kimi_vl':
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
@@ -171,13 +165,11 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             # https://github.com/modelscope/ms-swift/pull/8085
             # res['rotary_interleaved'] = False
     elif llm_model_type == 'qwen3_next' or hf_model_type in {'qwen3_5', 'qwen3_5_moe'}:
-        use_mcore_gdn = get_env_args('MCORE_BRIDGE_USE_MCORE_GDN', bool, False)
-        if use_mcore_gdn and llm_model_type == 'qwen3_next':
-            raise ValueError('qwen3_next is not supported for using the megatron-core implementation of GDN.')
-        if use_mcore_gdn:
+        use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
+        res['layernorm_zero_centered_gamma'] = True
+        res['attention_output_gate'] = True
+        if use_mcore_gdn and llm_model_type != 'qwen3_next':
             res['experimental_attention_variant'] = 'gated_delta_net'
-            res['layernorm_zero_centered_gamma'] = True
-            res['attention_output_gate'] = True
         res.setdefault('linear_attention_freq', 4)
     elif llm_model_type == 'minimax_m2':
         res['add_qkv_bias'] = False
