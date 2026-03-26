@@ -1434,6 +1434,16 @@ class GPTBridge:
             for prefix, mg_prefix in self.module_mapping.items():
                 mg_module = deep_getattr(mg_model, f'visual.{mg_prefix}')
                 hf_state_dict.update(self._set_module(mg_module, hf_state_dict, f'{hf_prefix}{prefix}.', to_mcore))
+            generator = getattr(self.config.model_meta.visual_cls, '_generator', None) or []
+            if not self._peft_format and generator and is_master():
+                generator_sd = getattr(self, '_generator_sd', None)
+                if to_mcore and not generator_sd:
+                    self._generator_sd = {
+                        k: v.load()
+                        for k, v in hf_state_dict.items() if any(k.startswith(gen_key) for gen_key in generator)
+                    }
+                elif not to_mcore and generator_sd and self._only_master_rank:
+                    hf_state_dict.update(self._generator_sd)
         if to_mcore:
             hf_state_dict = {}
         else:

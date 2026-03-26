@@ -67,16 +67,12 @@ class MinimaxM2SelfAttention(SelfAttention):
 
 
 class MinimaxM2Bridge(GPTBridge):
+    hf_mlp_prefix = 'block_sparse_moe'
+    hf_expert_bias_key = 'e_score_correction_bias'
 
-    def _set_qk_layernorm(self, mg_attn, hf_attn, hf_state_dict, to_mcore):
+    def _set_qk_layernorm(self, mg_attn, hf_state_dict, to_mcore):
         self._set_state_dict(mg_attn, 'q_norm.weight', hf_state_dict, 'q_norm.weight', to_mcore)
         self._set_state_dict(mg_attn, 'k_norm.weight', hf_state_dict, 'k_norm.weight', to_mcore)
-
-    def get_hf_mlp_prefix(self, layer_idx):
-        return 'block_sparse_moe'
-
-    def get_e_score_correction_bias_key(self, hf_mlp):
-        return 'e_score_correction_bias'
 
     def _set_moe_state(
         self,

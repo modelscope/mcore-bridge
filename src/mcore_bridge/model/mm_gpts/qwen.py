@@ -78,11 +78,11 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (Qwen2_5OmniAudioEncoder,
-                                                                            Qwen2_5OmniForConditionalGeneration,
+                                                                            Qwen2_5OmniThinkerForConditionalGeneration,
                                                                             Qwen2_5OmniVisionEncoder)
         self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(hf_config.thinker_config.audio_config)
         self.visual = Qwen2_5OmniVisionEncoder._from_config(hf_config.thinker_config.vision_config)
-        self.model_cls = Qwen2_5OmniForConditionalGeneration
+        self.model_cls = Qwen2_5OmniThinkerForConditionalGeneration
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         thinker_config = self.hf_config.thinker_config
@@ -94,14 +94,14 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
         if input_features is None:
             input_features = input_ids.new_zeros([1, 128, 128], dtype=self.audio_tower.dtype)
             feature_attention_mask = input_ids.new_ones([1, 128], dtype=torch.bool)
-            audio_res = self.model_cls.get_audio_features(self, input_features, feature_attention_mask)
+            audio_res = self.get_audio_features(input_features, feature_attention_mask)
             if hasattr(audio_res, 'last_hidden_state'):
                 audio_embeds = audio_res.last_hidden_state
             else:
                 audio_embeds = audio_res
             inputs_embeds = inputs_embeds + audio_embeds.mean() * 0.
         else:
-            audio_res = self.model_cls.get_audio_features(self, input_features, feature_attention_mask)
+            audio_res = self.get_audio_features(input_features, feature_attention_mask)
             if hasattr(audio_res, 'last_hidden_state'):
                 audio_embeds = audio_res.last_hidden_state
             else:
@@ -111,6 +111,10 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_embeds)
 
         return inputs_embeds
+
+    def get_audio_features(self, *args, **kwargs):
+        with self.patch_hf_config():
+            return self.model_cls.get_audio_features(self, *args, **kwargs)
 
 
 register_model(

@@ -117,7 +117,6 @@ class OLMoEBridge(GPTBridge):
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         else:
             hf_state_dict = {}
-        hf_attn = self.hf_layers[layer_idx].self_attn
         config = self.config
         if to_mcore:
             if isinstance(mg_attn.linear_qkv, LoraParallelLinear):
@@ -135,7 +134,7 @@ class OLMoEBridge(GPTBridge):
                                  'linear_qkv.lora_A.weight')
                 self._set_weight(mg_attn.linear_qkv.lora_B[self._adapter_name].weight, lora_B,
                                  'linear_qkv.lora_B.weight')
-            elif not self._is_peft_format:
+            elif not self._peft_format:
                 linear_qkv_weight = torch.cat([
                     hf_state_dict['q_proj.weight'].load(),
                     hf_state_dict['k_proj.weight'].load(),
@@ -153,11 +152,12 @@ class OLMoEBridge(GPTBridge):
                 self._set_weight(
                     mg_attn.linear_qkv.weight, linear_qkv_weight, 'linear_qkv.weight', hf_scale_inv=qkv_scale_inv)
         else:
-            q_dim, kv_dim = hf_attn.q_proj.weight.shape[0], hf_attn.k_proj.weight.shape[0]
+            q_dim = self.config.kv_channels * self.config.num_attention_heads // self.config.num_query_groups
+            kv_dim = self.config.kv_channels
             q_block = q_dim // self.fp8_block_size
             kv_block = kv_dim // self.fp8_block_size
             is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
-                                                               LoraParallelLinear) and self._is_peft_format
+                                                               LoraParallelLinear) and self._peft_format
             is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
@@ -175,7 +175,7 @@ class OLMoEBridge(GPTBridge):
                     hf_state_dict['q_proj.lora_B.weight'] = lora_B[:q_dim, :].clone()
                     hf_state_dict['k_proj.lora_B.weight'] = lora_B[q_dim:-kv_dim, :].clone()
                     hf_state_dict['v_proj.lora_B.weight'] = lora_B[-kv_dim:, :].clone()
-            elif not self._is_peft_format:
+            elif not self._peft_format:
                 mg_attn_weight, scale_inv = self._get_weight(
                     None if mg_attn is None else mg_attn.linear_qkv.weight.data, 'linear_qkv.weight')
                 if mg_attn_weight is not None:
@@ -188,7 +188,7 @@ class OLMoEBridge(GPTBridge):
                     hf_state_dict['v_proj.weight_scale_inv'] = scale_inv[-kv_block:, :].clone()
                 del mg_attn_weight
         self._set_state_dict(mg_attn, 'linear_proj.weight', hf_state_dict, 'o_proj.weight', to_mcore)
-        if config.add_qkv_bias and not self._is_peft_format:
+        if config.add_qkv_bias and not self._peft_format:
             if to_mcore:
                 linear_qkv_bias = torch.cat([
                     hf_state_dict['q_proj.bias'].load(),
@@ -204,10 +204,8 @@ class OLMoEBridge(GPTBridge):
                     hf_state_dict['q_proj.bias'] = mg_attn_bias[:q_dim].clone()
                     hf_state_dict['k_proj.bias'] = mg_attn_bias[q_dim:-kv_dim].clone()
                     hf_state_dict['v_proj.bias'] = mg_attn_bias[-kv_dim:].clone()
-        hf_q_norm_key = 'q_norm.weight' if hasattr(hf_attn, 'q_norm') else 'query_layernorm.weight'
-        hf_k_norm_key = 'k_norm.weight' if hasattr(hf_attn, 'k_norm') else 'key_layernorm.weight'
-        self._set_state_dict(mg_attn, 'q_layernorm.weight', hf_state_dict, hf_q_norm_key, to_mcore)
-        self._set_state_dict(mg_attn, 'k_layernorm.weight', hf_state_dict, hf_k_norm_key, to_mcore)
+        self._set_state_dict(mg_attn, 'q_layernorm.weight', hf_state_dict, 'q_norm.weight', to_mcore)
+        self._set_state_dict(mg_attn, 'k_layernorm.weight', hf_state_dict, 'k_norm.weight', to_mcore)
         if to_mcore:
             hf_state_dict = {}
         else:

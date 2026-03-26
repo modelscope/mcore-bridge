@@ -61,7 +61,7 @@ def get_mcore_model_type(hf_model_type: str) -> Optional[str]:
 
 
 def get_model_meta(mcore_model_type: str) -> ModelMeta:
-    return MODEL_MAPPING[mcore_model_type]
+    return MODEL_MAPPING.get(mcore_model_type)
 
 
 class ModelLoader:
