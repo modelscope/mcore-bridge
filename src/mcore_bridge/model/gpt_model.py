@@ -1,11 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import math
 import megatron.core
 import os
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
-import copy
 from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict

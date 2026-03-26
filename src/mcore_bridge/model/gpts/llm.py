@@ -13,7 +13,3 @@ register_model(
             'glm_moe_dsa', 'gpt_oss'
         ],
     ))
-
-
-class GptOssBridge(GPTBridge):
-    hf_gate_key = 'router.weight'

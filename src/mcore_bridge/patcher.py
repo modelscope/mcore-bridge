@@ -20,9 +20,10 @@ from megatron.core.transformer.multi_token_prediction import MultiTokenPredictio
 from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
-from swift.utils import get_logger, is_flash_attn_3_available
 from torch import nn
 from typing import List, Optional, Tuple
+
+from mcore_bridge.utils import get_logger, is_flash_attn_3_available
 
 mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 logger = get_logger()
@@ -815,6 +816,7 @@ def apply_patch():
     _patch_TransformerLayer()
     _patch_TELinear()
     _patch_mrope()
+    from mcore_bridge import tuners  # apply patch
     try:
         _patch_dsa()
     except ImportError:

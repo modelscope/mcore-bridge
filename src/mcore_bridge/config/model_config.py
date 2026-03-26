@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import os
 import re
 import torch.nn.functional as F
 from dataclasses import dataclass

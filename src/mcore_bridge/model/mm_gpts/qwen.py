@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 from PIL import Image
-from torch import nn
 from transformers import AutoModel, PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 

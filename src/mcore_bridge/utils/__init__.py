@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from .dequantizer import Fp8Dequantizer, MxFp4Dequantizer
 from .env import get_dist_setting, get_node_setting, is_dist, is_last_rank, is_local_master, is_master
-from .import_utils import _LazyModule
+from .import_utils import _LazyModule, is_flash_attn_3_available
 from .logger import get_logger
 from .megatron_utils import get_local_layer_specs, split_cp_inputs, unwrap_model
 from .safetensors import SafetensorLazyLoader, StreamingSafetensorSaver

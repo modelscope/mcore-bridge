@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-
 import megatron.core
 from megatron.core import mpu
 from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
