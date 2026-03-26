@@ -123,9 +123,9 @@ bridge.save_weights(peft_models, 'output/Qwen3.5-4B-lora', peft_format=True)
 
 ## 🏛 License
 
-本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-brige/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。
+本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-bridge/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。
 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/mcore-brige&type=Date)](https://star-history.com/#modelscope/mcore-brige&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/mcore-bridge&type=Date)](https://star-history.com/#modelscope/mcore-bridge&Date)
