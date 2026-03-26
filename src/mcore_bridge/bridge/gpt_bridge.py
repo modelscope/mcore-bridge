@@ -553,7 +553,7 @@ class GPTBridge:
                 self._set_weight(
                     mg_attn.linear_qkv.weight, linear_qkv_weight, 'linear_qkv.weight', hf_scale_inv=qkv_scale_inv)
         else:
-            q_dim = self.config.kv_channels * self.config.num_attention_heads
+            q_dim = self.config.kv_channels * self.config.num_attention_heads // self.config.num_query_groups
             if self.config.attention_output_gate:
                 q_dim *= 2
             kv_dim = self.config.kv_channels

@@ -5,7 +5,7 @@ import os
 import torch
 import torch.nn.functional as F
 from collections import OrderedDict
-from copy import deepcopy
+import copy
 from megatron.core import parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -144,7 +144,7 @@ class GPTModel(McoreGPTModel):
 
                     setattr(layer.__class__, 'transformer_layer', property(_value))
                 attention = layer.transformer_layer.self_attention
-                attention.config = deepcopy(attention.config)
+                attention.config = copy.copy(attention.config)
                 attention.config.apply_rope_fusion = False
 
     def _patch_apply_rotary_pos_emb(self):
