@@ -10,17 +10,10 @@ register_model(
         [
             'qwen2', 'llama', 'qwen3', 'qwen2_moe', 'qwen3_moe', 'internlm3', 'mimo', 'deepseek', 'deepseek_v2',
             'deepseek_v3', 'deepseek_v32', 'kimi_k2', 'dots1', 'ernie4_5', 'ernie4_5_moe', 'glm4_moe', 'glm4_moe_lite',
-            'glm_moe_dsa'
+            'glm_moe_dsa', 'gpt_oss'
         ],
     ))
 
 
 class GptOssBridge(GPTBridge):
     hf_gate_key = 'router.weight'
-
-
-register_model(ModelMeta(
-    ModelType.gpt_oss,
-    ['gpt_oss'],
-    bridge_cls=GptOssBridge,
-))

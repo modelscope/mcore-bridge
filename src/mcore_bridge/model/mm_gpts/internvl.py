@@ -12,7 +12,7 @@ from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
 
 
-class Internvl3Bridge(GPTBridge):
+class InternvlBridge(GPTBridge):
     hf_layers_prefix = 'language_model.model.layers'
     hf_embed_key = 'language_model.model.embed_tokens.weight'
     hf_final_layernorm_key = 'language_model.model.norm.weight'
@@ -20,7 +20,7 @@ class Internvl3Bridge(GPTBridge):
     hf_score_key = 'language_model.score.weight'
 
 
-class Internvl3Vit(HuggingFaceVit):
+class InternvlVit(HuggingFaceVit):
     module_mapping = {'vision_model': 'vision_model', 'mlp1': 'mlp1'}
     _vision_tower = ['vision_model']
     _aligner = ['mlp1']
@@ -34,6 +34,9 @@ class Internvl3Vit(HuggingFaceVit):
         self.hf_config.vision_config.use_flash_attn = use_flash_attn
 
     def prepare_model(self, hf_config: PretrainedConfig):
+        llm_model_type = self.config.llm_model_type
+        if llm_model_type not in ['qwen2', 'qwen3', 'qwen3_moe', 'gpt_oss']:
+            raise ValueError(f'{llm_model_type} is not supported for internvl_chat model')
         InternVisionModel = get_class_from_dynamic_module('modeling_internvl_chat.InternVisionModel',
                                                           hf_config.name_or_path)
         self.model_cls = get_class_from_dynamic_module('modeling_internvl_chat.InternVLChatModel',
@@ -77,8 +80,8 @@ register_model(
     ModelMeta(
         ModelType.internvl_chat,
         ['internvl_chat'],
-        bridge_cls=Internvl3Bridge,
-        visual_cls=Internvl3Vit,
+        bridge_cls=InternvlBridge,
+        visual_cls=InternvlVit,
     ))
 
 
@@ -101,6 +104,7 @@ class InternvlHfVit(HuggingFaceVit):
         self.vision_tower = AutoModel.from_config(hf_config.vision_config)
         self.multi_modal_projector = InternVLMultiModalProjector(hf_config).to(self.vision_tower.dtype)
         self.model_cls = InternVLModel
+        self.dtype = self.vision_tower.dtype
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
@@ -113,6 +117,8 @@ class InternvlHfVit(HuggingFaceVit):
                 vision_feature_layer=self.hf_config.vision_feature_layer,
                 vision_feature_select_strategy=self.hf_config.vision_feature_select_strategy,
             )
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
             special_image_mask = input_ids == self.hf_config.image_token_id
             special_image_mask = special_image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -124,6 +130,8 @@ class InternvlHfVit(HuggingFaceVit):
                 vision_feature_layer=self.hf_config.vision_feature_layer,
                 vision_feature_select_strategy=self.hf_config.vision_feature_select_strategy,
             )
+            if hasattr(image_features, 'pooler_output'):
+                image_features = image_features.pooler_output
             inputs_embeds = inputs_embeds + image_features.mean() * 0.
         return inputs_embeds
 

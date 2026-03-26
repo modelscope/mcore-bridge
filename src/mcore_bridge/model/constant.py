@@ -20,8 +20,8 @@ class MLLMModelType:
     qwen3_5 = 'qwen3_5'
     ovis2_5 = 'ovis2_5'
 
-    internvl = 'internvl'
     internvl_chat = 'internvl_chat'
+    internvl = 'internvl'
     glm4v = 'glm4v'
     glm4v_moe = 'glm4v_moe'
     kimi_vl = 'kimi_vl'

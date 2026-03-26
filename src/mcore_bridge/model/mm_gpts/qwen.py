@@ -135,33 +135,38 @@ class Ovis2_5Bridge(GPTBridge):
 
 
 class Ovis2_5Vit(HuggingFaceVit):
-    module_mapping = {'visual_tokenizer.vit': 'vit', 'visual_tokenizer.head': 'head', 'vte': 'vte'}
-    _vision_tower = ['vit', 'vte']
-    _aligner = ['head']
+    module_mapping = {'visual_tokenizer': 'visual_tokenizer', 'vte': 'vte'}
+    _vision_tower = ['visual_tokenizer.vit', 'vte']
+    _aligner = ['visual_tokenizer.head']
 
     def prepare_model(self, hf_config):
         self.min_pixels = get_env_args('min_pixels', int, 448 * 448)
         self.max_pixels = get_env_args('max_pixels', int, 1344 * 1792)
         VisualEmbedding = get_class_from_dynamic_module('modeling_ovis2_5.VisualEmbedding', hf_config.name_or_path)
         INDICATOR_IDS = get_class_from_dynamic_module('modeling_ovis2_5.INDICATOR_IDS', hf_config.name_or_path)
+        VisualTokenizer = get_class_from_dynamic_module('modeling_ovis2_5.VisualTokenizer', hf_config.name_or_path)
         head_dim = hf_config.visual_vocab_size - len(INDICATOR_IDS)
-        self.vit = AutoModel.from_config(hf_config.vit_config)
-        self.head = nn.Sequential(
-            nn.Linear(self.vit.config.hidden_size * self.vit.config.hidden_stride**2, head_dim, bias=False),
-            nn.LayerNorm(head_dim)).to(dtype=self.vit.dtype)
-
+        vit = AutoModel.from_config(hf_config.vit_config)
+        self.visual_tokenizer = VisualTokenizer(vit=vit,
+                                                visual_vocab_size=hf_config.visual_vocab_size,
+                                                image_processor_name_or_path=hf_config.name_or_path)
+        self.visual_tokenizer.head.to(dtype=vit.dtype)
         self.vte = VisualEmbedding(
-            hf_config.visual_vocab_size, hf_config.hidden_size, device=self.vit.device, dtype=self.vit.dtype)
+            hf_config.visual_vocab_size, hf_config.hidden_size, device=vit.device, dtype=vit.dtype)
+        self.indicator_token_indices = torch.arange(
+            hf_config.visual_vocab_size - len(INDICATOR_IDS),
+            hf_config.visual_vocab_size,
+            dtype=torch.long
+        )
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        model = self._hf_model[0]
         input_ids = kwargs['input_ids']
         pixel_values = kwargs.get('pixel_values', None)
         grid_thws = kwargs.get('grid_thws')
         INDICATOR_IDS = [-301, -302, -303, -304]
         VISUAL_ATOM_ID = -300
         device = inputs_embeds.device
-        visual_indicator_embeds = self.vte(model.indicator_token_indices.to(device=device)).to(
+        visual_indicator_embeds = self.vte(self.indicator_token_indices.to(device=device)).to(
             dtype=inputs_embeds.dtype, device=device)
         inputs_embeds = inputs_embeds.clone()
         for i, indicator_id in enumerate(INDICATOR_IDS):

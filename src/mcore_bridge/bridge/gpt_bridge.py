@@ -53,6 +53,7 @@ class GPTBridge:
         self._peft_format = False
         self._adapter_name = 'default'
         self.model_type = config.hf_model_type
+        self.llm_model_type = config.llm_model_type
         self.is_multimodal = config.is_multimodal
         self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
         self.module_mapping = config.model_meta.visual_cls.module_mapping if self.is_multimodal else {}
@@ -647,10 +648,12 @@ class GPTBridge:
         else:
             hf_state_dict = {}
         config = self.config
-        self._set_state_dict(mg_mlp, 'router.weight', hf_state_dict, self.hf_gate_key, to_mcore)
+        hf_gate_key = self.hf_gate_key
+        if self.llm_model_type == 'gpt_oss':
+            hf_gate_key = 'router.weight'
+        self._set_state_dict(mg_mlp, 'router.weight', hf_state_dict, hf_gate_key, to_mcore)
         if config.add_bias_linear:
-            self._set_state_dict(mg_mlp, 'router.bias', hf_state_dict, self.hf_gate_key.replace('weight', 'bias'),
-                                 to_mcore)
+            self._set_state_dict(mg_mlp, 'router.bias', hf_state_dict, hf_gate_key.replace('weight', 'bias'), to_mcore)
         if config.moe_router_enable_expert_bias:
             self._set_state_dict(mg_mlp, 'router.expert_bias', hf_state_dict, self.hf_expert_bias_key, to_mcore)
 
@@ -686,20 +689,19 @@ class GPTBridge:
 
     def _get_hf_experts_attr(self):
         # return hf_grouped, is_gate_up
-        if self.model_type in {
+        if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe'} or self.llm_model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
-                'glm4_moe_lite', 'glm4v_moe', 'minimax_m2', 'olmoe', 'qwen3_next', 'kimi_vl', 'qwen3_omni_moe',
-                'qwen3_5_moe', 'glm_moe_dsa', 'deepseek_v32'
+                'glm4_moe_lite', 'minimax_m2', 'olmoe', 'qwen3_next', 'qwen3_5_moe', 'glm_moe_dsa', 'deepseek_v32'
         }:
             return False, False
-        elif self.model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
+        elif self.model_type in {'qwen3_vl_moe', 'llama4'} or self.llm_model_type in {'gpt_oss'}:
             return True, True
         else:
             # default
             return False, False
 
     def _get_need_transpose(self):
-        if self.model_type in {'qwen3_vl_moe', 'gpt_oss', 'llama4'}:
+        if self.model_type in {'qwen3_vl_moe', 'llama4'} or self.llm_model_type in {'gpt_oss'}:
             return True
         else:
             return False
@@ -820,7 +822,7 @@ class GPTBridge:
                                 gate_up_proj_bias = hf_state_dict['gate_up_proj_bias'].load()
                                 gate_up_proj_bias = gate_up_proj_bias[ep_rank * num_local_experts:(ep_rank + 1)
                                                                       * num_local_experts]
-                            if self.model_type == 'gpt_oss':
+                            if self.llm_model_type == 'gpt_oss':
                                 gate_proj_weight = gate_up_proj_weight[:, ::2]
                                 up_proj_weight = gate_up_proj_weight[:, 1::2]
                                 gate_proj_bias, up_proj_bias = gate_up_proj_bias[:, ::2], gate_up_proj_bias[:, 1::2]
@@ -975,7 +977,7 @@ class GPTBridge:
                                     gate_up_proj_weight = torch.concat(
                                         [hf_state_dict['gate_up_proj'], gate_up_proj_weight], dim=0)
                                 is_last_ckpt = gate_up_proj_weight.shape[0] == config.num_moe_experts
-                                if self.model_type == 'gpt_oss' and is_last_ckpt:
+                                if self.llm_model_type == 'gpt_oss' and is_last_ckpt:
                                     gate_proj_weight, up_proj_weight = gate_up_proj_weight.chunk(2, dim=2)
                                     new_gate_up_proj_weight = torch.empty_like(gate_up_proj_weight)
                                     new_gate_up_proj_weight[..., ::2] = gate_proj_weight
@@ -995,7 +997,7 @@ class GPTBridge:
                                     if 'gate_up_proj_bias' in hf_state_dict:
                                         gate_up_proj_bias = torch.concat(
                                             [hf_state_dict['gate_up_proj_bias'], gate_up_proj_bias], dim=0)
-                                    if self.model_type == 'gpt_oss' and is_last_ckpt:
+                                    if self.llm_model_type == 'gpt_oss' and is_last_ckpt:
                                         gate_proj_bias, up_proj_bias = gate_up_proj_bias.chunk(2, dim=1)
                                         new_gate_up_proj_bias = torch.empty_like(gate_up_proj_bias)
                                         new_gate_up_proj_bias[:, ::2] = gate_proj_bias
@@ -1589,7 +1591,7 @@ class GPTBridge:
             hf_state_dict = {}
         self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
         transformer_layer = None if mtp_layer is None else mtp_layer.transformer_layer
-        if not to_mcore and not self.model_type == 'qwen3_next':
+        if not to_mcore and not self.llm_model_type == 'qwen3_next':
             self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, 'embed_tokens.weight',
                                  to_mcore)
             if self.config.untie_embeddings_and_output_weights:
