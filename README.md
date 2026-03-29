@@ -39,7 +39,7 @@
 - [News](#-news)
 - [Installation](#%EF%B8%8F-installation)
 - [Quick Start](#-quick-Start)
-- [Usage](#-Usage)
+- [Model List](#-Model-List)
 - [License](#-License)
 
 
@@ -47,9 +47,9 @@
 
 You can contact us and communicate with us by adding our group:
 
-WeChat Group |
-:-------------------------:
-<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200">
+| WeChat Group |
+|:-------------------------:|
+| <img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200"> |
 
 ## 📝 Introduction
 
@@ -135,8 +135,24 @@ processor.save_pretrained(output_dir)
 hf_config.save_pretrained(output_dir)
 ```
 
-## ✨ Usage
+## ✨ Model List
 
+The following is the list of models supported by MCore-Bridge:
+
+| Series     | model_type                                                   |
+| -------- | ------------------------------------------------------------ |
+| Qwen     | qwen2, qwen2_moe<br />qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />ovis2_5<br />qwen3, qwen3_moe<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe<br />qwen3_next, qwen3_5, qwen3_5_moe |
+| DeepSeek | deepseek_v3, deepseek_v32                                    |
+| GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm4v, glm4v_moe, <br />glm_moe_dsa |
+| MiniMax  | minimax_m2                                                   |
+| Kimi     | kimi_k2, kimi_vl                                             |
+| InternLM | internlm3, internvl_chat, internvl                           |
+| Llama    | llama, llama4                                                |
+| GPT-OSS  | gpt_oss                                                      |
+| ERNIE    | ernie4_5, ernie4_5_moe                                       |
+| MiMo     | mimo                                                         |
+| Dots     | dots1                                                        |
+| OLMoE    | olmoe                                                        |
 
 ## 🏛 License
 

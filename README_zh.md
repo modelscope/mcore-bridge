@@ -39,16 +39,16 @@
 - [新闻](#-新闻)
 - [安装](#%EF%B8%8F-安装)
 - [快速开始](#-快速开始)
-- [如何使用](#-如何使用)
+- [模型列表](#-模型列表)
 - [License](#-license)
 
 ## ☎ 用户群
 
 请扫描下面的二维码来加入我们的交流群：
 
-微信群 |
-:-------------------------:
-<img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200">
+| 微信群 |
+|:-------------------------:|
+| <img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200"> |
 
 ## 📝 简介
 
@@ -134,7 +134,24 @@ processor.save_pretrained(output_dir)
 hf_config.save_pretrained(output_dir)
 ```
 
-## ✨ 如何使用
+## ✨ 模型列表
+
+以下为MCore-Bridge支持的模型列表：
+
+| 系列     | model_type                                                   |
+| -------- | ------------------------------------------------------------ |
+| Qwen     | qwen2, qwen2_moe<br />qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />ovis2_5<br />qwen3, qwen3_moe<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe<br />qwen3_next, qwen3_5, qwen3_5_moe |
+| DeepSeek | deepseek_v3, deepseek_v32                                    |
+| GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm4v, glm4v_moe, <br />glm_moe_dsa |
+| MiniMax  | minimax_m2                                                   |
+| Kimi     | kimi_k2, kimi_vl                                             |
+| InternLM | internlm3, internvl_chat, internvl                           |
+| Llama    | llama, llama4                                                |
+| GPT-OSS  | gpt_oss                                                      |
+| ERNIE    | ernie4_5, ernie4_5_moe                                       |
+| MiMo     | mimo                                                         |
+| Dots     | dots1                                                        |
+| OLMoE    | olmoe                                                        |
 
 
 ## 🏛 License
