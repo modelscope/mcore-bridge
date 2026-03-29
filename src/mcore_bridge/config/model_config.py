@@ -305,11 +305,7 @@ class ModelConfig(TransformerConfig):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
         # patch rotary_interleaved
-        _origin_rotary_interleaved = self.rotary_interleaved
-        if self.multi_latent_attention and self.rotary_interleaved:
-            self.rotary_interleaved = False
         super().__post_init__()
-        self.rotary_interleaved = _origin_rotary_interleaved
 
         self._check_npu()
         if self.mcore_model_type is None:

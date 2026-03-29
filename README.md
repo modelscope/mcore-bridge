@@ -54,7 +54,7 @@ WeChat Group |
 ## 📝 Introduction
 
 ## 🎉 News
-- 🎉 2025.03.23: MCore-Bridge is released! Making Megatron training as simple as Transformers, providing Megatron-Core model definitions for state-of-the-art large language models.
+- 🎉 2025.04.01: MCore-Bridge is released! Providing Megatron-Core model definitions for state-of-the-art large language models and making Megatron training as simple as Transformers.
 
 ## 🛠️ Installation
 To install using pip:

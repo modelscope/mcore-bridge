@@ -53,7 +53,7 @@
 ## 📝 简介
 
 ## 🎉 新闻
-- 🎁 2026.03.23: Mcore-Bridge发布，让Megatron训练像transformers一样简单，为最先进的大语言模型提供 Megatron-Core 模型定义。
+- 🎁 2026.04.01: MCore-Bridge 正式发布！为最先进的大语言模型提供 Megatron-Core 模型定义，让 Megatron 训练像 Transformers 一样简单。
 
 ## 🛠️ 安装
 使用pip进行安装：

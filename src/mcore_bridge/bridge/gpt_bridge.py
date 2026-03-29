@@ -40,7 +40,7 @@ class GPTBridge:
     hf_k_norm_key = 'k_norm.weight'
     hf_mlp_prefix = 'mlp'
     hf_gate_key = 'gate.weight'
-    hf_shared_expert_key = 'shared_expert'
+    hf_shared_expert_key = None
     hf_expert_bias_key = 'gate.e_score_correction_bias'
 
     def __init__(self, config):
@@ -661,8 +661,11 @@ class GPTBridge:
 
         if config.moe_shared_expert_intermediate_size:
             hf_shared_expert_key = self.hf_shared_expert_key
-            if self.llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3'}:
-                hf_shared_expert_key = 'shared_experts'
+            if hf_shared_expert_key is None:
+                if 'qwen' in self.llm_model_type or self.model_type == 'llama4':
+                    hf_shared_expert_key = 'shared_expert'
+                else:
+                    hf_shared_expert_key = 'shared_experts'
             hf_state_dict.update(
                 self._set_mlp_state(None if mg_mlp is None else mg_mlp.shared_experts, hf_state_dict,
                                     f'{hf_shared_expert_key}.', layer_idx, to_mcore))
