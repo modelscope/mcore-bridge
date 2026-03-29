@@ -8,7 +8,6 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import gpt_model
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
-from PIL import Image
 from typing import List, Optional, Union
 
 from mcore_bridge.bridge import MultimodalGPTBridge
@@ -321,9 +320,9 @@ class Qwen3VL_Vit(HuggingFaceVit):
         self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return self._get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
+        return self._get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.hf_config)
 
-    def _get_inputs_embeds(self, inputs_embeds, inputs, visual, processor, hf_config):
+    def _get_inputs_embeds(self, inputs_embeds, inputs, visual, hf_config):
         input_ids = inputs['input_ids']
         packed_seq_params = inputs.get('packed_seq_params')
         pixel_values = inputs.get('pixel_values')
@@ -331,12 +330,12 @@ class Qwen3VL_Vit(HuggingFaceVit):
         image_grid_thw = inputs.get('image_grid_thw')
         video_grid_thw = inputs.get('video_grid_thw')
         dtype = visual.dtype
+        vision_config = HuggingFaceVit._get_vision_config(hf_config)
         if pixel_values is None and pixel_values_videos is None:  # plain-text
-            images = [Image.new('RGB', (32, 32), (0, 0, 0))]
-            media_inputs = processor.image_processor(images=images, return_tensors='pt')
-            media_inputs = to_device(media_inputs, input_ids.device)
-            pixel_values = media_inputs['pixel_values'].type(dtype)
-            visual_res = visual(pixel_values, grid_thw=media_inputs['image_grid_thw'])
+            hidden_size = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
+            pixel_values = torch.zeros(16 * 16, hidden_size, dtype=dtype, device=input_ids.device)
+            image_grid_thw = input_ids.new_tensor([[1, 16, 16]])
+            visual_res = visual(pixel_values, grid_thw=image_grid_thw)
             if hasattr(visual_res, 'pooler_output'):
                 image_embeds = visual_res.pooler_output
                 deepstack_visual_embeds = visual_res.deepstack_features
@@ -369,7 +368,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 image_embeds = mixed_embeds
                 video_embeds = None
             else:
-                merge_length = processor.image_processor.merge_size**2
+                merge_length = vision_config.spatial_merge_size**2
                 image_tokens = (image_grid_thw.prod(dim=-1) // merge_length).sum()
                 image_embeds = mixed_embeds[:image_tokens]
                 video_embeds = mixed_embeds[image_tokens:]

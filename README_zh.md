@@ -114,8 +114,6 @@ config = ModelConfig(
     expert_tensor_parallel_size=ETP,
     sequence_parallel=True,
     mtp_num_layers=1,
-    processor=processor,
-    hf_config=hf_config,
     **config_kwargs)
 
 # 创建模型

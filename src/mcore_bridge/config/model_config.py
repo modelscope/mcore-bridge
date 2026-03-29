@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
-from transformers import PretrainedConfig, PreTrainedTokenizerBase
+from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
@@ -204,7 +204,6 @@ class ModelConfig(TransformerConfig):
 
     # visual
     hf_config: Optional[PretrainedConfig] = None
-    processor: Optional[PreTrainedTokenizerBase] = None
     vit_gradient_checkpointing: Optional[bool] = None
     vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'
     vit_gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
@@ -315,8 +314,6 @@ class ModelConfig(TransformerConfig):
         if self.is_multimodal:
             if self.hf_config is None:
                 raise ValueError('Multimodal model must specify hf_config.')
-            if self.processor is None:
-                raise ValueError('Multimodal model must specify processor.')
         self.is_moe_model = self.num_moe_experts is not None
         self.bridge = self.model_meta.bridge_cls(self)
 

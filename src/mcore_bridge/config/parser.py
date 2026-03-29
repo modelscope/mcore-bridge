@@ -100,6 +100,7 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
 
 def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     res = _convert_config(hf_config)
+    res['hf_config'] = hf_config
     hf_model_type = res.get('hf_model_type')
     llm_model_type = res.get('llm_model_type') or hf_model_type
     res['llm_model_type'] = llm_model_type

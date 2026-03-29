@@ -33,6 +33,7 @@ class InternvlVit(HuggingFaceVit):
         self.hf_config.vision_config.use_flash_attn = use_flash_attn
 
     def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers import AutoProcessor
         llm_model_type = self.config.llm_model_type
         if llm_model_type not in ['qwen2', 'qwen3', 'qwen3_moe', 'gpt_oss']:
             raise ValueError(f'{llm_model_type} is not supported for internvl_chat model')
@@ -51,6 +52,7 @@ class InternvlVit(HuggingFaceVit):
         self.select_layer = hf_config.select_layer
         self.downsample_ratio = hf_config.downsample_ratio
         self.ps_version = hf_config.ps_version
+        self.processor = AutoProcessor.from_pretrained(hf_config.name_or_path, trust_remote_code=True)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']

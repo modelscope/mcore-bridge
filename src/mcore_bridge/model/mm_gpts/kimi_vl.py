@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
-from PIL import Image
 from transformers import PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
@@ -37,17 +36,18 @@ class KimiVLVit(HuggingFaceVit):
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         input_ids = kwargs['input_ids']
         pixel_values = kwargs.get('pixel_values')
+        vision_config = self.hf_config.vision_config
         if pixel_values is not None and pixel_values.size(0) > 0:
             pixel_values = pixel_values.to(self.vision_tower.dtype)
             image_features: torch.Tensor = self._extract_image_features(pixel_values, kwargs['image_grid_hws'])
             inputs_embeds = inputs_embeds.to(image_features[0].dtype).clone()
             inputs_embeds = self._merge_with_image_features(inputs_embeds, input_ids, image_features)
         else:
-            image_processor = self.processor.image_processor
-            dummy_image = Image.new('RGB', (32, 32), (0, 0, 0))
-            image_inputs = image_processor([dummy_image], return_tensors='pt')
-            pixel_values = image_inputs['pixel_values'].to(self.vision_tower.dtype)
-            image_features: torch.Tensor = self._extract_image_features(pixel_values, image_inputs['image_grid_hws'])
+            pixel_values = torch.zeros((16, 3, vision_config.patch_size, vision_config.patch_size),
+                                       dtype=self.vision_tower.dtype,
+                                       device=input_ids.device)
+            image_grid_hws = input_ids.new_tensor([[4, 4]])
+            image_features: torch.Tensor = self._extract_image_features(pixel_values, image_grid_hws)
             inputs_embeds = inputs_embeds + image_features.mean() * 0.
         return inputs_embeds
 

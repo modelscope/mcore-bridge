@@ -77,7 +77,7 @@ class Qwen3_5Vit(HuggingFaceVit):
         self.visual = Qwen3_5VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
+        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.hf_config)
 
 
 class Qwen3_5Bridge(Qwen3NextBridge):

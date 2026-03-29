@@ -28,7 +28,7 @@ class Qwen2_5VL_Vit(HuggingFaceVit):
         self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, self.hf_config)
+        return self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.hf_config)
 
 
 class Qwen2_5VLBridge(MultimodalGPTBridge):
@@ -85,7 +85,7 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         thinker_config = self.hf_config.thinker_config
-        inputs_embeds = self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, self.processor, thinker_config)
+        inputs_embeds = self._hf_get_inputs_embeds(inputs_embeds, kwargs, self.visual, thinker_config)
         input_ids = kwargs['input_ids']
         input_features = kwargs.get('input_features')
         feature_attention_mask = kwargs.get('feature_attention_mask')
