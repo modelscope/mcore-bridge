@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from .bridge import GPTBridge
     from .config import ModelConfig, hf_to_mcore_config
     from .model import get_mcore_model
+    from .tuners import LoraParallelLinear
     from .utils import get_logger, set_random_seed
     from .version import __release_datetime__, __version__
 else:
@@ -18,6 +19,7 @@ else:
         'bridge': ['GPTBridge'],
         'config': ['ModelConfig', 'hf_to_mcore_config'],
         'model': ['get_mcore_model'],
+        'tuners': ['LoraParallelLinear'],
         'utils': ['get_logger', 'set_random_seed'],
         'version': ['__release_datetime__', '__version__'],
     }
