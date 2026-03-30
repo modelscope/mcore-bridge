@@ -6,7 +6,7 @@ from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceMo
 from transformers import PretrainedConfig, dynamic_module_utils
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import safe_ddp_context, to_device
+from mcore_bridge.utils import safe_ddp_context
 
 
 @contextmanager

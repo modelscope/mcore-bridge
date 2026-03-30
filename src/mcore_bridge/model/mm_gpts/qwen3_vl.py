@@ -11,7 +11,7 @@ from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_
 from typing import List, Optional, Union
 
 from mcore_bridge.bridge import MultimodalGPTBridge
-from mcore_bridge.utils import split_cp_inputs, to_device
+from mcore_bridge.utils import split_cp_inputs
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
