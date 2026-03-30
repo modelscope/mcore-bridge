@@ -221,6 +221,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         self.set_adapter(self.active_adapters)
 
     def _get_rng_context(self, lora):
+        if not get_cuda_rng_tracker().is_initialized():
+            return nullcontext()
         if self.is_expert:
             rng_context = get_cuda_rng_tracker().fork(get_expert_parallel_rng_tracker_name())
         elif getattr(lora, 'parallel_mode', None) is None:

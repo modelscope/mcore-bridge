@@ -100,6 +100,7 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
 
 def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     res = _convert_config(hf_config)
+    res['hf_config'] = hf_config
     hf_model_type = res.get('hf_model_type')
     llm_model_type = res.get('llm_model_type') or hf_model_type
     res['llm_model_type'] = llm_model_type
@@ -162,8 +163,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             res.pop('num_query_groups', None)
         if llm_model_type == 'glm_moe_dsa':
             res['experimental_attention_variant'] = 'dsa'
-            # https://github.com/modelscope/ms-swift/pull/8085
-            # res['rotary_interleaved'] = False
     elif llm_model_type == 'qwen3_next' or hf_model_type in {'qwen3_5', 'qwen3_5_moe'}:
         use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
         res['layernorm_zero_centered_gamma'] = True
@@ -204,10 +203,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         mrope_interleaved = rope_scaling.get('mrope_interleaved', False) or rope_scaling.get('interleaved', False)
         res['mrope_interleaved'] = mrope_interleaved
 
-    if res.get('multi_latent_attention') and res.get('position_embedding_type') in {
-            'rope', None
-    } and 'rotary_interleaved' not in res:
-        res['rotary_interleaved'] = True
     if first_k_dense_replace is not None:
         res['moe_layer_freq'] = f'[0]*{first_k_dense_replace}+[1]*{res["num_layers"] - first_k_dense_replace}'
     if res.get('moe_router_score_function', 'softmax') == 'sigmoid' and 'moe_router_enable_expert_bias' not in res:

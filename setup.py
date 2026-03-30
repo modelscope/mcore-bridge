@@ -43,7 +43,7 @@ if __name__ == '__main__':
         keywords=['transformers', 'LLM', 'lora', 'megatron', 'peft'],
         url='https://github.com/modelscope/mcore-bridge',
         package_dir={'': 'src'},
-        packages=find_packages(include='src'),
+        packages=find_packages('src'),
         python_requires='>=3.8.0',
         classifiers=[
             'Development Status :: 4 - Beta',

@@ -3,11 +3,10 @@ import torch
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
-from PIL import Image
 from transformers import PretrainedConfig, dynamic_module_utils
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import safe_ddp_context, to_device
+from mcore_bridge.utils import safe_ddp_context
 
 
 @contextmanager
@@ -45,7 +44,6 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
         self.prepare_attn_impl()
         with patch_get_dynamic_module():
             self.prepare_model(hf_config)
-        self.processor = config.processor
         self.to(device='cuda')
 
     @abstractmethod
@@ -62,19 +60,25 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
         pass
 
     @staticmethod
-    def _hf_get_inputs_embeds(inputs_embeds, inputs, visual, processor, hf_config):
+    def _get_vision_config(hf_config):
+        for k in ['vision_config', 'vit_config']:
+            if hasattr(hf_config, k):
+                return getattr(hf_config, k)
+
+    @staticmethod
+    def _hf_get_inputs_embeds(inputs_embeds, inputs, visual, hf_config):
         input_ids = inputs['input_ids']
         pixel_values = inputs.get('pixel_values')
         pixel_values_videos = inputs.get('pixel_values_videos')
         image_grid_thw = inputs.get('image_grid_thw')
         video_grid_thw = inputs.get('video_grid_thw')
         dtype = visual.dtype
+        vision_config = HuggingFaceVit._get_vision_config(hf_config)
         if pixel_values is None and pixel_values_videos is None:  # plain-text
-            images = [Image.new('RGB', (32, 32), (0, 0, 0))]
-            media_inputs = processor.image_processor(images=images, return_tensors='pt')
-            media_inputs = to_device(media_inputs, input_ids.device)
-            pixel_values = media_inputs['pixel_values'].type(dtype)
-            image_embeds = visual(pixel_values, grid_thw=media_inputs['image_grid_thw'])
+            hidden_size = vision_config.in_channels * vision_config.temporal_patch_size * vision_config.patch_size**2
+            pixel_values = torch.zeros(16 * 16, hidden_size, dtype=dtype, device=input_ids.device)
+            image_grid_thw = input_ids.new_tensor([[1, 16, 16]])
+            image_embeds = visual(pixel_values, grid_thw=image_grid_thw)
             if hasattr(image_embeds, 'pooler_output'):
                 image_embeds = image_embeds.pooler_output
             inputs_embeds = inputs_embeds + image_embeds.mean().to(device=inputs_embeds.device) * 0.
@@ -99,7 +103,7 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
                 image_embeds = mixed_embeds
                 video_embeds = None
             else:
-                merge_length = processor.image_processor.merge_size**2
+                merge_length = vision_config.spatial_merge_size**2
                 image_tokens = (image_grid_thw.prod(dim=-1) // merge_length).sum()
                 image_embeds = mixed_embeds[:image_tokens]
                 video_embeds = mixed_embeds[image_tokens:]

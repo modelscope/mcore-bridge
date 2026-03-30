@@ -2,12 +2,13 @@
 # code borrowed from modelscope/ms-swift
 import megatron.core
 import torch
-from megatron.core import mpu
+from megatron.core import mpu, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from packaging import version
+from transformers import set_seed
 from typing import Optional
 
 from .logger import get_logger
@@ -79,3 +80,25 @@ def get_local_layer_specs(config, layer_specs, vp_stage=None):
         offset = get_transformer_layer_offset(config, **kwargs)
         local_layer_specs = layer_specs[offset:offset + num_layers_to_build]
     return local_layer_specs
+
+
+def set_random_seed(
+    seed_: int,
+    data_parallel_random_init: bool = False,
+    te_rng_tracker: bool = False,
+    inference_rng_tracker: bool = False,
+    use_cudagraphable_rng: bool = False,
+):
+    """Set random seed for reproducability."""
+    if seed_ is not None and seed_ > 0:
+        # Ensure that different pipeline MP stages get different seeds.
+        seed = seed_ + (1009 * mpu.get_pipeline_model_parallel_rank())
+        # Ensure different data parallel ranks get different seeds
+        if data_parallel_random_init:
+            seed = seed + (11 * mpu.get_data_parallel_rank())
+        set_seed(seed)
+        if torch.cuda.device_count() > 0:
+            tensor_parallel.model_parallel_cuda_manual_seed(seed, te_rng_tracker, inference_rng_tracker,
+                                                            use_cudagraphable_rng)
+    else:
+        raise ValueError(f'Seed ({seed_}) should be a positive integer.')

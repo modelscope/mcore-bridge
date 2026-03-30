@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
-from transformers import PretrainedConfig, PreTrainedTokenizerBase
+from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
@@ -204,7 +204,6 @@ class ModelConfig(TransformerConfig):
 
     # visual
     hf_config: Optional[PretrainedConfig] = None
-    processor: Optional[PreTrainedTokenizerBase] = None
     vit_gradient_checkpointing: Optional[bool] = None
     vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'
     vit_gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
@@ -305,22 +304,15 @@ class ModelConfig(TransformerConfig):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
         # patch rotary_interleaved
-        _origin_rotary_interleaved = self.rotary_interleaved
-        if self.multi_latent_attention and self.rotary_interleaved:
-            self.rotary_interleaved = False
         super().__post_init__()
-        self.rotary_interleaved = _origin_rotary_interleaved
 
         self._check_npu()
         if self.mcore_model_type is None:
             self.mcore_model_type = get_mcore_model_type(self.hf_model_type)
         self.model_meta = get_model_meta(self.mcore_model_type)
         self.is_multimodal = self.model_meta.visual_cls is not None
-        if self.is_multimodal:
-            if self.hf_config is None:
-                raise ValueError('Multimodal model must specify hf_config.')
-            if self.processor is None:
-                raise ValueError('Multimodal model must specify processor.')
+        if self.is_multimodal and self.hf_config is None:
+            raise ValueError('Multimodal model must specify hf_config.')
         self.is_moe_model = self.num_moe_experts is not None
         self.bridge = self.model_meta.bridge_cls(self)
 

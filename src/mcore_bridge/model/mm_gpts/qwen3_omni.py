@@ -34,7 +34,7 @@ class Qwen3Omni_Vit(HuggingFaceVit):
         input_ids = kwargs['input_ids']
         visual = self.visual
         hf_config = self.hf_config.thinker_config
-        res = Qwen3VL_Vit._get_inputs_embeds(self, inputs_embeds, kwargs, visual, self.processor, hf_config)
+        res = Qwen3VL_Vit._get_inputs_embeds(self, inputs_embeds, kwargs, visual, hf_config)
         inputs_embeds = res['inputs_embeds']
         input_features = kwargs.get('input_features')
         feature_attention_mask = kwargs.get('feature_attention_mask')
