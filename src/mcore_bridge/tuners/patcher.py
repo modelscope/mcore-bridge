@@ -42,18 +42,18 @@ def _patch_deepcopy():
     _origin_deepcopy = copy.deepcopy
 
     def new_deepcopy(x, *args, **kwargs):
-        tp_group_keys = ['tp_group', '_tp_group', 'config']
-        saved_tp_groups = {}
+        copy_keys = ['tp_group', '_tp_group', 'config']
+        saved_values = {}
 
-        for key in tp_group_keys:
+        for key in copy_keys:
             if getattr(x, key, None) is not None:
-                saved_tp_groups[key] = getattr(x, key)
+                saved_values[key] = getattr(x, key)
                 setattr(x, key, None)
 
         res = _origin_deepcopy(x, *args, **kwargs)
 
-        if saved_tp_groups:
-            for key, value in saved_tp_groups.items():
+        if saved_values:
+            for key, value in saved_values.items():
                 setattr(x, key, value)
                 setattr(res, key, value)
         return res
