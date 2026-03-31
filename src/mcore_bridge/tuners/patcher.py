@@ -46,16 +46,15 @@ def _patch_deepcopy():
         saved_values = {}
 
         for key in copy_keys:
-            if getattr(x, key, None) is not None:
-                saved_values[key] = getattr(x, key)
+            val = getattr(x, key, None)
+            if val is not None:
+                saved_values[key] = val
                 setattr(x, key, None)
 
         res = _origin_deepcopy(x, *args, **kwargs)
-
-        if saved_values:
-            for key, value in saved_values.items():
-                setattr(x, key, value)
-                setattr(res, key, value)
+        for key, value in saved_values.items():
+            setattr(x, key, value)
+            setattr(res, key, value)
         return res
 
     copy.deepcopy = new_deepcopy
