@@ -12,7 +12,7 @@ if TYPE_CHECKING:
     from .config import ModelConfig, hf_to_mcore_config
     from .model import get_mcore_model
     from .tuners import LoraParallelLinear
-    from .utils import get_logger, set_random_seed, unwrap_model, split_cp_inputs
+    from .utils import get_logger, set_random_seed, split_cp_inputs, unwrap_model
     from .version import __release_datetime__, __version__
 else:
     _import_structure = {
@@ -20,7 +20,7 @@ else:
         'config': ['ModelConfig', 'hf_to_mcore_config'],
         'model': ['get_mcore_model'],
         'tuners': ['LoraParallelLinear'],
-        'utils': ['get_logger', 'set_random_seed', 'unwrap_model', 'split_cp_inputs'],
+        'utils': ['get_logger', 'set_random_seed', 'split_cp_inputs', 'unwrap_model'],
         'version': ['__release_datetime__', '__version__'],
     }
 
