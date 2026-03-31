@@ -38,7 +38,6 @@ model.dispatch_megatron = dispatch_megatron
 
 
 @contextmanager
-@contextmanager
 def _patch_deepcopy():
     _origin_deepcopy = copy.deepcopy
     copy_keys = ('tp_group', '_tp_group', 'config')
