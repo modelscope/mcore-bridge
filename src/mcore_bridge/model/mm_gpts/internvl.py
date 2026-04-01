@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 from torch import nn
-from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer, PretrainedConfig
+from transformers import AutoModel, AutoTokenizer, PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from mcore_bridge.bridge import GPTBridge, MultimodalGPTBridge
