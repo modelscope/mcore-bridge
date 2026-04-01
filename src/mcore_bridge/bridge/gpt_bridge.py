@@ -1642,10 +1642,10 @@ class GPTBridge:
             if converter:
                 new_state_dict = {}
                 for k, v in state_dict.items():
-                    res = converter(k, v)
-                    if res is None:
+                    kv = converter(k, v)
+                    if kv is None:
                         continue
-                    k, v = res
+                    k, v = kv
                     new_state_dict[k] = v
                 state_dict = new_state_dict
             hf_prefix = 'base_model.model.' if peft_format else ''
@@ -1699,10 +1699,10 @@ class GPTBridge:
         with torch.no_grad():
             for k, v in self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc):
                 if converter:
-                    res = converter(k, v)
-                    if res is None:
+                    kv = converter(k, v)
+                    if kv is None:
                         continue
-                    k, v = res
+                    k, v = kv
                 yield k, v
 
     def save_weights(
