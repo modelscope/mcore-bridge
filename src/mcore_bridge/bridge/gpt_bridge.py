@@ -1621,7 +1621,7 @@ class GPTBridge:
         hf_model_dir: str,
         peft_format: bool = False,
         adapter_name: str = 'default',
-        converter=None,
+        converter: Callable = None,
     ):
         """Load weights from safetensors (HuggingFace) format into Megatron model.
 
@@ -1631,6 +1631,7 @@ class GPTBridge:
             peft_format: Whether the weights are in PEFT (LoRA, etc.) format. Defaults to False.
                 If True, loads LoRA delta weights. If False, loads the full model weights.
             adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
+            converter: Used to perform key-value conversion on the newly loaded state_dict.
         """
         self._peft_format = peft_format
         self._adapter_name = adapter_name
@@ -1644,15 +1645,17 @@ class GPTBridge:
             for mg_model in mg_models:
                 list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
 
-    def export_weights(self,
-                       mg_models,
-                       target_device=None,
-                       only_master_rank: bool = False,
-                       peft_format: bool = False,
-                       adapter_name: str = 'default',
-                       converter=None,
-                       tqdm_desc: str = 'Exporting: ',
-                       disable_tqdm: bool = True):
+    def export_weights(
+        self,
+        mg_models,
+        target_device=None,
+        only_master_rank: bool = False,
+        peft_format: bool = False,
+        adapter_name: str = 'default',
+        converter: Callable = None,
+        tqdm_desc: str = 'Exporting: ',
+        disable_tqdm: bool = True,
+    ):
         """Export Megatron model weights to safetensors (HuggingFace) format as a generator.
 
         This method yields weight tensors one by one for streaming save operations or RL weight synchronization,
@@ -1665,6 +1668,8 @@ class GPTBridge:
             peft_format: Whether to export in PEFT (LoRA, etc.) format. Defaults to False.
                 - If True, exports only LoRA delta weights. If False, exports the complete model weights
                 (e.g., after merge-lora or full-parameter fine-tuning).
+            adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
+            converter: Used to perform key-value conversion on the newly exported state_dict.
             tqdm_desc: Description text for the progress bar. Defaults to 'Exporting: '.
             disable_tqdm: Whether to disable the tqdm progress bar. Defaults to True.
 
@@ -1685,7 +1690,10 @@ class GPTBridge:
                 mg_models[i] = mg_model.model
         self.config = mg_models[0].config
         with torch.no_grad():
-            yield from self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc)
+            for k, v in self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc):
+                if converter:
+                    k, v = converter(k, v)
+                yield k, v
 
     def save_weights(
         self,
@@ -1708,6 +1716,8 @@ class GPTBridge:
             peft_format: Whether to save in PEFT (LoRA, etc.) format. Defaults to False.
                 If True, saves LoRA delta weights. If False, saves the complete model weights
                 (e.g., after merge-lora or full-parameter fine-tuning).
+            adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
+            converter: Used to perform key-value conversion on the newly exported state_dict.
             max_shard_size: Maximum size of a single storage file, default is '5GB'.
         """
         gc_collect()
@@ -1719,6 +1729,7 @@ class GPTBridge:
                 only_master_rank=True,
                 peft_format=peft_format,
                 adapter_name=adapter_name,
+                converter=converter,
                 tqdm_desc='Saving: ',
                 disable_tqdm=False):
             saver.add_tensor(k, v)
