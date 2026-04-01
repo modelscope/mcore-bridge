@@ -1640,7 +1640,7 @@ class GPTBridge:
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, peft_format=peft_format) as loader:
             state_dict = loader.get_state_dict()
             if converter:
-                state_dict = dict(converter(k, v) for k, v in state_dict.items())
+                state_dict = dict(converter(k, v, adapter_name=adapter_name) for k, v in state_dict.items())
             hf_prefix = 'base_model.model.' if peft_format else ''
             for mg_model in mg_models:
                 list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
@@ -1692,7 +1692,7 @@ class GPTBridge:
         with torch.no_grad():
             for k, v in self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc):
                 if converter:
-                    k, v = converter(k, v)
+                    k, v = converter(k, v, adapter_name=adapter_name)
                 yield k, v
 
     def save_weights(
