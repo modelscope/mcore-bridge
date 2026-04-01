@@ -1621,7 +1621,7 @@ class GPTBridge:
         hf_model_dir: str,
         peft_format: bool = False,
         adapter_name: str = 'default',
-        converter: Callable = None,
+        converter: Optional[Callable] = None,
     ):
         """Load weights from safetensors (HuggingFace) format into Megatron model.
 
@@ -1640,7 +1640,14 @@ class GPTBridge:
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, peft_format=peft_format) as loader:
             state_dict = loader.get_state_dict()
             if converter:
-                state_dict = dict(converter(k, v) for k, v in state_dict.items())
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    res = converter(k, v)
+                    if res is None:
+                        continue
+                    k, v = res
+                    new_state_dict[k] = v
+                state_dict = new_state_dict
             hf_prefix = 'base_model.model.' if peft_format else ''
             for mg_model in mg_models:
                 list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
@@ -1652,7 +1659,7 @@ class GPTBridge:
         only_master_rank: bool = False,
         peft_format: bool = False,
         adapter_name: str = 'default',
-        converter: Callable = None,
+        converter: Optional[Callable] = None,
         tqdm_desc: str = 'Exporting: ',
         disable_tqdm: bool = True,
     ):
@@ -1692,7 +1699,10 @@ class GPTBridge:
         with torch.no_grad():
             for k, v in self._convert(mg_models, {}, hf_prefix, False, tqdm_desc=tqdm_desc):
                 if converter:
-                    k, v = converter(k, v)
+                    res = converter(k, v)
+                    if res is None:
+                        continue
+                    k, v = res
                 yield k, v
 
     def save_weights(
@@ -1701,7 +1711,7 @@ class GPTBridge:
         output_dir: str,
         peft_format: bool = False,
         adapter_name: str = 'default',
-        converter: Callable = None,
+        converter: Optional[Callable] = None,
         max_shard_size: str = '5GB',
     ) -> None:
         """Save Megatron model checkpoint in safetensors (HuggingFace) format.
