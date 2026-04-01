@@ -11,7 +11,7 @@ from packaging import version
 from peft import PeftModel
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
-from typing import List, Optional, Union
+from typing import Callable, List, Optional, Union
 
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr,
@@ -1615,7 +1615,14 @@ class GPTBridge:
             hf_state_dict.update(origin_hf_state_dict)
         return hf_state_dict
 
-    def load_weights(self, mg_models, hf_model_dir: str, peft_format: bool = False, adapter_name: str = 'default'):
+    def load_weights(
+        self,
+        mg_models,
+        hf_model_dir: str,
+        peft_format: bool = False,
+        adapter_name: str = 'default',
+        converter=None,
+    ):
         """Load weights from safetensors (HuggingFace) format into Megatron model.
 
         Args:
@@ -1631,6 +1638,8 @@ class GPTBridge:
         self._disable_tqdm = False
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, peft_format=peft_format) as loader:
             state_dict = loader.get_state_dict()
+            if converter:
+                state_dict = dict(converter(k, v) for k, v in state_dict.items())
             hf_prefix = 'base_model.model.' if peft_format else ''
             for mg_model in mg_models:
                 list(self._convert([mg_model], state_dict, hf_prefix, True, 'Loading: '))
@@ -1640,6 +1649,8 @@ class GPTBridge:
                        target_device=None,
                        only_master_rank: bool = False,
                        peft_format: bool = False,
+                       adapter_name: str = 'default',
+                       converter=None,
                        tqdm_desc: str = 'Exporting: ',
                        disable_tqdm: bool = True):
         """Export Megatron model weights to safetensors (HuggingFace) format as a generator.
@@ -1663,8 +1674,8 @@ class GPTBridge:
         self._target_device = target_device
         self._only_master_rank = only_master_rank
         self._peft_format = peft_format
+        self._adapter_name = adapter_name
         self._disable_tqdm = disable_tqdm
-        self._adapter_name = 'default'
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
         hf_prefix = 'base_model.model.' if peft_format else ''
@@ -1681,6 +1692,8 @@ class GPTBridge:
         mg_models,
         output_dir: str,
         peft_format: bool = False,
+        adapter_name: str = 'default',
+        converter: Callable = None,
         max_shard_size: str = '5GB',
     ) -> None:
         """Save Megatron model checkpoint in safetensors (HuggingFace) format.
@@ -1705,6 +1718,7 @@ class GPTBridge:
                 target_device='cpu',
                 only_master_rank=True,
                 peft_format=peft_format,
+                adapter_name=adapter_name,
                 tqdm_desc='Saving: ',
                 disable_tqdm=False):
             saver.add_tensor(k, v)
