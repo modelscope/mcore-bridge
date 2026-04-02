@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import os
 import re
 import torch.nn.functional as F
@@ -346,3 +347,14 @@ class ModelConfig(TransformerConfig):
                                f'expert_model_parallel_size={expert_model_parallel_size}. '
                                f'Please set expert_model_parallel_size (EP) to {required_ep} '
                                f'(num_experts / {MAX_NPU_EXPERTS_PER_EP}) or higher.')
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        new_obj = cls.__new__(cls)
+        memo[id(self)] = new_obj
+        for k, v in self.__dict__.items():
+            if k == 'bridge':
+                setattr(new_obj, k, v)
+            else:
+                setattr(new_obj, k, copy.deepcopy(v, memo))
+        return new_obj
