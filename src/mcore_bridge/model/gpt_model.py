@@ -158,6 +158,7 @@ class GPTModel(McoreGPTModel):
             rotary_interleaved: bool = False,
             multi_latent_attention: bool = False,  # not use
             mscale: float = 1.0,
+            **kwargs,
         ) -> torch.Tensor:
             """Apply rotary positional embedding to input tensor T.
 

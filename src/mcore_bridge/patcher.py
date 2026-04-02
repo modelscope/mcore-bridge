@@ -608,6 +608,7 @@ def _patch_mrope():
         multi_latent_attention: bool = False,
         mscale: float = 1.0,
         cp_group: torch.distributed.ProcessGroup = None,
+        **kwargs,
     ) -> torch.Tensor:
         """A baseline implementation of applying RoPE for `thd` format.
 
@@ -629,7 +630,8 @@ def _patch_mrope():
         use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
         if not use_batched_rope:
             logger.warning_once('Using non-batched RoPE, which may affect performance.')
-            kwargs = {'cp_group': cp_group} if mcore_013 else {}
+            if mcore_013:
+                kwargs['cp_group'] = cp_group
             return _origin_apply_rotary_pos_emb_thd(
                 t,
                 cu_seqlens,
@@ -646,6 +648,7 @@ def _patch_mrope():
             rotary_interleaved=rotary_interleaved,
             multi_latent_attention=multi_latent_attention,
             mscale=mscale,
+            **kwargs,
         ).squeeze(1)
 
     rope_utils._apply_rotary_pos_emb_thd = _apply_rotary_pos_emb_thd
