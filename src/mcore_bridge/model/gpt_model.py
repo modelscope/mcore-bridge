@@ -430,7 +430,7 @@ class GPTModel(McoreGPTModel):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                 )
-                loss_mask, num_tokens = roll_tensor(
+                loss_mask, _ = roll_tensor(
                     loss_mask,
                     shifts=-1,
                     dims=-1,
@@ -438,27 +438,23 @@ class GPTModel(McoreGPTModel):
                     packed_seq_params=packed_seq_params,
                 )
                 mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
-                mtp_loss = loss_mask * mtp_loss
+                loss_mask_ = (loss_mask & (mtp_labels != -100))
+                num_tokens = loss_mask_.sum()
+                mtp_loss = loss_mask_ * mtp_loss
                 if self.training:
-                    # TODO(shifangx): remove the use of parallel_state here
-                    # after moving loss logging to loss_func in pretrain_gpt.py
+                    mtp_loss_for_log = (
+                        torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0))
                     MTPLossLoggingHelper.save_loss_to_tracker(
-                        torch.sum(mtp_loss) / num_tokens,
+                        mtp_loss_for_log,
                         mtp_layer_number,
                         self.config.mtp_num_layers,
-                        avg_group=parallel_state.get_data_parallel_group(
-                            with_context_parallel=True
-                        ),
+                        avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
                     )
                 mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
                 if self.config.calculate_per_token_loss:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss
-                    )
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
                 else:
-                    hidden_states = MTPLossAutoScaler.apply(
-                        hidden_states, mtp_loss_scale * mtp_loss / num_tokens
-                    )
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / num_tokens)
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
