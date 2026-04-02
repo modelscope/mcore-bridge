@@ -7,7 +7,7 @@
 <p> -->
 
 <p align="center">
-    <b>为最先进的大语言模型提供 Megatron-Core 模型定义</b>
+    <b>为最先进的大模型提供 Megatron-Core 模型定义</b>
 </p>
 
 <p align="center">
@@ -21,7 +21,7 @@
 <img src="https://img.shields.io/badge/python-3.11-5be.svg">
 <img src="https://img.shields.io/badge/pytorch-%E2%89%A52.0-orange.svg">
 <a href="https://github.com/NVIDIA/Megatron-LM/"><img src="https://img.shields.io/badge/megatron--core-%E2%89%A50.12-76B900.svg"></a>
-<a href="https://mcore-bridge.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-blue.svg"></a>
+<!-- <a href="https://mcore-bridge.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-blue.svg"></a> -->
 <a href="https://pypi.org/project/mcore-bridge/"><img src="https://badge.fury.io/py/mcore-bridge.svg"></a>
 <a href="https://github.com/modelscope/mcore-bridge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/modelscope/mcore-bridge"></a>
 <a href="https://pepy.tech/project/mcore-bridge"><img src="https://pepy.tech/badge/mcore-bridge"></a>
@@ -29,9 +29,9 @@
 </p>
 
 
-<p align="center">
+<!-- <p align="center">
         <a href="https://mcore-bridge.readthedocs.io/en/latest/">English Documentation</a> &nbsp ｜ &nbsp <a href="https://mcore-bridge.readthedocs.io/zh-cn/latest/">中文文档</a> &nbsp
-</p>
+</p> -->
 
 ##  📖 目录
 - [用户群](#-用户群)
@@ -53,7 +53,7 @@
 ## 📝 简介
 
 ## 🎉 新闻
-- 🎉 2026.04.01: MCore-Bridge 正式发布！为最先进的大语言模型提供 Megatron-Core 模型定义，让 Megatron 训练像 Transformers 一样简单。
+- 🎉 2026.03.30: MCore-Bridge 正式发布！为最先进的大模型提供 Megatron-Core 模型定义，让 Megatron 训练像 Transformers 一样简单。
 
 ## 🛠️ 安装
 使用pip进行安装：

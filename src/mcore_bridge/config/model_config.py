@@ -285,6 +285,7 @@ class ModelConfig(TransformerConfig):
 
         if self.add_bias_linear:
             self.add_qkv_bias = True
+        self.batch_p2p_comm = not self.overlap_p2p_comm
         if self.swiglu:
             self.activation_func = F.silu
             self.gated_linear_unit = True
