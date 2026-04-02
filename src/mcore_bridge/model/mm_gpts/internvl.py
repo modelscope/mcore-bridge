@@ -80,7 +80,7 @@ class InternvlVit(HuggingFaceVit):
             inputs_embeds = inputs_embeds + vit_embeds.mean() * 0.
         else:
             vit_embeds = self.extract_feature(pixel_values.to(self.vision_model.dtype))
-            selected = (input_ids == self.processor.encode('<IMG_CONTEXT>', add_special_tokens=False)[0])
+            selected = (input_ids == self.tokenizer.encode('<IMG_CONTEXT>', add_special_tokens=False)[0])
             inputs_embeds = inputs_embeds.clone()
             inputs_embeds[selected] = vit_embeds.reshape(-1, vit_embeds.shape[-1]).to(dtype=inputs_embeds.dtype)
         return inputs_embeds
