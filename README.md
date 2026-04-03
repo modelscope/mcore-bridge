@@ -35,7 +35,6 @@
 
 ## 📖 Table of Contents
 - [Groups](#-Groups)
-- [Introduction](#-introduction)
 - [News](#-news)
 - [Installation](#%EF%B8%8F-installation)
 - [Quick Start](#-quick-Start)
@@ -50,8 +49,6 @@ You can contact us and communicate with us by adding our group:
 | WeChat Group |
 |:-------------------------:|
 | <img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/docs/resources/wechat/megatron.png" width="200" height="200"> |
-
-## 📝 Introduction
 
 ## 🎉 News
 - 🎉 2026.03.30: MCore-Bridge is released! Providing Megatron-Core model definitions for state-of-the-art large models and making Megatron training as simple as Transformers.
@@ -79,6 +76,8 @@ uv pip install -e . --torch-backend=auto
 ```
 
 ## 🚀 Quick Start
+
+How to use MCore-Bridge for training can be referred to the [ms-swift project](https://swift.readthedocs.io/en/latest/Megatron-SWIFT/Mcore-Bridge.html). Here we introduce how to use MCore-Bridge programmatically.
 
 You need to create the following file (test.py), then run `CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun --nproc_per_node=4 test.py`. Below is sample code demonstrating how to use Mcore-Bridge for model creation, weight loading, export, and saving.
 
