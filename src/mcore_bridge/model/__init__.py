@@ -3,4 +3,4 @@ from . import gpts, mm_gpts
 from .constant import ModelType
 from .gpt_model import GPTModel
 from .mm_gpt_model import MultimodalGPTModel
-from .register import get_mcore_model, get_mcore_model_type, get_model_meta
+from .register import MODEL_MAPPING, get_mcore_model, get_mcore_model_type, get_model_meta
