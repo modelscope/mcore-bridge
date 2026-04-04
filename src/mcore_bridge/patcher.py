@@ -425,7 +425,6 @@ def _patch_mtp():
             embedding=embedding,
             packed_seq_params=packed_seq_params,
             hidden_states=hidden_states,
-            packed_seq_params=packed_seq_params,
             decoder_input=decoder_input,
         )
         assert not self.transformer_layer.self_attention.config.apply_rope_fusion
