@@ -101,6 +101,8 @@ class Gemma4TransformerLayer(TransformerLayer):
     def forward(self, *args, per_layer_input=None, **kwargs):
         hidden_states, context = super().forward(*args, **kwargs)
         if per_layer_input is not None and self.hidden_size_per_layer_input:
+            if per_layer_input.dim() == hidden_states.dim() + 1:
+                per_layer_input = per_layer_input[..., self.layer_number - 1, :]
             residual = hidden_states
             hidden_states = self.per_layer_input_gate(hidden_states)
             hidden_states = torch.nn.functional.gelu(hidden_states, approximate='tanh')
@@ -149,6 +151,41 @@ class Gemma4GPTModel(GPTModel):
         if per_layer_inputs is None:
             return per_layer_projection
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        attention_mask: torch.Tensor = None,
+        decoder_input: torch.Tensor = None,
+        labels: torch.Tensor = None,
+        inference_context=None,
+        packed_seq_params=None,
+        extra_block_kwargs: dict = None,
+        runtime_gather_output=None,
+        *,
+        inference_params=None,
+        loss_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        extra_block_kwargs = dict(extra_block_kwargs or {})
+        if self.hidden_size_per_layer_input and decoder_input is not None:
+            per_layer_inputs = self.get_per_layer_inputs(input_ids)
+            extra_block_kwargs['per_layer_input'] = self.project_per_layer_inputs(decoder_input, per_layer_inputs)
+        return super().forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            decoder_input=decoder_input,
+            labels=labels,
+            inference_context=inference_context,
+            packed_seq_params=packed_seq_params,
+            extra_block_kwargs=extra_block_kwargs,
+            runtime_gather_output=runtime_gather_output,
+            inference_params=inference_params,
+            loss_mask=loss_mask,
+            **kwargs,
+        )
 
 
 class Gemma4MultimodalGPTModel(MultimodalGPTModel):
