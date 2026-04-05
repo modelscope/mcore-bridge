@@ -11,6 +11,7 @@ config_mapping = {
     'ffn_hidden_size': ['intermediate_size'],
     'num_attention_heads': ['num_attention_heads'],
     'num_query_groups': ['num_key_value_heads'],
+    'num_global_query_groups': ['num_global_key_value_heads'],
     'max_position_embeddings': ['max_position_embeddings'],
     'layernorm_epsilon': ['rms_norm_eps'],
     'rotary_base': ['rope_theta'],
@@ -21,6 +22,7 @@ config_mapping = {
     'add_qkv_bias': ['attention_bias', 'qkv_bias', 'use_bias'],
     'add_bias_linear': ['mlp_bias'],
     'kv_channels': ['head_dim'],
+    'global_kv_channels': ['global_head_dim'],
     'hf_model_type': ['model_type'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
@@ -60,6 +62,14 @@ config_mapping = {
     'window_size': ['sliding_window'],
     'layer_types': ['layer_types'],
     'interleave_moe_layer_step': ['interleave_moe_layer_step'],
+    # gemma4
+    'hidden_size_per_layer_input': ['hidden_size_per_layer_input'],
+    'vocab_size_per_layer_input': ['vocab_size_per_layer_input'],
+    'num_kv_shared_layers': ['num_kv_shared_layers'],
+    'enable_moe_block': ['enable_moe_block'],
+    'use_double_wide_mlp': ['use_double_wide_mlp'],
+    'num_experts': ['num_experts'],
+    'top_k_experts': ['top_k_experts'],
 }
 
 
@@ -195,6 +205,11 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             res['moe_layer_freq'] = f"[{','.join(moe_layer_freq)}]"
     elif hf_model_type == 'glm4v':
         res['rotary_interleaved'] = True
+    elif hf_model_type == 'gemma4':
+        res['qk_layernorm'] = True
+        if layer_types is not None:
+            res['window_attn_skip_freq'] = f"[{','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])}]"
+            res['layer_types'] = layer_types
 
     if rope_scaling.get('rope_type') is None and rope_scaling.get('type') is not None:
         rope_scaling = {**rope_scaling, 'rope_type': rope_scaling['type']}
