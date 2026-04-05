@@ -406,8 +406,7 @@ class GPTModel(McoreGPTModel):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                embedding=self.embedding,
-                decoder_input=decoder_input,
+                embedding=(self.embedding, decoder_input),
                 **(extra_block_kwargs or {}),
             )
             mtp_labels = labels.clone()

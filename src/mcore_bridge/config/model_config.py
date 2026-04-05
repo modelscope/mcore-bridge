@@ -205,9 +205,7 @@ class ModelConfig(TransformerConfig):
 
     # visual
     hf_config: Optional[PretrainedConfig] = None
-    vit_gradient_checkpointing: Optional[bool] = None
     vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'
-    vit_gradient_checkpointing_kwargs: Optional[Union[dict, str]] = None
 
     # Override
     perform_initialization: bool = False
