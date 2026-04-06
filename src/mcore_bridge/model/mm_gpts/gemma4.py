@@ -1,13 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+from contextlib import nullcontext
+
 import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from megatron.core import tensor_parallel
+from megatron.core.enums import Fp8Recipe
+from megatron.core.fp4_utils import get_fp4_context
+from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.models.gpt import gpt_model
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import TransformerLayer, get_transformer_layer_offset
+from megatron.core.utils import WrappedTensor, deprecate_inference_params, get_pg_rank, make_viewless_tensor
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.model.gpt_model import GPTModel
@@ -52,6 +62,7 @@ class Gemma4SelfAttention(SelfAttention):
         super().__init__(local_config, submodules, *args, **kwargs)
         self.layer_type = layer_type
         self.post_self_attn_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.post_self_attn_layernorm.to(device=next(self.linear_proj.parameters()).device, dtype=config.params_dtype)
 
     def forward(self, hidden_states, *args, **kwargs):
         output, bias = super().forward(hidden_states, *args, **kwargs)
@@ -72,6 +83,7 @@ class Gemma4MLP(MLP):
             local_config.ffn_hidden_size = config.ffn_hidden_size * 2
         super().__init__(local_config, submodules, tp_group=tp_group)
         self.post_mlp_layernorm = Gemma4RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+        self.post_mlp_layernorm.to(device=next(self.linear_fc2.parameters()).device, dtype=config.params_dtype)
 
     def forward(self, hidden_states, *args, **kwargs):
         output, bias = super().forward(hidden_states, *args, **kwargs)
@@ -97,6 +109,10 @@ class Gemma4TransformerLayer(TransformerLayer):
             self.per_layer_input_gate = nn.Linear(config.hidden_size, self.hidden_size_per_layer_input, bias=False)
             self.per_layer_projection = nn.Linear(self.hidden_size_per_layer_input, config.hidden_size, bias=False)
             self.post_per_layer_input_norm = Gemma4RMSNorm(config.hidden_size, eps=config.layernorm_epsilon)
+            device = next(self.self_attention.parameters()).device
+            self.per_layer_input_gate.to(device=device, dtype=config.params_dtype)
+            self.per_layer_projection.to(device=device, dtype=config.params_dtype)
+            self.post_per_layer_input_norm.to(device=device, dtype=config.params_dtype)
 
     def forward(self, *args, per_layer_input=None, **kwargs):
         hidden_states, context = super().forward(*args, **kwargs)
@@ -111,6 +127,283 @@ class Gemma4TransformerLayer(TransformerLayer):
             hidden_states = self.post_per_layer_input_norm(hidden_states)
             hidden_states = residual + hidden_states
         return hidden_states, context
+
+
+class Gemma4TransformerBlock(gpt_model.TransformerBlock):
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        rotary_pos_emb: torch.Tensor,
+        attention_bias: torch.Tensor,
+        packed_seq_params: PackedSeqParams,
+        use_inner_quantization_context: bool,
+        padding_mask: torch.Tensor | None = None,
+        extract_layer_indices=None,
+        layer_offset: int = 0,
+        per_layer_input: torch.Tensor | None = None,
+    ):
+        if per_layer_input is None:
+            return super()._checkpointed_forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                attention_bias=attention_bias,
+                packed_seq_params=packed_seq_params,
+                use_inner_quantization_context=use_inner_quantization_context,
+                padding_mask=padding_mask,
+                extract_layer_indices=extract_layer_indices,
+                layer_offset=layer_offset,
+            )
+
+        if extract_layer_indices is None:
+            extract_layer_indices = set()
+        intermediate_hidden_states = []
+
+        def custom(start: int, end: int):
+
+            def custom_forward(
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask=None,
+                per_layer_input=None,
+            ):
+                for index in range(start, end):
+                    layer = self._get_layer(index)
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with inner_quantization_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            attention_bias=attention_bias,
+                            inference_context=None,
+                            packed_seq_params=packed_seq_params,
+                            padding_mask=padding_mask,
+                            per_layer_input=per_layer_input,
+                        )
+                return hidden_states, context
+
+            return custom_forward
+
+        def checkpoint_handler(forward_func):
+            if self.config.fp8 or self.config.fp4:
+                return gpt_model.te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    padding_mask,
+                    per_layer_input,
+                )
+            return tensor_parallel.checkpoint(
+                forward_func,
+                self.config.distribute_saved_activations,
+                hidden_states,
+                attention_mask,
+                context,
+                context_mask,
+                rotary_pos_emb,
+                padding_mask,
+                per_layer_input,
+            )
+
+        if self.config.recompute_method == 'uniform':
+            layer_idx = 0
+            while layer_idx < self.num_layers_per_pipeline_rank:
+                chunk_end = min(layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank)
+                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+                for idx in range(layer_idx, chunk_end):
+                    if (idx + layer_offset) in extract_layer_indices and idx == chunk_end - 1:
+                        intermediate_hidden_states.append(hidden_states)
+                layer_idx += self.config.recompute_num_layers
+        elif self.config.recompute_method == 'block':
+            recompute_skip_num_layers = 0
+            for layer_idx in range(self.num_layers_per_pipeline_rank):
+                if (self.config.fp8 or self.config.fp4) and not hidden_states.requires_grad:
+                    recompute_skip_num_layers += 1
+                if (
+                    layer_idx >= recompute_skip_num_layers
+                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                ):
+                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                else:
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+                        hidden_states,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        rotary_pos_emb,
+                        padding_mask,
+                        per_layer_input,
+                    )
+                if (layer_idx + layer_offset) in extract_layer_indices:
+                    intermediate_hidden_states.append(hidden_states)
+        else:
+            raise ValueError('Invalid activation recompute method.')
+
+        if len(extract_layer_indices) > 0:
+            return hidden_states, intermediate_hidden_states
+        return hidden_states
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor | WrappedTensor,
+        attention_mask: torch.Tensor | None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        rotary_pos_emb: torch.Tensor | None = None,
+        rotary_pos_cos: torch.Tensor | None = None,
+        rotary_pos_sin: torch.Tensor | None = None,
+        rotary_pos_cos_sin: torch.Tensor | None = None,
+        attention_bias: torch.Tensor | None = None,
+        inference_context: BaseInferenceContext | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        sequence_len_offset: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        extract_layer_indices=None,
+        *,
+        inference_params: BaseInferenceContext | None = None,
+        dynamic_inference_decode_only: bool | None = None,
+        per_layer_input: torch.Tensor | None = None,
+    ):
+        if per_layer_input is None:
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                extract_layer_indices=extract_layer_indices,
+                inference_params=inference_params,
+                dynamic_inference_decode_only=dynamic_inference_decode_only,
+            )
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+        if extract_layer_indices is None:
+            extract_layer_indices = set()
+        intermediate_hidden_states = []
+
+        pp_group = self.pg_collection.pp if hasattr(self.pg_collection, 'pp') else None
+        layer_offset = get_transformer_layer_offset(self.config, self.vp_stage, get_pg_rank(pp_group))
+
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+        if not self.pre_process:
+            hidden_states = self.input_tensor
+
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        rng_context = tensor_parallel.get_cuda_rng_tracker().fork() if self.config.sequence_parallel else nullcontext()
+
+        if self.config.fp8:
+            use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
+            use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
+            outer_quantization_context = get_fp8_context(self.config) if use_outer_quantization_context else nullcontext()
+        elif self.config.fp4:
+            use_inner_quantization_context = True
+            outer_quantization_context = nullcontext()
+        else:
+            use_inner_quantization_context = False
+            outer_quantization_context = nullcontext()
+
+        with rng_context, outer_quantization_context:
+            if self.config.recompute_granularity == 'full' and self.training:
+                checkpointed_result = self._checkpointed_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    context_mask=context_mask,
+                    rotary_pos_emb=rotary_pos_emb,
+                    attention_bias=attention_bias,
+                    packed_seq_params=packed_seq_params,
+                    use_inner_quantization_context=use_inner_quantization_context,
+                    padding_mask=padding_mask,
+                    extract_layer_indices=extract_layer_indices,
+                    layer_offset=layer_offset,
+                    per_layer_input=per_layer_input,
+                )
+                if len(extract_layer_indices) > 0:
+                    hidden_states, intermediate_hidden_states = checkpointed_result
+                else:
+                    hidden_states = checkpointed_result
+            else:
+                for l_no, layer in enumerate(self.layers):
+                    if use_inner_quantization_context:
+                        if self.config.fp8:
+                            inner_quantization_context = get_fp8_context(self.config, layer.layer_number - 1)
+                        elif self.config.fp4:
+                            inner_quantization_context = get_fp4_context(self.config, layer.layer_number - 1)
+                        else:
+                            inner_quantization_context = nullcontext()
+                    else:
+                        inner_quantization_context = nullcontext()
+
+                    with self.offload_context, inner_quantization_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            rotary_pos_cos=rotary_pos_cos,
+                            rotary_pos_sin=rotary_pos_sin,
+                            rotary_pos_cos_sin=rotary_pos_cos_sin,
+                            attention_bias=attention_bias,
+                            inference_context=inference_context,
+                            packed_seq_params=packed_seq_params,
+                            sequence_len_offset=sequence_len_offset,
+                            padding_mask=padding_mask,
+                            per_layer_input=per_layer_input,
+                        )
+                    if (
+                        torch.is_grad_enabled()
+                        and self.config.cpu_offloading
+                        and self.group_prefetch_offload_commit_async is not None
+                    ):
+                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+                    if (l_no + layer_offset) in extract_layer_indices:
+                        intermediate_hidden_states.append(hidden_states)
+
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        if not self.pre_process and len(self.layers) == 0 and not self.final_layernorm:
+            hidden_states = hidden_states.clone()
+        if len(extract_layer_indices) > 0:
+            return hidden_states, intermediate_hidden_states
+        return hidden_states
 
 
 class Gemma4GPTModel(GPTModel):
@@ -135,10 +428,17 @@ class Gemma4GPTModel(GPTModel):
             self.per_layer_projection_norm = Gemma4RMSNorm(self.hidden_size_per_layer_input, eps=config.layernorm_epsilon)
             self.per_layer_input_scale = 2.0**-0.5
             self.per_layer_model_projection_scale = config.hidden_size**-0.5
+            device = self.embedding.word_embeddings.weight.device
+            self.embed_tokens_per_layer.to(device=device, dtype=config.params_dtype)
+            self.per_layer_model_projection.to(device=device, dtype=config.params_dtype)
+            self.per_layer_projection_norm.to(device=device, dtype=config.params_dtype)
 
     def get_per_layer_inputs(self, input_ids: torch.Tensor):
         per_layer_inputs = self.embed_tokens_per_layer(input_ids)
-        return per_layer_inputs.reshape(*input_ids.shape, self.config.num_layers, self.hidden_size_per_layer_input)
+        per_layer_inputs = per_layer_inputs.reshape(*input_ids.shape, self.config.num_layers, self.hidden_size_per_layer_input)
+        if per_layer_inputs.dim() == 4:
+            per_layer_inputs = per_layer_inputs.transpose(0, 1).contiguous()
+        return per_layer_inputs
 
     def project_per_layer_inputs(self, inputs_embeds: torch.Tensor, per_layer_inputs: torch.Tensor | None = None):
         per_layer_projection = self.per_layer_model_projection(inputs_embeds) * self.per_layer_model_projection_scale
@@ -287,6 +587,16 @@ class Gemma4Bridge(MultimodalGPTBridge):
 class Gemma4Loader(ModelLoader):
     model_cls = Gemma4MultimodalGPTModel
 
+    def _patch_transformer_block(self):
+        if hasattr(gpt_model, 'OriginTransformerBlock'):
+            return
+        gpt_model.OriginTransformerBlock = gpt_model.TransformerBlock
+        gpt_model.TransformerBlock = Gemma4TransformerBlock
+
+    def __init__(self, config):
+        super().__init__(config)
+        self._patch_transformer_block()
+
     def get_transformer_layer_spec(self, vp_stage=None):
         self.config.qk_layernorm = True
         layer_spec = self._get_transformer_layer_spec()
@@ -304,6 +614,15 @@ class Gemma4Vit(HuggingFaceVit):
     }
     _vision_tower = ['vision_tower', 'audio_tower']
     _aligner = ['embed_vision', 'embed_audio']
+
+    @staticmethod
+    def _expand_modal_mask(mask: torch.Tensor, inputs_embeds: torch.Tensor) -> torch.Tensor:
+        if mask.dim() == 2 and inputs_embeds.dim() == 3:
+            if mask.shape[:2] == inputs_embeds.shape[:2]:
+                pass
+            elif mask.shape[0] == inputs_embeds.shape[1] and mask.shape[1] == inputs_embeds.shape[0]:
+                mask = mask.transpose(0, 1)
+        return mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from transformers.models.gemma4.modeling_gemma4 import (
@@ -344,7 +663,7 @@ class Gemma4Vit(HuggingFaceVit):
                 return_dict=True,
             ).pooler_output
             image_features = image_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            image_mask = image_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            image_mask = self._expand_modal_mask(image_mask, inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_features)
 
         if pixel_values_videos is not None:
@@ -354,7 +673,7 @@ class Gemma4Vit(HuggingFaceVit):
                 return_dict=True,
             ).pooler_output
             video_features = video_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            video_mask = video_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            video_mask = self._expand_modal_mask(video_mask, inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_features)
 
         if input_features is not None and input_features_mask is not None:
@@ -363,7 +682,7 @@ class Gemma4Vit(HuggingFaceVit):
             audio_mask_from_encoder = audio_output.attention_mask
             audio_features = audio_features[audio_mask_from_encoder]
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
-            audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+            audio_mask = self._expand_modal_mask(audio_mask, inputs_embeds)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
         return inputs_embeds
