@@ -21,6 +21,17 @@ except ImportError:
     _GatedDeltaNet = object
 
 
+def _unpack_sequence(x, cu_seqlens, dim=1):
+    unpacked_x = []
+    num_seqs = cu_seqlens.shape[0] - 1
+    for i in range(num_seqs):
+        idx_start = cu_seqlens[i].item()
+        idx_end = cu_seqlens[i + 1].item()
+        chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
+        unpacked_x.append(x[tuple(chunked_index)])
+    return unpacked_x
+
+
 class GatedDeltaNet(_GatedDeltaNet):
 
     def forward(
@@ -78,14 +89,26 @@ class GatedDeltaNet(_GatedDeltaNet):
 
         if cp_size > 1:
             from megatron.core.ssm.gated_delta_net import get_parameter_local_cp, tensor_a2a_cp2hp, tensor_a2a_hp2cp
-
-            # CP All to All: CP to HP
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba,
-                seq_dim=0,
-                head_dim=-1,
-                cp_group=self.pg_collection.cp,
-            )
+            if cu_seqlens is not None:
+                unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens // self.cp_size, dim=0)
+                outputs = []
+                for qkvzba_i in unpacked_qkvzba:
+                    qkvzba_i = tensor_a2a_cp2hp(
+                        qkvzba_i,
+                        seq_dim=0,
+                        head_dim=-1,
+                        cp_group=self.pg_collection.cp,
+                    )
+                    outputs.append(qkvzba_i)
+                qkvzba = torch.cat(outputs, dim=0)
+            else:
+                # CP All to All: CP to HP
+                qkvzba = tensor_a2a_cp2hp(
+                    qkvzba,
+                    seq_dim=0,
+                    head_dim=-1,
+                    cp_group=self.pg_collection.cp,
+                )
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -226,7 +249,15 @@ class GatedDeltaNet(_GatedDeltaNet):
         norm_out = norm_out.reshape(batch, seq_len, -1)
         norm_out = norm_out.transpose(0, 1).contiguous()
         if cp_size > 1:
-            norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+            if cu_seqlens is not None:
+                unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens, dim=0)
+                outputs = []
+                for norm_out_i in unpacked_norm_out:
+                    norm_out_i = tensor_a2a_hp2cp(norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+                    outputs.append(norm_out_i)
+                norm_out = torch.cat(outputs, dim=0)
+            else:
+                norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
 
         # Output projection
         nvtx_range_push(suffix='out_proj')
