@@ -37,8 +37,8 @@
 - [用户群](#-用户群)
 - [新闻](#-新闻)
 - [安装](#%EF%B8%8F-安装)
-- [快速开始](#-快速开始)
 - [模型列表](#-模型列表)
+- [快速开始](#-快速开始)
 - [License](#-license)
 
 ## ☎ 用户群
@@ -73,6 +73,26 @@ pip install -e .
 # 使用uv
 uv pip install -e . --torch-backend=auto
 ```
+
+## ✨ 模型列表
+
+以下为MCore-Bridge支持的模型列表：
+
+| 系列     | model_type                                                   |
+| -------- | ------------------------------------------------------------ |
+| Qwen     | qwen2, qwen2_moe<br />qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />qwen3, qwen3_moe<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe<br />qwen3_next, qwen3_5, qwen3_5_moe |
+| DeepSeek | deepseek_v3, deepseek_v32                                    |
+| GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm4v, glm4v_moe, <br />glm_moe_dsa |
+| MiniMax  | minimax_m2                                                   |
+| Kimi     | kimi_k2, kimi_vl                                             |
+| InternLM | internlm3, internvl_chat, internvl                           |
+| Ovis     | ovis2_5                                                      |
+| Llama    | llama, llama4                                                |
+| GPT-OSS  | gpt_oss                                                      |
+| ERNIE    | ernie4_5, ernie4_5_moe                                       |
+| MiMo     | mimo                                                         |
+| Dots     | dots1                                                        |
+| OLMoE    | olmoe                                                        |
 
 ## 🚀 快速开始
 
@@ -213,26 +233,6 @@ model_dir = snapshot_download('Qwen/Qwen3.5-4B')
 model = Qwen3_5ForConditionalGeneration.from_pretrained(model_dir)
 peft_model = PeftModel.from_pretrained(model, 'Qwen3.5-4B-LoRA')
 ```
-
-## ✨ 模型列表
-
-以下为MCore-Bridge支持的模型列表：
-
-| 系列     | model_type                                                   |
-| -------- | ------------------------------------------------------------ |
-| Qwen     | qwen2, qwen2_moe<br />qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />qwen3, qwen3_moe<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe<br />qwen3_next, qwen3_5, qwen3_5_moe |
-| DeepSeek | deepseek_v3, deepseek_v32                                    |
-| GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm4v, glm4v_moe, <br />glm_moe_dsa |
-| MiniMax  | minimax_m2                                                   |
-| Kimi     | kimi_k2, kimi_vl                                             |
-| InternLM | internlm3, internvl_chat, internvl                           |
-| Ovis     | ovis2_5                                                      |
-| Llama    | llama, llama4                                                |
-| GPT-OSS  | gpt_oss                                                      |
-| ERNIE    | ernie4_5, ernie4_5_moe                                       |
-| MiMo     | mimo                                                         |
-| Dots     | dots1                                                        |
-| OLMoE    | olmoe                                                        |
 
 
 ## 🏛 License
