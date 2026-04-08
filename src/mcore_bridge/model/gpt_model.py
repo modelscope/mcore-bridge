@@ -402,7 +402,7 @@ class GPTModel(McoreGPTModel):
         if self.config.is_multimodal and self.config.context_parallel_size > 1:
             input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
 
-        if self.mtp_process:
+        if self.mtp_process and labels is not None:
             if self.config.is_multimodal:
                 embedding_ = (self.embedding, decoder_input)
             else:
