@@ -76,6 +76,22 @@ def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwar
     )
 
 
+def _get_tensor_parallel_group_for_lora(base_layer):
+    """Resolve the tensor-parallel group across TE and MindSpeed TE variants.
+
+    Megatron's TE layers expose ``tp_group`` directly, but MindSpeed 0.15.x
+    replaces some TE classes (for example
+    ``MindSpeedTELayerNormColumnParallelLinear``) with implementations that keep
+    the same tensor-parallel semantics under ``parallel_group`` instead. LoRA
+    still needs to forward the right group into the newly created parallel
+    adapter layers, otherwise adapter injection fails before training starts.
+    """
+    tp_group = getattr(base_layer, 'tp_group', None)
+    if tp_group is not None:
+        return tp_group
+    return getattr(base_layer, 'parallel_group', None)
+
+
 class LoraParallelLinear(MegatronModule, LoraLayer):
 
     def __init__(
@@ -146,7 +162,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'is_expert': self.is_expert,
         }
         if mcore_013 and not (mcore_016 and self.is_grouped):
-            kwargs['tp_group'] = self.base_layer.tp_group
+            tp_group = _get_tensor_parallel_group_for_lora(self.base_layer)
+            if tp_group is not None:
+                kwargs['tp_group'] = tp_group
         if isinstance(self.base_layer, TopKRouter):
             router_shape = self.base_layer.weight.shape
             lora_a = _build_local_te_linear(router_shape[1], r, lora_bias, **kwargs)
