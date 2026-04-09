@@ -267,7 +267,8 @@ class GPTBridge:
                 new_state_dict = {}
                 for k, v in hf_state_dict.items():
                     if self._peft_format:
-                        if ('.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k) and f'{self._adapter_name}.' in k:
+                        if ('.lora_A.' in k or '.lora_B.' in k
+                                or '.modules_to_save.' in k) and f'{self._adapter_name}.' in k:
                             k = k.replace(f'{self._adapter_name}.', '')
                             new_state_dict[k] = v
                     else:
