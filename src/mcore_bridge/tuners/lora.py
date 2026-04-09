@@ -1,12 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-from importlib import metadata
 import megatron.core
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import warnings
 from contextlib import contextmanager, nullcontext
+from importlib import metadata
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (TEColumnParallelGroupedLinear, TEColumnParallelLinear,
