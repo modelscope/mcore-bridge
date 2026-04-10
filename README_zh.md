@@ -102,6 +102,7 @@ uv pip install -e . --torch-backend=auto
 
 保存的模型，可以参考[模型卡片的示例代码](https://modelscope.cn/models/Qwen/Qwen3.5-35B-A3B)进行推理。
 
+
 ```python
 # test env: transformers==5.2.0 megatron-core==0.16.1
 import os
