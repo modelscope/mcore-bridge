@@ -267,17 +267,19 @@ class GPTBridge:
                 new_state_dict = {}
                 for k, v in hf_state_dict.items():
                     if self._peft_format:
-                        if ('.lora_A.' in k or '.lora_B.' in k
-                                or '.modules_to_save.' in k) and f'.{self._adapter_name}.' in k:
+                        # Without adding a leading '.' here (e.g., '.lora_A.'),
+                        # we avoid the case where mg_module itself is a linear layer (such as proj1).
+                        if ('lora_A.' in k or 'lora_B.' in k
+                                or 'modules_to_save.' in k) and f'.{self._adapter_name}.' in k:
                             k = k.replace(f'.{self._adapter_name}.', '.')
                             new_state_dict[k] = v
                     else:
-                        if '.lora_A.' in k or '.lora_B.' in k or '.original_module.' in k:
+                        if 'lora_A.' in k or 'lora_B.' in k or 'original_module.' in k:
                             continue
-                        if '.modules_to_save.' in k and f'.{self._adapter_name}.' not in k:
+                        if 'modules_to_save.' in k and f'.{self._adapter_name}.' not in k:
                             continue
-                        k = k.replace('.base_layer.', '.')
-                        k = k.replace(f'.modules_to_save.{self._adapter_name}.', '.')
+                        k = k.replace('base_layer.', '')
+                        k = k.replace(f'modules_to_save.{self._adapter_name}.', '')
                         new_state_dict[k] = v
                 hf_state_dict = new_state_dict
             if self.pp_size > 1:
