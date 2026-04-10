@@ -276,7 +276,7 @@ class GPTBridge:
                     else:
                         if 'lora_A.' in k or 'lora_B.' in k or 'original_module.' in k:
                             continue
-                        if 'modules_to_save.' in k and f'.{self._adapter_name}.' not in k:
+                        if 'modules_to_save.' in k and f'modules_to_save.{self._adapter_name}.' not in k:
                             continue
                         k = k.replace('base_layer.', '')
                         k = k.replace(f'modules_to_save.{self._adapter_name}.', '')
