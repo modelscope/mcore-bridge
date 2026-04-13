@@ -21,6 +21,7 @@ from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import Callable, List, Optional, Tuple
 
 from mcore_bridge.utils import get_logger, is_flash_attn_3_available
@@ -593,8 +594,25 @@ def _patch_TransformerLayer():
 def _patch_TELinear():
 
     def __repr__(self):
-        return (f'{type(self).__name__}(in_features={self.in_features}, '
-                f'out_features={self.out_features}, bias={self.use_bias}, TP={self.tp_size})')
+        if is_torch_npu_available():
+            # MindSpeed 0.15.x changes some TE debug fields to
+            # input_size/output_size. Keep this compatibility on the NPU path
+            # only so GPU and older versions retain their original field
+            # semantics.
+            in_features = getattr(self, 'in_features', getattr(self, 'input_size', None))
+            out_features = getattr(self, 'out_features', getattr(self, 'output_size', None))
+            use_bias = getattr(self, 'use_bias', getattr(self, 'bias', None) is not None)
+            tp_size = getattr(self, 'tp_size', None)
+            if tp_size is None:
+                parallel_mode = getattr(self, 'parallel_mode', None)
+                tp_size = 1 if parallel_mode == 'duplicated' else 'unknown'
+        else:
+            in_features = self.in_features
+            out_features = self.out_features
+            use_bias = self.use_bias
+            tp_size = self.tp_size
+        return (f'{type(self).__name__}(in_features={in_features}, '
+                f'out_features={out_features}, bias={use_bias}, TP={tp_size})')
 
     TELinear.__repr__ = __repr__
 
