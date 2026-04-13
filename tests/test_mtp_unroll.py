@@ -1,9 +1,11 @@
 import types
 
+import pytest
 import torch
 from transformers import PretrainedConfig
 
 from mcore_bridge.config import hf_to_mcore_config
+from mcore_bridge.model.gpt_model import GPTModel
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 
 
@@ -60,3 +62,48 @@ def test_mtp_block_reuses_physical_layers_for_unroll_steps():
     assert layer0.calls == [1, 3, 5]
     assert layer1.calls == [2, 4]
     assert outputs.shape[0] == hidden_states.shape[0] * (1 + block.config.mtp_unroll_steps)
+
+
+def test_multimodal_mtp_reuses_decoder_input_without_detach():
+    captured = {}
+
+    class StopMTP(RuntimeError):
+        pass
+
+    def mtp(**kwargs):
+        captured.update(kwargs.get('extra_block_kwargs') or {})
+        raise StopMTP
+
+    model = types.SimpleNamespace(
+        post_process=True,
+        config=types.SimpleNamespace(
+            task_type='causal_lm',
+            is_multimodal=True,
+            context_parallel_size=1,
+            mtp_num_layers=1,
+            mtp_unroll_steps=None,
+        ),
+        training=True,
+        share_embeddings_and_output_weights=False,
+        mtp_process=True,
+        mtp=mtp,
+        embedding=object(),
+    )
+    decoder_input = torch.randn(2, 1, 4, requires_grad=True)
+
+    with pytest.raises(StopMTP):
+        GPTModel._postprocess(
+            model,
+            hidden_states=torch.randn(2, 1, 4),
+            input_ids=torch.zeros(1, 2, dtype=torch.long),
+            position_ids=torch.zeros(1, 2, dtype=torch.long),
+            labels=torch.zeros(1, 2, dtype=torch.long),
+            rotary_pos_emb=torch.zeros(2, 1, 4),
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            decoder_input=decoder_input,
+            attention_mask=torch.zeros(1, 1, 2, 2, dtype=torch.bool),
+        )
+
+    assert captured['base_decoder_input'] is decoder_input
+    assert captured['base_decoder_input'].requires_grad

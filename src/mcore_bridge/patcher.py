@@ -383,13 +383,14 @@ def _patch_mtp():
     def _shift_decoder_input(
         decoder_input: torch.Tensor,
         cp_group,
+        shifts: int = -1,
         packed_seq_params: PackedSeqParams = None,
     ) -> torch.Tensor:
         # Convert [s, b, h] -> [b, h, s] so roll_tensor can operate on the sequence dimension.
         decoder_input = decoder_input.permute(1, 2, 0).contiguous()
         decoder_input, _ = roll_tensor(
             decoder_input,
-            shifts=-1,
+            shifts=shifts,
             dims=-1,
             cp_group=cp_group,
             packed_seq_params=packed_seq_params,
@@ -468,12 +469,12 @@ def _patch_mtp():
             enable_sp = self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1
             if enable_sp:
                 decoder_input = gather_from_sequence_parallel_region(decoder_input)
-            for _ in range(effective_depth):
-                decoder_input = _shift_decoder_input(
-                    decoder_input,
-                    cp_group=self.cp_group,
-                    packed_seq_params=packed_seq_params,
-                )
+            decoder_input = _shift_decoder_input(
+                decoder_input,
+                cp_group=self.cp_group,
+                shifts=-effective_depth,
+                packed_seq_params=packed_seq_params,
+            )
             if enable_sp:
                 decoder_input = scatter_to_sequence_parallel_region(decoder_input)
             hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)

@@ -407,7 +407,7 @@ class GPTModel(McoreGPTModel):
             mtp_depth = getattr(self.config, 'mtp_unroll_steps', None) or self.config.mtp_num_layers
             mtp_extra_block_kwargs = dict(extra_block_kwargs or {})
             if self.config.is_multimodal and decoder_input is not None:
-                mtp_extra_block_kwargs['base_decoder_input'] = decoder_input.detach()
+                mtp_extra_block_kwargs['base_decoder_input'] = decoder_input
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
