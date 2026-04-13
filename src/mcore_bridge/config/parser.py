@@ -47,6 +47,7 @@ config_mapping = {
     'linear_key_head_dim': ['linear_key_head_dim'],
     'linear_value_head_dim': ['linear_value_head_dim'],
     'linear_conv_kernel_dim': ['linear_conv_kernel_dim'],
+    'mtp_unroll_steps': ['mtp_unroll_steps'],
     # dsa
     'dsa_indexer_n_heads': ['index_n_heads'],
     'dsa_indexer_head_dim': ['index_head_dim'],

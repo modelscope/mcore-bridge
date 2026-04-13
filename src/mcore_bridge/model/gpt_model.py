@@ -404,10 +404,10 @@ class GPTModel(McoreGPTModel):
             input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
 
         if self.mtp_process and labels is not None:
-            if self.config.is_multimodal:
-                embedding_ = (self.embedding, decoder_input)
-            else:
-                embedding_ = self.embedding
+            mtp_depth = getattr(self.config, 'mtp_unroll_steps', None) or self.config.mtp_num_layers
+            mtp_extra_block_kwargs = dict(extra_block_kwargs or {})
+            if self.config.is_multimodal and decoder_input is not None:
+                mtp_extra_block_kwargs['base_decoder_input'] = decoder_input.detach()
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -419,16 +419,16 @@ class GPTModel(McoreGPTModel):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                embedding=embedding_,
-                **(extra_block_kwargs or {}),
+                embedding=self.embedding,
+                extra_block_kwargs=mtp_extra_block_kwargs or None,
             )
             mtp_labels = labels.clone()
-            hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_num_layers, dim=0)
+            hidden_states_list = torch.chunk(hidden_states, 1 + mtp_depth, dim=0)
             hidden_states = hidden_states_list[0]
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
-            for mtp_layer_number in range(self.config.mtp_num_layers):
+            for mtp_layer_number in range(mtp_depth):
                 # output
                 mtp_logits, _ = self.output_layer(
                     hidden_states_list[mtp_layer_number + 1],
@@ -460,10 +460,10 @@ class GPTModel(McoreGPTModel):
                     MTPLossLoggingHelper.save_loss_to_tracker(
                         mtp_loss_for_log,
                         mtp_layer_number,
-                        self.config.mtp_num_layers,
+                        mtp_depth,
                         avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
                     )
-                mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_num_layers
+                mtp_loss_scale = self.config.mtp_loss_scaling_factor / mtp_depth
                 if self.config.calculate_per_token_loss:
                     hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
                 else:
