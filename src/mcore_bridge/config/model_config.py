@@ -203,6 +203,10 @@ class ModelConfig(TransformerConfig):
     dsa_indexer_use_sparse_loss: bool = False
     dsa_indexer_rotary_interleaved: bool = False
 
+    # mtp
+    mtp_unroll_steps: Optional[int] = None
+    decoder_input_detach: bool = True
+
     # visual
     hf_config: Optional[PretrainedConfig] = None
     vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'

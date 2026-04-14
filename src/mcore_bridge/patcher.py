@@ -16,7 +16,7 @@ from megatron.core.tensor_parallel.mappings import (gather_from_sequence_paralle
                                                     scatter_to_sequence_parallel_region)
 from megatron.core.transformer import TransformerLayer
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer, MultiTokenPredictionBlock, get_mtp_layer_offset
 from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
@@ -394,6 +394,7 @@ def _patch_mtp():
         packed_seq_params: PackedSeqParams = None,
         sequence_len_offset: torch.Tensor = None,
         embedding=None,
+        depth_idx: int = None,
     ):
         """
         Execute the forward pass through the Multi-Token Prediction (MTP) layer.
@@ -417,7 +418,9 @@ def _patch_mtp():
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
-        # TODO: Multimodal compatible
+        # current unroll depth
+        effective_depth = self.layer_number if depth_idx is None else depth_idx
+
         assert context is None, 'multi token prediction + cross attention is not yet supported.'
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
@@ -433,7 +436,7 @@ def _patch_mtp():
             rotary_pos_emb = rotary_pos_emb[position_ids[0]]
         else:
             # mrope or not packed_seq
-            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-self.layer_number, dims=0)
+            rotary_pos_emb = torch.roll(rotary_pos_emb, shifts=-effective_depth, dims=0)
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
                 partial(
@@ -470,6 +473,60 @@ def _patch_mtp():
         return hidden_states, input_ids, position_ids
 
     MultiTokenPredictionLayer.forward = forward
+
+    def block_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor,
+        context: torch.Tensor = None,
+        context_mask: torch.Tensor = None,
+        rotary_pos_emb: torch.Tensor = None,
+        rotary_pos_cos: torch.Tensor = None,
+        rotary_pos_sin: torch.Tensor = None,
+        attention_bias: torch.Tensor = None,
+        inference_params: InferenceParams = None,
+        packed_seq_params: PackedSeqParams = None,
+        sequence_len_offset: torch.Tensor = None,
+        extra_block_kwargs: Optional[dict] = None,
+        embedding=None,
+    ):
+        """Perform the forward pass through all MTP modules with optional layer reuse."""
+        offset = get_mtp_layer_offset(self.config, self.vp_stage)
+        hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
+        hidden_states = hidden_states_list[offset]
+
+        physical_num_layers = len(self.layers)
+        unroll_steps = getattr(self.config, 'mtp_unroll_steps', None) or self.config.mtp_num_layers
+
+        for step in range(unroll_steps):
+            layer = self.layers[step % physical_num_layers]
+            global_depth = offset + step + 1
+            hidden_states, input_ids, position_ids = layer(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                inference_params=inference_params,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                embedding=embedding,
+                depth_idx=global_depth,
+                **(extra_block_kwargs or {}),
+            )
+            hidden_states_list.append(hidden_states)
+
+        hidden_states = torch.cat(hidden_states_list, dim=0)
+        return hidden_states
+
+    MultiTokenPredictionBlock.forward = block_forward
+
+
+
 
     def _get_embeddings(
         self,
