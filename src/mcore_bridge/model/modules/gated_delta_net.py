@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from typing import List, Optional
 
@@ -17,7 +18,7 @@ except ImportError:
 
 try:
     from megatron.core.ssm.gated_delta_net import GatedDeltaNet as _GatedDeltaNet
-    from megatron.core.ssm.gated_delta_net import torch_chunk_gated_delta_rule
+    from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules, torch_chunk_gated_delta_rule
 except ImportError:
     _GatedDeltaNet = object
 
@@ -82,6 +83,9 @@ def get_parameter_local_cp(
 
 
 class GatedDeltaNet(_GatedDeltaNet):
+
+    def __init__(self, config: TransformerConfig, submodules: 'GatedDeltaNetSubmodules', *args, **kwargs):
+        super().__init__(config, submodules, *args, **kwargs)
 
     def forward(
         self,
