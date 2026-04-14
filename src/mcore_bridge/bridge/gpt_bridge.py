@@ -1241,6 +1241,7 @@ class GPTBridge:
         num_key_heads = config.linear_num_key_heads
         key_dim = config.linear_key_head_dim
         value_dim = config.linear_value_head_dim * config.linear_num_value_heads // num_key_heads
+        hidden_size_block = config.hidden_size // self.fp8_block_size
         if to_mcore:
             if isinstance(mg_attn.in_proj_qkvz, LoraParallelLinear):
                 lora_A = hf_state_dict['in_proj_qkvz.lora_A.weight'].load()
@@ -1267,7 +1268,19 @@ class GPTBridge:
                     hf_state_dict['in_proj_z.weight'].load().reshape(num_key_heads, -1, config.hidden_size)
                 ],
                                            dim=1).reshape((-1, config.hidden_size))
-                self._set_weight(mg_attn.in_proj_qkvz.weight, in_proj_weight, 'in_proj_qkvz.weight')
+                in_scale_inv = None
+                if 'in_proj_qkv.weight_scale_inv' in hf_state_dict:
+                    qkv_scale_inv = hf_state_dict['in_proj_qkv.weight_scale_inv'].load()
+                    q_si, k_si, v_si = torch.split(
+                        qkv_scale_inv, [x * num_key_heads // 128 for x in [key_dim, key_dim, value_dim]], dim=0)
+                    in_scale_inv = torch.cat([
+                        *(x.reshape(num_key_heads, -1, hidden_size_block) for x in [q_si, k_si, v_si]),
+                        hf_state_dict['in_proj_z.weight_scale_inv'].load().reshape(num_key_heads, -1,
+                                                                                   hidden_size_block),
+                    ],
+                                             dim=1).reshape((-1, hidden_size_block))
+                self._set_weight(
+                    mg_attn.in_proj_qkvz.weight, in_proj_weight, 'in_proj_qkvz.weight', hf_scale_inv=in_scale_inv)
         else:
             qkv_dim = key_dim * 2 + value_dim
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj,
@@ -1293,8 +1306,8 @@ class GPTBridge:
                     hf_state_dict['in_proj_qkv.lora_B.weight'] = torch.concat([q_lora_B, k_lora_B, v_lora_B], dim=0)
                     hf_state_dict['in_proj_z.lora_B.weight'] = lora_B[:, qkv_dim:].reshape(-1, lora_B.shape[-1]).clone()
             elif not self._peft_format:
-                in_proj_weight, _ = self._get_weight(None if mg_attn is None else mg_attn.in_proj_qkvz.weight.data,
-                                                     'in_proj_qkvz.weight')
+                in_proj_weight, scale_inv = self._get_weight(
+                    None if mg_attn is None else mg_attn.in_proj_qkvz.weight.data, 'in_proj_qkvz.weight')
                 if in_proj_weight is not None:
                     in_proj_weight = in_proj_weight.reshape(num_key_heads, -1, config.hidden_size)
                     q = in_proj_weight[:, :key_dim].reshape(-1, config.hidden_size)
@@ -1303,6 +1316,15 @@ class GPTBridge:
                     hf_state_dict['in_proj_qkv.weight'] = torch.concat([q, k, v], dim=0)
                     hf_state_dict['in_proj_z.weight'] = in_proj_weight[:, qkv_dim:].reshape(-1,
                                                                                             config.hidden_size).clone()
+                if scale_inv is not None:
+                    key_block = key_dim // self.fp8_block_size
+                    qkv_block = qkv_dim // self.fp8_block_size
+                    scale_inv = scale_inv.reshape(num_key_heads, -1, hidden_size_block)
+                    q = scale_inv[:, :key_block].reshape(-1, hidden_size_block)
+                    k = scale_inv[:, key_block:2 * key_block].reshape(-1, hidden_size_block)
+                    v = scale_inv[:, 2 * key_block:qkv_block].reshape(-1, hidden_size_block)
+                    hf_state_dict['in_proj_qkv.weight'] = torch.concat([q, k, v], dim=0)
+                    hf_state_dict['in_proj_z.weight'] = scale_inv[:, qkv_block:].reshape(-1, hidden_size_block).clone()
         if to_mcore:
             if isinstance(mg_attn.in_proj_ba, LoraParallelLinear):
                 lora_A = hf_state_dict['in_proj_b.lora_A.weight'].load()

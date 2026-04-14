@@ -173,7 +173,10 @@ class GatedDeltaNet(_GatedDeltaNet):
         nvtx_range_push(suffix='in_proj')
         qkvz, _ = self.in_proj_qkvz(hidden_states)
         ba, _ = self.in_proj_ba(hidden_states)
-        qkvzba = torch.concat([qkvz, ba], dim=0)
+        num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
+        qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_device, qkvz.shape[-1] // num_key_heads_per_device))
+        ba = ba.view(ba.shape[:-1] + (num_key_heads_per_device, ba.shape[-1] // num_key_heads_per_device))
+        qkvzba = torch.concat([qkvz, ba], dim=-1).view(*qkvz.shape[:2], -1)
         nvtx_range_pop(suffix='in_proj')
 
         if cp_size > 1:
@@ -198,15 +201,11 @@ class GatedDeltaNet(_GatedDeltaNet):
                     head_dim=-1,
                     cp_group=self.pg_collection.cp,
                 )
-
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
-        qkvzba = qkvzba.transpose(0, 1)
-
-        # Split, reorder, and reshape the tensor into q, k, v, gate, beta, alpha
-        num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
         qkvzba = qkvzba.view(qkvzba.shape[:-1]
                              + (num_key_heads_per_device, qkvzba.shape[-1] // num_key_heads_per_device))
+        qkvzba = qkvzba.transpose(0, 1)
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
