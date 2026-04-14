@@ -1240,7 +1240,6 @@ class GPTBridge:
         num_key_heads = config.linear_num_key_heads
         key_dim = config.linear_key_head_dim
         value_dim = config.linear_value_head_dim * config.linear_num_value_heads // num_key_heads
-        hidden_size_block = config.hidden_size // self.fp8_block_size
         if to_mcore:
             if isinstance(mg_attn.in_proj, LoraParallelLinear):
                 lora_A = hf_state_dict['in_proj_qkv.lora_A.weight'].load()
@@ -1249,11 +1248,12 @@ class GPTBridge:
                        (lora_A == hf_state_dict['in_proj_a.lora_A.weight'].load()).all(), \
                        'Need to ensure QKVZBA\'s lora_A are consistent'
                 qkv_lora_B = hf_state_dict['in_proj_qkv.lora_B.weight'].load()
+                q_lora_B, k_lora_B, v_lora_B = torch.split(
+                    qkv_lora_B, [key_dim * num_key_heads, key_dim * num_key_heads, value_dim * num_key_heads], dim=0)
                 lora_B = torch.cat([
-                    qkv_lora_B.reshape(num_key_heads, -1, qkv_lora_B.shape[-1]),
-                    hf_state_dict['in_proj_z.lora_B.weight'].load().reshape(num_key_heads, -1, qkv_lora_B.shape[-1]),
-                    hf_state_dict['in_proj_b.lora_B.weight'].load().reshape(num_key_heads, -1, qkv_lora_B.shape[-1]),
-                    hf_state_dict['in_proj_a.lora_B.weight'].load().reshape(num_key_heads, -1, qkv_lora_B.shape[-1]),
+                    *(x.reshape(num_key_heads, -1, qkv_lora_B.shape[-1]) for x in [q_lora_B, k_lora_B, v_lora_B]),
+                    *(hf_state_dict[f'{key}.lora_B.weight'].load().reshape(num_key_heads, -1, qkv_lora_B.shape[-1])
+                      for key in ['in_proj_z', 'in_proj_b', 'in_proj_a'])
                 ],
                                    dim=1).reshape(-1, qkv_lora_B.shape[-1])
                 self._set_weight(mg_attn.in_proj.lora_A[self._adapter_name].weight, lora_A, 'in_proj.lora_A.weight')
@@ -1264,31 +1264,15 @@ class GPTBridge:
                     qkv, [key_dim * num_key_heads, key_dim * num_key_heads, value_dim * num_key_heads], dim=0)
                 in_proj_weight = torch.cat([
                     *(x.reshape(num_key_heads, -1, config.hidden_size) for x in [q, k, v]),
-                    *(hf_state_dict[key].load().reshape(num_key_heads, -1, config.hidden_size)
-                      for key in ['in_proj_z.weight', 'in_proj_b.weight', 'in_proj_a.weight']),
+                    *(hf_state_dict[f'{key}.weight'].load().reshape(num_key_heads, -1, config.hidden_size)
+                      for key in ['in_proj_z', 'in_proj_b', 'in_proj_a']),
                 ],
                                            dim=1).reshape((-1, config.hidden_size))
-                in_scale_inv = None
-                if 'in_proj_qkv.weight_scale_inv' in hf_state_dict:
-                    in_scale_inv = torch.cat([
-                        hf_state_dict['in_proj_qkv.weight_scale_inv'].load().reshape(
-                            (num_key_heads, -1, hidden_size_block)),
-                        hf_state_dict['in_proj_z.weight_scale_inv'].load().reshape(
-                            (num_key_heads, -1, hidden_size_block)),
-                        hf_state_dict['in_proj_b.weight_scale_inv'].load().reshape(
-                            (num_key_heads, -1, hidden_size_block)),
-                        hf_state_dict['in_proj_a.weight_scale_inv'].load().reshape(
-                            (num_key_heads, -1, hidden_size_block)),
-                    ],
-                                             dim=1).reshape((-1, hidden_size_block))
                 self._set_weight(mg_attn.in_proj.weight, in_proj_weight, 'in_proj.weight', hf_scale_inv=in_scale_inv)
         else:
             qkv_dim = key_dim * 2 + value_dim
             z_dim = value_dim
             a_dim = config.linear_num_value_heads // num_key_heads
-            qkv_block = qkv_dim // self.fp8_block_size
-            z_block = z_dim // self.fp8_block_size
-            a_block = a_dim // self.fp8_block_size
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj,
                                                                LoraParallelLinear) and self._peft_format
             is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
@@ -1306,8 +1290,10 @@ class GPTBridge:
                     self._peft_target_modules.update({'in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a'})
                     for key in ['in_proj_qkv', 'in_proj_z', 'in_proj_b', 'in_proj_a']:
                         hf_state_dict[f'{key}.lora_A.weight'] = lora_A.clone()
-                    hf_state_dict['in_proj_qkv.lora_B.weight'] = lora_B[:, :qkv_dim].reshape(-1,
-                                                                                             lora_B.shape[-1]).clone()
+                    q_lora_B = lora_B[:, :key_dim].reshape(-1, lora_B.shape[-1])
+                    k_lora_B = lora_B[:, key_dim:2 * key_dim].reshape(-1, lora_B.shape[-1])
+                    v_lora_B = lora_B[:, 2 * key_dim:qkv_dim].reshape(-1, lora_B.shape[-1])
+                    hf_state_dict['in_proj_qkv.lora_B.weight'] = torch.concat([q_lora_B, k_lora_B, v_lora_B], dim=0)
                     hf_state_dict['in_proj_z.lora_B.weight'] = lora_B[:, qkv_dim:qkv_dim + z_dim].reshape(
                         -1, lora_B.shape[-1]).clone()
                     hf_state_dict['in_proj_b.lora_B.weight'] = lora_B[:, qkv_dim + z_dim:-a_dim].reshape(
@@ -1328,17 +1314,6 @@ class GPTBridge:
                         -1, config.hidden_size).clone()
                     hf_state_dict['in_proj_a.weight'] = in_proj_weight[:, -a_dim:].reshape(-1,
                                                                                            config.hidden_size).clone()
-                if scale_inv is not None:
-                    scale_inv = scale_inv.reshape((num_key_heads, -1, hidden_size_block))
-                    hf_state_dict['in_proj_qkv.weight_scale_inv'] = scale_inv[:, :qkv_block].reshape(
-                        -1, hidden_size_block).clone()
-                    hf_state_dict['in_proj_z.weight_scale_inv'] = scale_inv[:, qkv_block:qkv_block + z_block].reshape(
-                        -1, hidden_size_block).clone()
-                    hf_state_dict['in_proj_b.weight_scale_inv'] = scale_inv[:, qkv_block + z_block:-a_block].reshape(
-                        -1, hidden_size_block).clone()
-                    hf_state_dict['in_proj_a.weight_scale_inv'] = scale_inv[:, -a_block:].reshape(
-                        -1, hidden_size_block).clone()
-                del in_proj_weight
         if not self._peft_format:
             if to_mcore:
                 conv1d = hf_state_dict['conv1d.weight'].load()
