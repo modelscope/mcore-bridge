@@ -367,37 +367,4 @@ class GatedDeltaNet(_GatedDeltaNet):
             sharded_state_dict[f'{prefix}in_proj.weight'],
         )
 
-        sharded_state_dict[f'{prefix}in_proj.weight'] = _split_tensor_factory(
-            sharded_state_dict[f'{prefix}in_proj.weight'],
-            [
-                self.qk_dim // self.tp_size,
-                self.qk_dim // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.v_dim // self.tp_size,
-                self.num_value_heads // self.tp_size,
-                self.num_value_heads // self.tp_size,
-            ],
-            ['query', 'key', 'value', 'z', 'beta', 'alpha'],
-            0,
-        )
-
-        conv_layer_name_list = ['conv1d.weight']
-        assert (sharded_state_dict[f'{prefix}conv1d.weight'].data.size(0) == self.conv_dim_local_tp), (
-            self.conv_dim_local_tp, sharded_state_dict[f'{prefix}conv1d.weight'])
-        if self.conv_bias:
-            conv_layer_name_list.append('conv1d.bias')
-            assert (sharded_state_dict[f'{prefix}conv1d.bias'].data.size(0) == self.conv_dim_local_tp), (
-                self.conv_dim_local_tp, sharded_state_dict[f'{prefix}conv1d.bias'])
-        for conv_layer_name in conv_layer_name_list:
-            sharded_state_dict[f'{prefix}{conv_layer_name}'] = _split_tensor_factory(
-                sharded_state_dict[f'{prefix}{conv_layer_name}'],
-                [
-                    self.qk_dim // self.tp_size,
-                    self.qk_dim // self.tp_size,
-                    self.v_dim // self.tp_size,
-                ],
-                ['query', 'key', 'value'],
-                0,
-            )
-
         return sharded_state_dict
