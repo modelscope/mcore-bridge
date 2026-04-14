@@ -8,7 +8,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from typing import List, Optional
-
+import transformer_engine
 try:
     from fla.modules.convolution import causal_conv1d
     from fla.modules.l2norm import l2norm
@@ -107,19 +107,24 @@ class GatedDeltaNet(_GatedDeltaNet):
             tp_comm_buffer_name='fc1',
             tp_group=self.pg_collection.tp,
         )
-        self.in_proj_ba = build_module(
-            submodules.in_proj,
-            self.hidden_size,
-            self.in_proj_ba_dim,
-            config=self.config,
-            init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='fc1_ba',
-            tp_group=self.pg_collection.tp,
-        )
+        if config.fp8_param:
+            fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
+        else:
+            fp8_context = nullcontext()
+        with fp8_context:
+            self.in_proj_ba = build_module(
+                submodules.in_proj,
+                self.hidden_size,
+                self.in_proj_ba_dim,
+                config=self.config,
+                init_method=self.config.init_method,
+                gather_output=False,
+                bias=self.bias,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='fc1_ba',
+                tp_group=self.pg_collection.tp,
+            )
 
     def forward(
         self,
