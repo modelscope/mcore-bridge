@@ -16,7 +16,8 @@ from megatron.core.tensor_parallel.mappings import (gather_from_sequence_paralle
                                                     scatter_to_sequence_parallel_region)
 from megatron.core.transformer import TransformerLayer
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer, MultiTokenPredictionBlock, get_mtp_layer_offset
+from megatron.core.transformer.multi_token_prediction import (MultiTokenPredictionBlock, MultiTokenPredictionLayer,
+                                                              get_mtp_layer_offset)
 from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
@@ -524,9 +525,6 @@ def _patch_mtp():
         return hidden_states
 
     MultiTokenPredictionBlock.forward = block_forward
-
-
-
 
     def _get_embeddings(
         self,

@@ -1,11 +1,10 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+from types import SimpleNamespace
 
 import mcore_bridge  # noqa: F401
 import mcore_bridge.model.gpt_model as gpt_model_mod
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
 from mcore_bridge.model.gpt_model import GPTModel
 
 
@@ -85,9 +84,7 @@ def test_postprocess_uses_unroll_steps_for_mtp_loss(monkeypatch):
     monkeypatch.setattr(
         gpt_model_mod.MTPLossLoggingHelper,
         'save_loss_to_tracker',
-        lambda loss, layer_number, total_layers, avg_group=None: saved_losses.append(
-            (layer_number, total_layers)
-        ),
+        lambda loss, layer_number, total_layers, avg_group=None: saved_losses.append((layer_number, total_layers)),
     )
     monkeypatch.setattr(
         gpt_model_mod.parallel_state,
