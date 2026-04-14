@@ -1317,7 +1317,8 @@ class GPTBridge:
         if not self._peft_format:
             if to_mcore:
                 conv1d = hf_state_dict['conv1d.weight'].load()
-                q_c, k_c, v_c = torch.split(conv1d, [key_dim, key_dim, value_dim], dim=0)
+                q_c, k_c, v_c = torch.split(
+                    conv1d, [key_dim * num_key_heads, key_dim * num_key_heads, value_dim * num_key_heads], dim=0)
                 conv1d = torch.cat([
                     *(x.reshape(num_key_heads, -1, *conv1d.shape[-2:]) for x in [q_c, k_c, v_c]),
                 ],
