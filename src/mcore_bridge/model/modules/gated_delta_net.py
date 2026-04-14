@@ -3,8 +3,7 @@ import torch
 import torch.nn.functional as F
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint,
-                                             sharded_state_dict_default)
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from typing import List, Optional
 
 try:
@@ -317,7 +316,7 @@ class GatedDeltaNet(_GatedDeltaNet):
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""
-        from megatron.core.ssm.gated_delta_net import _split_tensor_factory
+        from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 
         # Guard for cases metadata is not provided
         metadata = ensure_metadata_has_dp_cp_group(metadata)
