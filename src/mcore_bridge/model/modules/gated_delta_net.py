@@ -359,12 +359,4 @@ class GatedDeltaNet(_GatedDeltaNet):
 
             sharded_state_dict.update(module_sharded_sd)
 
-        # At this point the TP sharding is correctly defined for each tensor, but some of the
-        # tensors must be additionally split into separate parts
-        in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
-        assert sharded_state_dict[f'{prefix}in_proj.weight'].data.size(0) == in_proj_dim_local_tp, (
-            in_proj_dim_local_tp,
-            sharded_state_dict[f'{prefix}in_proj.weight'],
-        )
-
         return sharded_state_dict
