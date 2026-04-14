@@ -1375,6 +1375,7 @@ class GPTBridge:
                 in_proj_weight, _ = self._get_weight(None if mg_attn is None else mg_attn.in_proj_ba.weight.data,
                                                      'in_proj_ba.weight')
                 if in_proj_weight is not None:
+                    in_proj_weight = in_proj_weight.reshape(num_key_heads, -1, config.hidden_size)
                     hf_state_dict['in_proj_b.weight'] = in_proj_weight[:, :-a_dim].reshape(-1,
                                                                                            config.hidden_size).clone()
                     hf_state_dict['in_proj_a.weight'] = in_proj_weight[:, -a_dim:].reshape(-1,
