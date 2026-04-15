@@ -708,9 +708,9 @@ class GPTBridge:
 
     def _get_hf_experts_attr(self, is_mtp: bool = False):
         # return hf_grouped, is_gate_up
-        if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe'} or self.llm_model_type in {
+        if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'} or self.llm_model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
-                'glm4_moe_lite', 'minimax_m2', 'olmoe', 'qwen3_next', 'qwen3_5_moe', 'glm_moe_dsa', 'deepseek_v32'
+                'glm4_moe_lite', 'minimax_m2', 'olmoe', 'qwen3_next', 'glm_moe_dsa', 'deepseek_v32'
         }:
             return False, False
         elif self.model_type in {'qwen3_vl_moe', 'llama4'} or self.llm_model_type in {'gpt_oss'}:
@@ -1757,7 +1757,8 @@ class GPTBridge:
             hf_state_dict = {}
         self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
         transformer_layer = None if mtp_layer is None else mtp_layer.transformer_layer
-        if not to_mcore and not self.llm_model_type == 'qwen3_next':
+        # TODO: check
+        if not to_mcore and self.llm_model_type in {'deepseek_v3', 'deepseek_v32', 'glm4_moe', 'glm4_moe_lite'}:
             self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, 'embed_tokens.weight',
                                  to_mcore)
             if self.config.untie_embeddings_and_output_weights:
