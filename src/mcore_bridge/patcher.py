@@ -429,6 +429,7 @@ def _patch_mtp():
             embedding=embedding,
             packed_seq_params=packed_seq_params,
             hidden_states=hidden_states,
+            depth=effective_depth,
         )
         assert not self.transformer_layer.self_attention.config.apply_rope_fusion
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -533,6 +534,7 @@ def _patch_mtp():
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        depth: int = 1,
     ):
         from megatron.core.transformer.multi_token_prediction import roll_tensor
         from megatron.core.utils import make_viewless_tensor
@@ -563,13 +565,17 @@ def _patch_mtp():
             enable_sp = self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1
             if enable_sp:
                 decoder_input = gather_from_sequence_parallel_region(decoder_input)
-            decoder_input, _ = roll_tensor(
-                decoder_input.transpose(0, 2),
-                shifts=-1,
-                dims=-1,
-                cp_group=self.cp_group,
-                packed_seq_params=packed_seq_params,
-            )
+            decoder_input = decoder_input.transpose(0, 2)
+            # Megatron's roll_tensor is implemented around single-token left shifts, especially
+            # for packed sequences / CP, so apply depth as repeated -1 rolls instead of -depth.
+            for _ in range(depth):
+                decoder_input, _ = roll_tensor(
+                    decoder_input,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
             decoder_input = decoder_input.transpose(0, 2).contiguous()
             if enable_sp:
                 decoder_input = scatter_to_sequence_parallel_region(decoder_input)

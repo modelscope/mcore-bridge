@@ -69,6 +69,87 @@ def test_mtp_block_reuses_single_physical_layer_across_unroll_steps():
     assert [chunk[0, 0, 0].item() for chunk in chunks] == [0.0, 1.0, 3.0, 6.0]
 
 
+def test_mtp_block_rolls_multimodal_decoder_input_by_global_depth(monkeypatch):
+    from megatron.core.transformer import multi_token_prediction as mtp_mod
+
+    monkeypatch.setattr(
+        mtp_mod,
+        'roll_tensor',
+        lambda tensor, shifts, dims, cp_group=None, packed_seq_params=None: (
+            torch.roll(tensor, shifts=shifts, dims=dims), tensor.numel()),
+    )
+
+    class RecordingMultimodalLayer:
+
+        def __init__(self):
+            self.layer_number = 1
+            self.cp_group = None
+            self.training = False
+            self.decoder_inputs = []
+            self.config = SimpleNamespace(
+                position_embedding_type='rope',
+                recompute_granularity='selective',
+                sequence_parallel=False,
+                tensor_model_parallel_size=1,
+            )
+            self.transformer_layer = SimpleNamespace(
+                self_attention=SimpleNamespace(
+                    config=SimpleNamespace(apply_rope_fusion=False),
+                ))
+
+        _get_embeddings = mtp_mod.MultiTokenPredictionLayer._get_embeddings
+        __call__ = mtp_mod.MultiTokenPredictionLayer.forward
+
+        def _proj_and_transformer_layer(
+            self,
+            *,
+            hidden_states,
+            decoder_input,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            attention_bias,
+            inference_params,
+            packed_seq_params,
+            sequence_len_offset,
+        ):
+            self.decoder_inputs.append(decoder_input.clone())
+            return hidden_states
+
+    layer = RecordingMultimodalLayer()
+    block = SimpleNamespace(
+        config=SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_unroll_steps=3,
+            pipeline_model_parallel_size=1,
+            pipeline_model_parallel_layout=None,
+        ),
+        vp_stage=None,
+        layers=[layer],
+    )
+
+    hidden_states = torch.zeros(4, 1, 1)
+    input_ids = torch.zeros(1, 4, dtype=torch.long)
+    position_ids = torch.zeros(1, 4, dtype=torch.long)
+    decoder_input = torch.arange(4, dtype=torch.float).view(4, 1, 1)
+    rotary_pos_emb = torch.zeros(4, 1, 1)
+
+    MultiTokenPredictionBlock.forward(
+        block,
+        input_ids=input_ids,
+        position_ids=position_ids,
+        hidden_states=hidden_states,
+        attention_mask=None,
+        rotary_pos_emb=rotary_pos_emb,
+        embedding=(lambda **kwargs: None, decoder_input),
+    )
+
+    assert [tensor[0, 0, 0].item() for tensor in layer.decoder_inputs] == [1.0, 2.0, 3.0]
+
+
 def test_postprocess_uses_unroll_steps_for_mtp_loss(monkeypatch):
     saved_losses = []
     monkeypatch.setattr(
