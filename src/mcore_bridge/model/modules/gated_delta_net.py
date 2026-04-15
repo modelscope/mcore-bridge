@@ -2,6 +2,7 @@
 import torch
 import torch.nn.functional as F
 import transformer_engine
+from contextlib import nullcontext
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
