@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import torch
 import torch.nn.functional as F
 import transformer_engine
@@ -93,6 +94,8 @@ class GatedDeltaNet(_GatedDeltaNet):
         if config.linear_decoupled_in_proj:
             in_proj = submodules.in_proj
             submodules.in_proj = IdentityOp
+        if 'cp_comm_type' not in inspect.signature(_GatedDeltaNet).parameters:
+            kwargs.pop('cp_comm_type', None)
         super().__init__(config, submodules, *args, **kwargs)
         if not config.linear_decoupled_in_proj:
             return
