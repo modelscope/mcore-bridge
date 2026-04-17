@@ -175,7 +175,6 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         from megatron.core.transformer.multi_token_prediction import roll_tensor
-        from megatron.core.utils import make_viewless_tensor
 
         # Calc logits for the current Multi-Token Prediction (MTP) layers.
         input_ids, _ = roll_tensor(
