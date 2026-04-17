@@ -53,6 +53,7 @@ class GPTBridge:
         self._only_master_rank = False
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
+        self._fp8_skip_modules = set()
         self._peft_format = False
         self._adapter_name = 'default'
         self.model_type = config.hf_model_type
@@ -1745,8 +1746,10 @@ class GPTBridge:
         prog_bar.close()
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
-        for key in ['enorm.weight', 'hnorm.weight', 'eh_proj.weight']:
+        keys = ['enorm.weight', 'hnorm.weight', 'eh_proj.weight']
+        for key in keys:
             self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+        self._fp8_skip_modules.update(keys)
         self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'shared_head.norm.weight', to_mcore)
 
     def _convert_mtp_layer(self, lm_model, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
@@ -1862,6 +1865,7 @@ class GPTBridge:
         self._disable_tqdm = disable_tqdm
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
+        self._fp8_skip_modules = set()
         hf_prefix = 'base_model.model.' if peft_format else ''
         mg_models = unwrap_model(mg_models)
         for i, mg_model in enumerate(mg_models):

@@ -529,9 +529,10 @@ class Qwen3NextBridge(GPTBridge):
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
         hf_state_dict = self._remove_prefix(origin_hf_state_dict, 'mtp.')
-        for mg_key, key in zip(['enorm.weight', 'hnorm.weight', 'eh_proj.weight'],
-                               ['pre_fc_norm_embedding.weight', 'pre_fc_norm_hidden.weight', 'fc.weight']):
+        hf_keys = ['pre_fc_norm_embedding.weight', 'pre_fc_norm_hidden.weight', 'fc.weight']
+        for mg_key, key in zip(['enorm.weight', 'hnorm.weight', 'eh_proj.weight'], hf_keys):
             self._set_state_dict(mtp_layer, mg_key, hf_state_dict, key, to_mcore)
+        self._fp8_skip_modules.update(hf_keys)
         self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'norm.weight', to_mcore)
         if not to_mcore:
             origin_hf_state_dict.update(self._add_prefix(hf_state_dict, 'mtp.'))
