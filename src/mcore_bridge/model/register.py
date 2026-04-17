@@ -15,6 +15,8 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
+from .modules import MultiTokenPredictionLayer
+
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
     from .mm_gpt_model import MultimodalGPTModel
@@ -121,8 +123,11 @@ class ModelLoader:
         else:
             transformer_layer_spec_for_mtp = transformer_layer_spec
         kwargs = {'vp_stage': vp_stage} if self.mcore_013 else {}
-        return get_gpt_mtp_block_spec(
+        mtp_block_spec = get_gpt_mtp_block_spec(
             self.config, transformer_layer_spec_for_mtp, use_transformer_engine=True, **kwargs)
+        for layer_spec in mtp_block_spec.layer_specs:
+            layer_spec.module = MultiTokenPredictionLayer
+        return mtp_block_spec
 
     def _set_shared_expert_gate(self, transformer_layer_spec):
         mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')

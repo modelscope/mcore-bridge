@@ -377,8 +377,6 @@ def _patch_TEGroupedLinear():
     TEGroupedLinear.sharded_state_dict = sharded_state_dict
 
 
-
-
 def _patch_peft_ModulesToSaveWrapper():
     if version.parse(peft.__version__) >= version.parse('0.16'):
         from peft.utils import other as peft_module
