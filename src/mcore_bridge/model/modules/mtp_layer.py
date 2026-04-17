@@ -23,6 +23,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             eh_proj = submodules.eh_proj
             submodules.eh_proj = IdentityOp
         super().__init__(config, submodules, *args, **kwargs)
+        self.tp_group = getattr(self, 'tp_group', None)
         if not config.fp8_param:
             return
         submodules.eh_proj = eh_proj
@@ -39,7 +40,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 skip_bias_add=False,
                 is_expert=False,
                 tp_comm_buffer_name='mtp_eh_proj',
-                tp_group=getattr(self, 'tp_group', None),
+                tp_group=self.tp_group,
             )
 
     def forward(
