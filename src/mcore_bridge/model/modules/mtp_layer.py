@@ -13,6 +13,11 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.utils import make_viewless_tensor
 from typing import Callable, Optional
 
+try:
+    from megatron.core.typed_torch import apply_module
+except ImportError:
+    apply_module = None
+
 from mcore_bridge.config import ModelConfig
 
 
@@ -115,13 +120,12 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
         """
         Concatenate the tokens before sending to transformer layer.
         """
-        try:
-            from megatron.core.typed_torch import apply_module
-            decoder_input = apply_module(self.enorm)(decoder_input)
-            hidden_states = apply_module(self.hnorm)(hidden_states)
-        except ImportError:
+        if apply_module is None:
             decoder_input = self.enorm(decoder_input)
             hidden_states = self.hnorm(hidden_states)
+        else:
+            decoder_input = apply_module(self.enorm)(decoder_input)
+            hidden_states = apply_module(self.hnorm)(hidden_states)
         decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
         # At the (k - 1)-th MTP module, concatenates the i-th token's hidden_states
@@ -190,6 +194,8 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             decoder_input = decoder_input.transpose(0, 2).contiguous()
             if enable_sp:
                 decoder_input = scatter_to_sequence_parallel_region(decoder_input)
+        if self.config.mtp_decoder_input_detach:
+            decoder_input = decoder_input.detach()
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         return input_ids, position_ids, decoder_input, hidden_states

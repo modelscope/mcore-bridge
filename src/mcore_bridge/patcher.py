@@ -581,9 +581,9 @@ def _patch_dsa():
 
     from megatron.core.models.gpt import experimental_attention_variant_module_specs
     from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
-    DSAIndexer = experimental_attention_variant_module_specs.DSAIndexer
+    _DSAIndexer = experimental_attention_variant_module_specs.DSAIndexer
 
-    class NewDSAIndexer(DSAIndexer):
+    class DSAIndexer(_DSAIndexer):
 
         def forward_before_topk(
             self,
@@ -723,7 +723,7 @@ def _patch_dsa():
             _, topk_indices = self.forward_with_scores(x, qr, mask, packed_seq_params)
             return topk_indices
 
-    experimental_attention_variant_module_specs.DSAIndexer = NewDSAIndexer
+    experimental_attention_variant_module_specs.DSAIndexer = DSAIndexer
 
 
 def apply_patch():
