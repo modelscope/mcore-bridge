@@ -224,6 +224,7 @@ class ModelConfig(TransformerConfig):
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = 'causal_lm'
     num_labels: Optional[int] = None
     mlp_padding_free: bool = False
+    mtp_decoder_input_detach: bool = False
 
     _mindspeed_defaults_cache = None
 
