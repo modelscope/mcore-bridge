@@ -3,8 +3,7 @@ import peft
 import sys
 import torch
 import torch.nn.functional as F
-from functools import partial
-from megatron.core import InferenceParams, mpu, parallel_state, tensor_parallel
+from megatron.core import mpu, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELinear
 from megatron.core.models.common.embeddings import rope_utils
@@ -16,13 +15,13 @@ from megatron.core.tensor_parallel.mappings import (gather_from_sequence_paralle
                                                     scatter_to_sequence_parallel_region)
 from megatron.core.transformer import TransformerLayer
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention, MultiLatentAttention
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock, get_mtp_layer_offset
 from megatron.core.utils import deprecate_inference_params
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
 from torch import nn
 from transformers.utils import is_torch_npu_available
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from mcore_bridge.utils import get_logger, is_flash_attn_3_available
 
@@ -383,7 +382,7 @@ def _patch_peft_ModulesToSaveWrapper():
     else:
         from peft.tuners import tuners_utils as peft_module
 
-    from .tuners.utils import tuners_sharded_state_dict
+    from mcore_bridge.tuners.utils import tuners_sharded_state_dict
 
     OriginModulesToSaveWrapper = peft_module.ModulesToSaveWrapper
 
@@ -578,7 +577,6 @@ def _patch_mrope():
 
 
 def _patch_dsa():
-
     from megatron.core.models.gpt import experimental_attention_variant_module_specs
     from megatron.core.transformer.experimental_attention_variant.dsa import rotate_activation
     _DSAIndexer = experimental_attention_variant_module_specs.DSAIndexer
@@ -726,6 +724,38 @@ def _patch_dsa():
     experimental_attention_variant_module_specs.DSAIndexer = DSAIndexer
 
 
+def _patch_mtp():
+
+    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, hidden_states: torch.Tensor,
+                attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
+        # get hidden states from previous mtp stages
+        offset = get_mtp_layer_offset(self.config, self.vp_stage)
+        hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
+        hidden_states = hidden_states_list[offset]
+        mtp_decoder_input = decoder_input = kwargs.pop('decoder_input', None)
+        for layer_number in range(len(self.layers)):
+            (hidden_states, input_ids, position_ids, decoder_input) = self.layers[layer_number](
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                decoder_input=decoder_input,
+                **kwargs,
+            )
+            if mtp_decoder_input is None:
+                decoder_input = None
+
+            # append the output hidden states of the current mtp layer
+            # to the hidden_states_list
+            hidden_states_list.append(hidden_states)
+
+        # concat the hidden states of all mtp layers
+        hidden_states = torch.cat(hidden_states_list, dim=0)
+        return hidden_states
+
+    MultiTokenPredictionBlock.forward = forward
+
+
 def apply_patch():
     _patch_flash_attn()
     _patch_transformer_engine()
@@ -741,6 +771,7 @@ def apply_patch():
     _patch_TransformerLayer()
     _patch_TELinear()
     _patch_mrope()
+    _patch_mtp()
     from mcore_bridge import tuners  # apply patch
     try:
         _patch_dsa()

@@ -64,6 +64,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
         packed_seq_params: PackedSeqParams = None,
         sequence_len_offset: torch.Tensor = None,
         embedding=None,
+        decoder_input=None,
     ):
         assert context is None, 'multi token prediction + cross attention is not yet supported.'
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
@@ -72,6 +73,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             embedding=embedding,
             packed_seq_params=packed_seq_params,
             hidden_states=hidden_states,
+            decoder_input=decoder_input,
         )
         assert not self.transformer_layer.self_attention.config.apply_rope_fusion
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -114,7 +116,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
             )
-        return hidden_states, input_ids, position_ids
+        return hidden_states, input_ids, position_ids, decoder_input
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -155,6 +157,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        decoder_input=None,
     ):
         from megatron.core.transformer.multi_token_prediction import roll_tensor
 
@@ -173,11 +176,6 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
         )
-        # embedding
-        if isinstance(embedding, tuple):
-            embedding, decoder_input = embedding
-        else:
-            decoder_input = None
         if decoder_input is None:
             decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
         else:

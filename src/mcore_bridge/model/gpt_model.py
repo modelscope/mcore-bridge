@@ -404,10 +404,6 @@ class GPTModel(McoreGPTModel):
             input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
 
         if self.mtp_process and labels is not None:
-            if self.config.is_multimodal:
-                embedding_ = (self.embedding, decoder_input)
-            else:
-                embedding_ = self.embedding
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -419,7 +415,8 @@ class GPTModel(McoreGPTModel):
                 rotary_pos_sin=rotary_pos_sin,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
-                embedding=embedding_,
+                embedding=self.embedding,
+                decoder_input=decoder_input if self.config.is_multimodal else None,
                 **(extra_block_kwargs or {}),
             )
             mtp_labels = labels.clone()
