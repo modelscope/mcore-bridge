@@ -186,7 +186,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 decoder_input = gather_from_sequence_parallel_region(decoder_input)
             decoder_input, _ = roll_tensor(
                 decoder_input.transpose(0, 2),
-                shifts=-1,
+                shifts=-self.layer_number,
                 dims=-1,
                 cp_group=self.cp_group,
                 packed_seq_params=packed_seq_params,
