@@ -727,7 +727,7 @@ def _patch_dsa():
 def _patch_mtp():
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor, *args, **kwargs) -> torch.Tensor:
+                attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
@@ -740,7 +740,6 @@ def _patch_mtp():
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 decoder_input=decoder_input,
-                *args,
                 **kwargs,
             )
             if mtp_decoder_input is None:
