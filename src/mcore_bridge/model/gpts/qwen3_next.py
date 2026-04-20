@@ -18,6 +18,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.utils import deprecate_inference_params, is_fa_min_version
 from packaging import version
 from typing import Optional, Tuple, Union
+from transformers.utils import is_torch_npu_available
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
@@ -56,6 +57,19 @@ except ImportError:
     SplitAlongDim = None
 
 logger = get_logger()
+
+
+def _get_hf_attention_mask(kwargs) -> Optional[torch.Tensor]:
+    if is_torch_npu_available():
+        attention_mask = kwargs.get('attention_mask_2d')
+        if attention_mask is not None:
+            return attention_mask.to(torch.bool)
+    attention_mask = kwargs.get('attention_mask')
+    if attention_mask is None:
+        return None
+    if attention_mask.ndim == 4:
+        return (~attention_mask).sum(dim=(1, 2)) > 0
+    return attention_mask.to(torch.bool)
 
 
 class Qwen3NextRMSNorm(torch.nn.Module):
@@ -485,9 +499,7 @@ class Qwen3NextGatedDeltaNet(_HuggingFaceModule, _Qwen3NextGatedDeltaNet):
             hidden_states = new_hidden_states
         else:
             hidden_states = hidden_states.transpose(0, 1)
-            attention_mask = kwargs.get('attention_mask')
-            if attention_mask is not None:
-                attention_mask = (~attention_mask).sum(dim=(1, 2)) > 0
+            attention_mask = _get_hf_attention_mask(kwargs)
         res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
         if thd_format:
             res = res[attention_mask][:, None]
