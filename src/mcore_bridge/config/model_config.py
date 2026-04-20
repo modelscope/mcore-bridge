@@ -309,6 +309,7 @@ class ModelConfig(TransformerConfig):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
         if self.mtp_shared_weights:
+            assert self.mtp_num_layers is not None
             self.mtp_unroll_steps = self.mtp_num_layers
             self.mtp_num_layers = 1
         else:
