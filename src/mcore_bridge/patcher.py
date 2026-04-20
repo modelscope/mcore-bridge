@@ -730,6 +730,7 @@ def _patch_mtp():
                 attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
+        assert offset == 0, f'not supported'
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
         mtp_decoder_input = decoder_input = kwargs.pop('decoder_input', None)
