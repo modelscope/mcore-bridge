@@ -126,9 +126,11 @@ class ModelConfig(TransformerConfig):
     ffn_hidden_size: Optional[int] = None
     num_attention_heads: Optional[int] = None
     num_query_groups: Optional[int] = None
+    num_global_query_groups: Optional[int] = None
     softmax_type: Literal['vanilla', 'off-by-one', 'learnable'] = 'vanilla'
     window_size: Optional[str] = None
     window_attn_skip_freq: Optional[str] = None
+    layer_types: Optional[List[str]] = None
     max_position_embeddings: Optional[int] = None
 
     position_embedding_type: Literal['learned_absolute', 'rope', 'mrope', 'none'] = 'rope'
@@ -153,6 +155,7 @@ class ModelConfig(TransformerConfig):
     attention_dropout: float = 0.
     hidden_dropout: float = 0.
     kv_channels: Optional[int] = None
+    global_kv_channels: Optional[int] = None
     qk_layernorm: bool = False
     qk_l2_norm: bool = False
     no_rope_freq: Optional[int] = None
@@ -207,6 +210,14 @@ class ModelConfig(TransformerConfig):
     # visual
     hf_config: Optional[PretrainedConfig] = None
     vit_attn_impl: Optional[str] = None  # e.g. 'flash_attention_2'
+
+    # gemma4
+    hidden_size_per_layer_input: Optional[int] = None
+    vocab_size_per_layer_input: Optional[int] = None
+    num_kv_shared_layers: int = 0
+    enable_moe_block: bool = False
+    use_double_wide_mlp: bool = False
+    top_k_experts: Optional[int] = None
 
     # Override
     perform_initialization: bool = False
