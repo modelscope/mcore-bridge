@@ -80,14 +80,14 @@ class MinimaxM2Bridge(GPTBridge):
         hf_prefix: str,
         layer_idx: int,
         to_mcore: bool,
-        is_mtp: bool,
+        is_mtp: bool = False,
     ):
         if to_mcore:
             hf_state_dict = {
                 k.replace('.w1.', '.gate_proj.').replace('.w3.', '.up_proj.').replace('.w2.', '.down_proj.'): v
                 for k, v in hf_state_dict.items()
             }
-        hf_state_dict = super()._set_moe_state(mg_mlp, hf_state_dict, hf_prefix, layer_idx, to_mcore)
+        hf_state_dict = super()._set_moe_state(mg_mlp, hf_state_dict, hf_prefix, layer_idx, to_mcore, is_mtp)
         if not to_mcore:
             hf_state_dict = {
                 k.replace('.gate_proj.', '.w1.').replace('.up_proj.', '.w3.').replace('.down_proj.', '.w2.'): v
