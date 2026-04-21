@@ -80,6 +80,7 @@ class MinimaxM2Bridge(GPTBridge):
         hf_prefix: str,
         layer_idx: int,
         to_mcore: bool,
+        is_mtp: bool,
     ):
         if to_mcore:
             hf_state_dict = {
