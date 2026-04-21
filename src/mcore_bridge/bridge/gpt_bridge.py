@@ -56,6 +56,7 @@ class GPTBridge:
         self._fp8_skip_modules = set()
         self._peft_format = False
         self._adapter_name = 'default'
+        self._is_saving = False
         self.model_type = config.hf_model_type
         self.llm_model_type = config.llm_model_type
         self.is_multimodal = config.is_multimodal
@@ -723,7 +724,8 @@ class GPTBridge:
 
     def _get_hf_experts_attr(self, is_mtp: bool = False):
         # return hf_grouped, is_gate_up
-        if not is_mtp and not self.config.fp8_param and not self._peft_format and self.model_type == 'qwen3_5_moe':
+        if (self._is_saving and not is_mtp and not self.config.fp8_param and not self._peft_format
+                and self.model_type == 'qwen3_5_moe'):
             return True, True
         if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'} or self.llm_model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
@@ -1813,6 +1815,7 @@ class GPTBridge:
         self._adapter_name = adapter_name
         mg_models = unwrap_model(mg_models)
         self._disable_tqdm = False
+        self._is_saving = False
         with torch.no_grad(), SafetensorLazyLoader(hf_model_dir, peft_format=peft_format) as loader:
             state_dict = loader.get_state_dict()
             if converter:
@@ -1838,6 +1841,7 @@ class GPTBridge:
         converter: Optional[Callable] = None,
         tqdm_desc: str = 'Exporting: ',
         disable_tqdm: bool = True,
+        _is_saving: bool = False,
     ):
         """Export Megatron model weights to safetensors (HuggingFace) format as a generator.
 
@@ -1864,6 +1868,7 @@ class GPTBridge:
         self._peft_format = peft_format
         self._adapter_name = adapter_name
         self._disable_tqdm = disable_tqdm
+        self._is_saving = _is_saving
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
         self._fp8_skip_modules = set()
@@ -1918,7 +1923,8 @@ class GPTBridge:
                 adapter_name=adapter_name,
                 converter=converter,
                 tqdm_desc='Saving: ',
-                disable_tqdm=False):
+                disable_tqdm=False,
+                _is_saving=True):
             saver.add_tensor(k, v)
         saver.finalize()
         dist.barrier()  # Ensure all weights are saved completely
