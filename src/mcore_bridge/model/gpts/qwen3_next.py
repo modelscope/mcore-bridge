@@ -59,7 +59,7 @@ except ImportError:
 logger = get_logger()
 
 
-def _get_hf_attention_mask(kwargs) -> Optional[torch.Tensor]:
+def resolve_hf_attention_mask(kwargs) -> Optional[torch.Tensor]:
     if is_torch_npu_available():
         attention_mask = kwargs.get('attention_mask_2d')
         if attention_mask is not None:
@@ -499,7 +499,7 @@ class Qwen3NextGatedDeltaNet(_HuggingFaceModule, _Qwen3NextGatedDeltaNet):
             hidden_states = new_hidden_states
         else:
             hidden_states = hidden_states.transpose(0, 1)
-            attention_mask = _get_hf_attention_mask(kwargs)
+            attention_mask = resolve_hf_attention_mask(kwargs)
         res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
         if thd_format:
             res = res[attention_mask][:, None]
