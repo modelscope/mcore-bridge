@@ -238,8 +238,3 @@ peft_model = PeftModel.from_pretrained(model, 'Qwen3.5-4B-LoRA')
 ## 🏛 License
 
 本框架使用[Apache License (Version 2.0)](https://github.com/modelscope/mcore-bridge/blob/master/LICENSE)进行许可。模型和数据集请查看原资源页面并遵守对应License。
-
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/mcore-bridge&type=Date)](https://star-history.com/#modelscope/mcore-bridge&Date)
