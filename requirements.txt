@@ -1,6 +1,6 @@
 megatron-core>=0.12
 modelscope
-peft>=0.11,<0.19
+peft>=0.11,<0.20
 safetensors
 tqdm
-transformers>=4.33,<5.6.0
+transformers>=4.33,<5.7.0
