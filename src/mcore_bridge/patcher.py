@@ -689,8 +689,7 @@ def _patch_dsa():
             try:
                 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
             except ImportError:
-                raise ImportError('fused_qk_topk_naive is not available. Please install megatron-core from source. '
-                                  '`pip install git+https://github.com/NVIDIA/Megatron-LM.git`')
+                raise ImportError('fused_qk_topk_naive is not available. Please install "megatron-core>=0.17.0"')
             # [seqlen, batch, index_n_heads * index_head_dim]
             # [seqlen, batch, index_head_dim]
             # [seqlen, batch, index_n_heads]
