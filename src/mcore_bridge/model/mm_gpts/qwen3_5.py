@@ -10,7 +10,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from mcore_bridge.utils import get_env_args
 
 from ..constant import ModelType
-from ..gpts.qwen3_next import Qwen3NextBridge, Qwen3NextLoader
+from ..gpts.qwen3_next import Qwen3NextBridge, Qwen3NextLoader, resolve_gdn_attention_mask
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
 
@@ -52,9 +52,7 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
             hidden_states = new_hidden_states
         else:
             hidden_states = hidden_states.transpose(0, 1)
-            attention_mask = kwargs.get('attention_mask')
-            if attention_mask is not None:
-                attention_mask = (~attention_mask).sum(dim=(1, 2)) > 0
+            attention_mask = resolve_gdn_attention_mask(kwargs)
         res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
         if thd_format:
             res = res[attention_mask][:, None]
