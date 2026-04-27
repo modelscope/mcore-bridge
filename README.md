@@ -85,7 +85,7 @@ The following is the list of models supported by MCore-Bridge:
 | DeepSeek | deepseek_v3, deepseek_v32                                    |
 | GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm4v, glm4v_moe, <br />glm_moe_dsa |
 | MiniMax  | minimax_m2                                                   |
-| Kimi     | kimi_k2, kimi_vl                                             |
+| Kimi     | kimi_k2, kimi_vl, kimi_k25                                   |
 | InternLM | internlm3, internvl_chat, internvl                           |
 | Ovis     | ovis2_5                                                      |
 | Llama    | llama, llama4                                                |
