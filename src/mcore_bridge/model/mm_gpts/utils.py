@@ -26,6 +26,7 @@ def patch_get_dynamic_module():
 
 class HuggingFaceVit(_HuggingFaceModule, ABC):
     module_mapping = {}  # hf -> mcore
+    support_multimodal = True
 
     @contextmanager
     def patch_hf_config(self):

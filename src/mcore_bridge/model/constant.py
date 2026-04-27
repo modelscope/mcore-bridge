@@ -27,6 +27,8 @@ class MLLMModelType:
     kimi_vl = 'kimi_vl'
     llama4 = 'llama4'
 
+    kimi_k25 = 'kimi_k25'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass

@@ -66,3 +66,35 @@ register_model(ModelMeta(
     bridge_cls=KimiVLBridge,
     visual_cls=KimiVLVit,
 ))
+
+
+class KimiK25Vit(HuggingFaceVit):
+    module_mapping = {'vision_tower': 'vision_tower', 'mm_projector': 'mm_projector'}
+    _vision_tower = ['vision_tower']
+    _aligner = ['mm_projector']
+    support_multimodal = False
+
+    def prepare_model(self, hf_config: PretrainedConfig):
+        output = []
+        for key in ['MoonViT3dPretrainedModel', 'PatchMergerMLP', 'VisionTowerConfig', 'ProjectorConfig']:
+            output.append(get_class_from_dynamic_module(f'modeling_kimi_k25.{key}', hf_config.name_or_path))
+        MoonViT3dPretrainedModel, PatchMergerMLP, VisionTowerConfig, ProjectorConfig = output
+        assert hf_config.vision_config.mm_projector_type == 'patchmerger'
+        vit_config = VisionTowerConfig(hf_config.vision_config)
+        proj_config = ProjectorConfig(hf_config.vision_config)
+        self.vision_tower = MoonViT3dPretrainedModel._from_config(vit_config)
+        self.mm_projector = PatchMergerMLP(proj_config).to(self.vision_tower.dtype)
+
+    def get_inputs_embeds(self, inputs_embeds, **kwargs):
+        pixel_values = kwargs.pop('pixel_values', None)
+        if pixel_values is not None:
+            raise NotImplementedError('Kimi-K25 currently only supports plain text training.')
+        return inputs_embeds
+
+
+register_model(ModelMeta(
+    ModelType.kimi_k25,
+    ['kimi_k25'],
+    bridge_cls=KimiVLBridge,
+    visual_cls=KimiK25Vit,
+))
