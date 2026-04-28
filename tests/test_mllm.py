@@ -108,6 +108,10 @@ def test_qwen3_5():
     # _test_model('Qwen/Qwen3.5-27B')
 
 
+def test_llava_onevision1_5():
+    _test_model('lmms-lab/LLaVA-OneVision-1.5-4B-Instruct')
+
+
 if __name__ == '__main__':
     # test_qwen2_5_vl()
     # test_qwen2_vl()
@@ -126,4 +130,5 @@ if __name__ == '__main__':
     # test_qwen3_vl_moe()
     # test_qwen3_omni()
     # test_llama4()
-    test_qwen3_5()
+    # test_qwen3_5()
+    test_llava_onevision1_5()

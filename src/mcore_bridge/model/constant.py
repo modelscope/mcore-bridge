@@ -30,6 +30,8 @@ class MLLMModelType:
 
     kimi_k25 = 'kimi_k25'
 
+    llava_onevision1_5 = 'llava_onevision1_5'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass
