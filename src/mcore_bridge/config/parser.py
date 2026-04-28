@@ -79,7 +79,10 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
                     if hf_v == 'silu':
                         megatron_config[k] = True
                 elif hf_k == 'moe_router_use_sigmoid':
-                    megatron_config[k] = 'sigmoid'
+                    if hf_v:
+                        megatron_config[k] = 'sigmoid'
+                    else:
+                        continue
                 else:
                     if k == 'kv_lora_rank':
                         megatron_config['multi_latent_attention'] = True
