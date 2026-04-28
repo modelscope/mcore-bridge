@@ -39,7 +39,7 @@ config_mapping = {
     'qk_pos_emb_head_dim': ['qk_rope_head_dim'],
     'v_head_dim': ['v_head_dim'],
     'moe_router_topk_scaling_factor': ['routed_scaling_factor'],
-    'qk_layernorm': ['use_qk_norm'],
+    'qk_layernorm': ['use_qk_norm', 'qk_norm'],
     # qwen3_next/qwen3_5
     'linear_attention_freq': ['full_attention_interval'],
     'linear_num_key_heads': ['linear_num_key_heads'],
