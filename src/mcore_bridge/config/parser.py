@@ -33,13 +33,13 @@ config_mapping = {
     # deepseek
     'q_lora_rank': ['q_lora_rank'],
     'kv_lora_rank': ['kv_lora_rank'],
-    'moe_router_score_function': ['scoring_func'],
+    'moe_router_score_function': ['scoring_func', 'moe_router_use_sigmoid'],
     'moe_router_bias_update_rate': ['aux_loss_alpha'],
     'qk_head_dim': ['qk_nope_head_dim'],
     'qk_pos_emb_head_dim': ['qk_rope_head_dim'],
     'v_head_dim': ['v_head_dim'],
-    'moe_router_topk_scaling_factor': ['routed_scaling_factor'],
-    'qk_layernorm': ['use_qk_norm'],
+    'moe_router_topk_scaling_factor': ['routed_scaling_factor', 'router_scaling_factor'],
+    'qk_layernorm': ['use_qk_norm', 'qk_norm'],
     # qwen3_next/qwen3_5
     'linear_attention_freq': ['full_attention_interval'],
     'linear_num_key_heads': ['linear_num_key_heads'],
@@ -56,7 +56,7 @@ config_mapping = {
     'original_max_position_embeddings': ['original_max_position_embeddings'],
     'partial_rotary_factor': ['partial_rotary_factor'],
     'first_k_dense_replace': ['first_k_dense_replace', 'moe_layer_start_index'],
-    'n_shared_experts': ['n_shared_experts', 'num_shared_expert', 'moe_num_shared_experts'],
+    'n_shared_experts': ['n_shared_experts', 'num_shared_expert', 'moe_num_shared_experts', 'num_shared_experts'],
     'window_size': ['sliding_window'],
     'layer_types': ['layer_types'],
     'interleave_moe_layer_step': ['interleave_moe_layer_step'],
@@ -78,6 +78,11 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
                 elif k == 'swiglu':
                     if hf_v == 'silu':
                         megatron_config[k] = True
+                elif hf_k == 'moe_router_use_sigmoid':
+                    if hf_v:
+                        megatron_config[k] = 'sigmoid'
+                    else:
+                        continue
                 else:
                     if k == 'kv_lora_rank':
                         megatron_config['multi_latent_attention'] = True

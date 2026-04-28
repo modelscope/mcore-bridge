@@ -90,6 +90,7 @@ The following is the list of models supported by MCore-Bridge:
 | Ovis     | ovis2_5                                                      |
 | Llama    | llama, llama4                                                |
 | GPT-OSS  | gpt_oss                                                      |
+| Hunyuan  | hy_v3                                                        |
 | ERNIE    | ernie4_5, ernie4_5_moe                                       |
 | MiMo     | mimo                                                         |
 | Dots     | dots1                                                        |

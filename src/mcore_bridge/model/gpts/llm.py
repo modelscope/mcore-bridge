@@ -1,6 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from mcore_bridge.bridge import GPTBridge
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 
