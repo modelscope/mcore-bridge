@@ -1,5 +1,7 @@
 /.vscode
 *.egg-info/
+/.idea/
+/.qoder/
 build/
 dist/
 __pycache__/

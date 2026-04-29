@@ -41,6 +41,8 @@ class GPTBridge:
     # HF Keys
     hf_q_norm_key = 'q_norm.weight'
     hf_k_norm_key = 'k_norm.weight'
+    hf_o_proj_key = 'o_proj'
+    hf_attn_prefix = 'self_attn'
     hf_mlp_prefix = 'mlp'
     hf_gate_key = 'gate.weight'
     hf_shared_expert_key = None
@@ -531,11 +533,7 @@ class GPTBridge:
             return state_dict
         return {k: v for k, v in state_dict.items() if k.startswith(prefix)}
 
-    def _set_attn_state(self, mg_attn, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
-        if to_mcore:
-            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
-        else:
-            hf_state_dict = {}
+    def _set_qkv(self, mg_attn, hf_state_dict, to_mcore: bool):
         config = self.config
         num_query_groups = (
             config.num_query_groups if config.num_query_groups is not None else config.num_attention_heads)
@@ -626,9 +624,6 @@ class GPTBridge:
                     hf_state_dict['v_proj.weight_scale_inv'] = scale_inv[:, -kv_block:, :].reshape(
                         -1, hidden_size_block).clone()
                 del mg_attn_weight
-        self._set_state_dict(mg_attn, 'linear_proj.weight', hf_state_dict, 'o_proj.weight', to_mcore)
-        if config.add_bias_linear:
-            self._set_state_dict(mg_attn, 'linear_proj.bias', hf_state_dict, 'o_proj.bias', to_mcore)
 
         # Copy bias
         if (config.add_bias_linear or config.add_qkv_bias) and not self._peft_format:
@@ -648,6 +643,18 @@ class GPTBridge:
                     hf_state_dict['q_proj.bias'] = mg_attn_bias[:, :q_dim].reshape(-1).clone()
                     hf_state_dict['k_proj.bias'] = mg_attn_bias[:, q_dim:-kv_dim].reshape(-1).clone()
                     hf_state_dict['v_proj.bias'] = mg_attn_bias[:, -kv_dim:].reshape(-1).clone()
+        return hf_state_dict
+
+    def _set_attn_state(self, mg_attn, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
+        if to_mcore:
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+        else:
+            hf_state_dict = {}
+        config = self.config
+        hf_state_dict.update(self._set_qkv(mg_attn, hf_state_dict, to_mcore))
+        self._set_state_dict(mg_attn, 'linear_proj.weight', hf_state_dict, f'{self.hf_o_proj_key}.weight', to_mcore)
+        if config.add_bias_linear:
+            self._set_state_dict(mg_attn, 'linear_proj.bias', hf_state_dict, f'{self.hf_o_proj_key}.bias', to_mcore)
         if getattr(config, 'softmax_type', 'vanilla') == 'learnable':
             self._set_state_dict(mg_attn, 'core_attention.softmax_offset', hf_state_dict, 'sinks', to_mcore)
         if config.qk_layernorm:
@@ -1567,10 +1574,12 @@ class GPTBridge:
     def _set_layer_attn(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
         mg_attn = None if mg_layer is None else mg_layer.self_attention
         if self.config.multi_latent_attention:
-            hf_state_dict.update(self._set_mla_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
+            hf_state_dict.update(
+                self._set_mla_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
-            hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
+            hf_state_dict.update(
+                self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
                                  'input_layernorm.weight', to_mcore)
         return hf_state_dict
