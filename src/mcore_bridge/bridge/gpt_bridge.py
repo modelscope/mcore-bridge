@@ -41,6 +41,7 @@ class GPTBridge:
     # HF Keys
     hf_q_norm_key = 'q_norm.weight'
     hf_k_norm_key = 'k_norm.weight'
+    hf_attn_prefix = 'self_attn'
     hf_mlp_prefix = 'mlp'
     hf_gate_key = 'gate.weight'
     hf_shared_expert_key = None
@@ -1567,10 +1568,10 @@ class GPTBridge:
     def _set_layer_attn(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
         mg_attn = None if mg_layer is None else mg_layer.self_attention
         if self.config.multi_latent_attention:
-            hf_state_dict.update(self._set_mla_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
+            hf_state_dict.update(self._set_mla_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
         else:
-            hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
+            hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
                                  'input_layernorm.weight', to_mcore)
         return hf_state_dict
