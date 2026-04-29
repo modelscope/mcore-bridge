@@ -3,13 +3,13 @@ import copy
 import os
 import re
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
-from typing import List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from mcore_bridge.utils import get_logger, json_parse_to_dict
 
@@ -229,6 +229,7 @@ class ModelConfig(TransformerConfig):
     task_type: Literal['causal_lm', 'seq_cls', 'embedding', 'generative_reranker'] = 'causal_lm'
     num_labels: Optional[int] = None
     mlp_padding_free: bool = False
+    model_kwargs: Dict[str, Any] = field(default_factory=dict)
 
     _mindspeed_defaults_cache = None
 
