@@ -33,7 +33,7 @@ config_mapping = {
     # deepseek
     'q_lora_rank': ['q_lora_rank'],
     'kv_lora_rank': ['kv_lora_rank'],
-    'moe_router_score_function': ['scoring_func', 'moe_router_use_sigmoid'],
+    'moe_router_score_function': ['scoring_func', 'moe_router_use_sigmoid', 'score_function'],
     'moe_router_bias_update_rate': ['aux_loss_alpha'],
     'qk_head_dim': ['qk_nope_head_dim'],
     'qk_pos_emb_head_dim': ['qk_rope_head_dim'],
