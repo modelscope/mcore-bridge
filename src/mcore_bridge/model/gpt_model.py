@@ -110,9 +110,7 @@ class GPTModel(McoreGPTModel):
             for i in range(len(self.decoder.layers)):
                 if hasattr(self.decoder.layers[i].self_attention, 'rotary_pos_emb'):
                     del self.decoder.layers[i].self_attention.rotary_pos_emb
-        self.attention_scaling = 1.
-        new_inv_freq, self.attention_scaling = get_rope_inv_freq(config)
-        self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+        self._set_inv_freq()
         if self.config.task_type == 'seq_cls' and self.post_process:
             self.output_layer = OutputLayerLinear(
                 config.hidden_size,
@@ -222,7 +220,36 @@ class GPTModel(McoreGPTModel):
         if decoder_input is not None and self.training and torch.is_grad_enabled() and not decoder_input.requires_grad:
             # fix LoRA incompatibility with gradient checkpointing
             decoder_input = decoder_input.requires_grad_(True)
+        rotary_pos_emb, decoder_rotary_pos_emb, rotary_pos_cos, rotary_pos_sin = self._get_rotary_pos_emb(
+            decoder_input, position_ids, packed_seq_params=packed_seq_params)
 
+        if (in_inference_mode and ((self.config.enable_cuda_graph and self.config.cuda_graph_scope != 'full_iteration')
+                                   or self.config.flash_decode) and rotary_pos_cos is not None
+                and inference_context.is_static_batching()):
+            current_batch_size = input_ids.shape[0]
+            sequence_len_offset = torch.tensor(
+                [inference_context.sequence_len_offset] * current_batch_size,
+                dtype=torch.int32,
+                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
+            )
+        else:
+            sequence_len_offset = None
+
+        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
+        # reference held by this caller function, enabling early garbage collection for
+        # inference. Skip wrapping if decoder_input is logged after decoder completion.
+        if in_inference_mode and not has_config_logger_enabled(self.config):
+            decoder_input = WrappedTensor(decoder_input)
+
+        return (decoder_input, rotary_pos_emb, decoder_rotary_pos_emb, rotary_pos_cos, rotary_pos_sin,
+                sequence_len_offset)
+
+    def _set_inv_freq(self):
+        self.attention_scaling = 1.
+        new_inv_freq, self.attention_scaling = get_rope_inv_freq(self.config)
+        self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+
+    def _get_rotary_pos_emb(self, decoder_input, position_ids, packed_seq_params, inference_context=None):
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
         rotary_pos_cos = None
@@ -257,26 +284,13 @@ class GPTModel(McoreGPTModel):
                         rotary_seq_len,
                         packed_seq=packed_seq,
                     )
+        decoder_rotary_pos_emb = rotary_pos_emb
+        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        if self.position_embedding_type == 'rope' and packed_seq and not self.config.apply_rope_fusion:
+            assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
+            decoder_rotary_pos_emb = rotary_pos_emb[position_ids[0]]
 
-        if (in_inference_mode and ((self.config.enable_cuda_graph and self.config.cuda_graph_scope != 'full_iteration')
-                                   or self.config.flash_decode) and rotary_pos_cos is not None
-                and inference_context.is_static_batching()):
-            current_batch_size = input_ids.shape[0]
-            sequence_len_offset = torch.tensor(
-                [inference_context.sequence_len_offset] * current_batch_size,
-                dtype=torch.int32,
-                device=rotary_pos_cos.device,  # Co-locate this with the rotary tensors
-            )
-        else:
-            sequence_len_offset = None
-
-        # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
-        # reference held by this caller function, enabling early garbage collection for
-        # inference. Skip wrapping if decoder_input is logged after decoder completion.
-        if in_inference_mode and not has_config_logger_enabled(self.config):
-            decoder_input = WrappedTensor(decoder_input)
-
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+        return rotary_pos_emb, decoder_rotary_pos_emb, rotary_pos_cos, rotary_pos_sin
 
     # Code borrowed from NVIDIA/Megatron-LM
     def forward(
@@ -308,7 +322,7 @@ class GPTModel(McoreGPTModel):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+        decoder_input, rotary_pos_emb, decoder_rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self._preprocess(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -316,11 +330,6 @@ class GPTModel(McoreGPTModel):
                 inference_context=inference_context,
                 packed_seq_params=packed_seq_params,
             ))
-        decoder_rotary_pos_emb = rotary_pos_emb
-        packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        if self.position_embedding_type == 'rope' and packed_seq and not self.config.apply_rope_fusion:
-            assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
-            decoder_rotary_pos_emb = rotary_pos_emb[position_ids[0]]
 
         mtp_decoder_input = decoder_input
         if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:

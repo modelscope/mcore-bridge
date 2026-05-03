@@ -1,5 +1,8 @@
+import copy
 import json
 import os
+from contextlib import contextmanager
+from torch import nn
 from transformers.utils import strtobool
 from typing import Callable, Dict, Optional, TypeVar, Union
 
@@ -58,3 +61,36 @@ def deep_getattr(obj, attr: str, default=None):
         else:
             obj = getattr(obj, a, default)
     return obj
+
+
+@contextmanager
+def patch_deepcopy():
+    _origin_deepcopy = copy.deepcopy
+    copy_keys = ('tp_group', '_tp_group', 'config')
+
+    def new_deepcopy(x, *args, **kwargs):
+        if not isinstance(x, nn.Module):
+            return _origin_deepcopy(x, *args, **kwargs)
+
+        saved_values = {}
+        for key in copy_keys:
+            val = getattr(x, key, None)
+            if val is not None:
+                saved_values[key] = val
+                setattr(x, key, None)
+
+        try:
+            res = _origin_deepcopy(x, *args, **kwargs)
+        finally:
+            for key, value in saved_values.items():
+                setattr(x, key, value)
+
+        for key, value in saved_values.items():
+            setattr(res, key, value)
+        return res
+
+    copy.deepcopy = new_deepcopy
+    try:
+        yield
+    finally:
+        copy.deepcopy = _origin_deepcopy

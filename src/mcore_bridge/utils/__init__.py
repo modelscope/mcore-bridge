@@ -6,4 +6,4 @@ from .logger import get_logger
 from .megatron_utils import get_local_layer_specs, set_random_seed, split_cp_inputs, unwrap_model
 from .safetensors import SafetensorLazyLoader, StreamingSafetensorSaver
 from .torch_utils import gc_collect, get_current_device, safe_ddp_context, to_device
-from .utils import deep_getattr, get_env_args, json_parse_to_dict
+from .utils import deep_getattr, get_env_args, json_parse_to_dict, patch_deepcopy

@@ -106,12 +106,12 @@ def _get_rope_type(rope_scaling: Optional[Dict[str, Any]]):
     return rope_type
 
 
-def get_rope_inv_freq(config, seq_len=None):
+def get_rope_inv_freq(config, seq_len=None, **kwargs):
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
     ROPE_INIT_FUNCTIONS.update(EXTENDED_ROPE_INIT_FUNCTIONS)
     dummy_config = _get_dummy_config(config)
     rope_init_fn = ROPE_INIT_FUNCTIONS[_get_rope_type(config.rope_scaling)]
-    inv_freq, attention_scaling = rope_init_fn(dummy_config, 'cpu', seq_len=seq_len)
+    inv_freq, attention_scaling = rope_init_fn(dummy_config, 'cpu', seq_len=seq_len, **kwargs)
     if attention_scaling is None:
         attention_scaling = 1.
     return inv_freq, attention_scaling
