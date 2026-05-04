@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import math
-import megatron.core
 import os
 import torch
 import torch.nn.functional as F
@@ -20,7 +19,6 @@ from megatron.core.tensor_parallel.mappings import (gather_from_sequence_paralle
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper, roll_tensor
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from packaging import version
 from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
@@ -29,8 +27,6 @@ from mcore_bridge.utils import get_logger, split_cp_inputs
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class OutputLayerLinear(TELinear):
@@ -79,12 +75,6 @@ class GPTModel(McoreGPTModel):
                 config.mscale_all_dim = hf_rope_scaling['mscale_all_dim']
                 config.rotary_scaling_factor = hf_rope_scaling['factor']
         self.hf_rope_scaling = hf_rope_scaling
-        if mcore_013:
-            kwargs = {'vp_stage': vp_stage}
-        else:
-            self.vp_stage = vp_stage
-            assert vp_stage is None, 'megatron-core==0.12 does not support vp_stage'
-            kwargs = {}
         super().__init__(
             config,
             transformer_layer_spec,
@@ -96,7 +86,7 @@ class GPTModel(McoreGPTModel):
             position_embedding_type=config.position_embedding_type,
             rotary_base=config.rotary_base,
             mtp_block_spec=mtp_block_spec,
-            **kwargs,
+            vp_stage=vp_stage,
         )
         if config.multi_latent_attention:
             self.rotary_pos_emb = RotaryEmbedding(

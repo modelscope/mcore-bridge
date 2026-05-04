@@ -71,7 +71,6 @@ class ModelLoader:
 
     def __init__(self, config: ModelConfig):
         from mcore_bridge.model import GPTModel, MultimodalGPTModel
-        self.mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
         self.config = config
         if self.model_cls is None:
             self.model_cls = MultimodalGPTModel if config.is_multimodal else GPTModel
@@ -92,9 +91,12 @@ class ModelLoader:
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         if self.config.num_moe_experts:
-            kwargs = {'qk_l2_norm': self.config.qk_l2_norm, 'vp_stage': vp_stage} if self.mcore_013 else {}
             transformer_layer_spec = get_gpt_decoder_block_spec(
-                self.config, use_transformer_engine=True, normalization=self.config.normalization, **kwargs)
+                self.config,
+                use_transformer_engine=True,
+                normalization=self.config.normalization,
+                qk_l2_norm=self.config.qk_l2_norm,
+                vp_stage=vp_stage)
             if self.config.experimental_attention_variant == 'dsa':
                 for layer_spec in transformer_layer_spec.layer_specs:
                     self._replace_spec_dsa(layer_spec)
@@ -104,13 +106,12 @@ class ModelLoader:
 
     def _get_transformer_layer_spec(self):
         config = self.config
-        kwargs = {'qk_l2_norm': config.qk_l2_norm} if self.mcore_013 else {}
         transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             config.num_moe_experts,
             config.moe_grouped_gemm,
             config.qk_layernorm,
             config.multi_latent_attention,
-            **kwargs,
+            qk_l2_norm=config.qk_l2_norm,
         )
         return transformer_layer_spec
 
@@ -122,9 +123,8 @@ class ModelLoader:
             transformer_layer_spec_for_mtp = self._get_transformer_layer_spec()
         else:
             transformer_layer_spec_for_mtp = transformer_layer_spec
-        kwargs = {'vp_stage': vp_stage} if self.mcore_013 else {}
         mtp_block_spec = get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=True, **kwargs)
+            self.config, transformer_layer_spec_for_mtp, use_transformer_engine=True, vp_stage=vp_stage)
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 layer_spec.module = MultiTokenPredictionLayer

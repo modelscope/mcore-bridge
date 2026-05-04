@@ -1,4 +1,3 @@
-import megatron.core
 import torch
 import torch.distributed as dist
 from copy import deepcopy
@@ -9,7 +8,6 @@ from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules, get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from packaging import version
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -18,8 +16,6 @@ from mcore_bridge.tuners import LoraParallelLinear
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class OLMoESelfAttention(SelfAttentionBase):
@@ -78,13 +74,12 @@ def get_olmoe_decoder_block_spec(
 ) -> TransformerBlockSubmodules:
     """GPT block spec."""
     layer_norm_impl = TENorm
-    kwargs = {'use_kitchen': config.use_kitchen} if mcore_013 else {}
     moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
         num_experts=config.num_moe_experts,
         moe_grouped_gemm=config.moe_grouped_gemm,
         qk_layernorm=True,
         multi_latent_attention=False,
-        **kwargs,
+        use_kitchen=config.use_kitchen,
     )
     layer_specs = []
     for _ in range(config.num_layers):

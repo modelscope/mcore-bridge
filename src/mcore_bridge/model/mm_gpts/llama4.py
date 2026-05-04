@@ -1,10 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
 import torch
 from copy import deepcopy
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from packaging import version
 from transformers import PretrainedConfig
 from typing import Optional
 
@@ -13,8 +11,6 @@ from mcore_bridge.bridge import GPTBridge
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
 from .utils import HuggingFaceVit
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class Llama4Vit(HuggingFaceVit):

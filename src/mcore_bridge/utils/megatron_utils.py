@@ -1,21 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # code borrowed from modelscope/ms-swift
-import megatron.core
 import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
-from packaging import version
 from transformers import set_seed
 from typing import Optional
 
 from .logger import get_logger
 
 logger = get_logger()
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 def unwrap_model(models, module_instances=None):
@@ -67,17 +63,16 @@ def split_cp_inputs(inputs: torch.Tensor, cu_seqlens: Optional[torch.Tensor], di
 
 
 def get_local_layer_specs(config, layer_specs, vp_stage=None):
-    kwargs = {'vp_stage': vp_stage} if mcore_013 else {}
-    num_layers_to_build = get_num_layers_to_build(config, **kwargs)
+    num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
 
     if getattr(config, 'pipeline_model_parallel_layout', None) is not None:
         from megatron.core.transformer.enums import LayerType
         local_layer_specs = [
             layer_specs[layer_id] for layer_id in config.pipeline_model_parallel_layout.get_layer_id_list(
-                layer_type=LayerType.decoder, **kwargs)
+                layer_type=LayerType.decoder, vp_stage=vp_stage)
         ]
     else:
-        offset = get_transformer_layer_offset(config, **kwargs)
+        offset = get_transformer_layer_offset(config, vp_stage=vp_stage)
         local_layer_specs = layer_specs[offset:offset + num_layers_to_build]
     return local_layer_specs
 

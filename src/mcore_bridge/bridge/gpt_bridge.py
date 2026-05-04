@@ -1,13 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import megatron.core
 import re
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from megatron.core import mpu
-from packaging import version
 from peft import PeftModel
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
@@ -21,8 +19,6 @@ from mcore_bridge.utils import (MxFp4Dequantizer, SafetensorLazyLoader, Streamin
                                 gc_collect, get_logger, is_master, unwrap_model)
 
 logger = get_logger()
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 EP_PP_SIZE = None
 EP_PP_GROUP = None
@@ -60,7 +56,6 @@ class GPTBridge:
         self.model_type = config.hf_model_type
         self.llm_model_type = config.llm_model_type
         self.is_multimodal = config.is_multimodal
-        self.mcore_014 = version.parse(megatron.core.__version__) >= version.parse('0.14.0rc0')
         self.module_mapping = config.model_meta.visual_cls.module_mapping if self.is_multimodal else {}
         self.tp_size = self.config.tensor_model_parallel_size
         self.pp_size = self.config.pipeline_model_parallel_size
@@ -130,9 +125,6 @@ class GPTBridge:
         }
         if self.config.task_type in {'causal_lm', 'generative_reranker'}:
             dim0_keys.add('output_layer')
-        if not self.mcore_014:
-            # https://github.com/NVIDIA/Megatron-LM/commit/720c8b40d8e7e2de1dd303d792f29093101c5e72
-            dim0_keys.update({'linear_q_down_proj', 'linear_kv_down_proj'})
         # RowLinear
         dim1_keys = {'out_proj', 'linear_proj', 'linear_fc2'}
         if 'lora_A' not in mg_key and 'lora_B' not in mg_key:
@@ -1679,12 +1671,8 @@ class GPTBridge:
             hf_state_dict = {}
         mg_models = iter(mg_models)
         mg_model = next(mg_models)
-        if mcore_013:
-            is_pp_first_stage = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
-            is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
-        else:
-            is_pp_first_stage = mpu.is_pipeline_first_stage()
-            is_pp_last_stage = mpu.is_pipeline_last_stage()
+        is_pp_first_stage = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
+        is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
         if not to_mcore or is_pp_first_stage:
             hf_state_dict.update(self._convert_pre_process(mg_model, hf_state_dict, '', to_mcore))
         if to_mcore:

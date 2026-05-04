@@ -29,7 +29,6 @@ from mcore_bridge.utils import get_current_device
 
 from .utils import tuners_sharded_state_dict
 
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 MINDSPEED_015 = version.parse('0.15.0')
 
@@ -163,7 +162,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'config': self.config,
             'is_expert': self.is_expert,
         }
-        if mcore_013 and not (mcore_016 and self.is_grouped):
+        if not (mcore_016 and self.is_grouped):
             tp_group = _get_tensor_parallel_group_for_lora(self.base_layer)
             if tp_group is not None:
                 kwargs['tp_group'] = tp_group
