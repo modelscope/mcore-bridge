@@ -7,14 +7,11 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import VocabParallelEmbedding, reduce_scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
-from packaging import version
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import split_cp_inputs
 
 from .gpt_model import GPTModel
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class MultimodalGPTModel(MegatronModule):
@@ -60,9 +57,8 @@ class MultimodalGPTModel(MegatronModule):
                 res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
-                group_kwargs = {'group': _self.tp_group} if mcore_013 else {}
-                res = reduce_scatter_to_sequence_parallel_region(res, **
-                                                                 group_kwargs) / self.config.tensor_model_parallel_size
+                res = reduce_scatter_to_sequence_parallel_region(
+                    res, group=_self.tp_group) / self.config.tensor_model_parallel_size
             return res
 
         VocabParallelEmbedding.forward = forward

@@ -1,12 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
 from megatron.core import mpu
 from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
                                                     scatter_to_tensor_model_parallel_region)
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
-from packaging import version
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -14,8 +12,6 @@ from mcore_bridge.config import ModelConfig
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class MinimaxM2SelfAttention(SelfAttention):

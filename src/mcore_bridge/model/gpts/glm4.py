@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.transformer import transformer_layer
@@ -7,7 +6,6 @@ from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP, apply_swiglu_sharded_factory
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
-from packaging import version
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -15,8 +13,6 @@ from mcore_bridge.config import ModelConfig
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
-
-mcore_013 = version.parse(megatron.core.__version__) >= version.parse('0.13.0rc0')
 
 
 class Glm4SelfAttention(SelfAttention):
