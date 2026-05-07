@@ -16,13 +16,13 @@ from megatron.core.models.gpt import GPTModel as McoreGPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     gather_from_tensor_model_parallel_region)
-from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper, roll_tensor
+from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger, split_cp_inputs
+from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
 
 from .rope import dynamic_rope_update, get_rope_inv_freq
 

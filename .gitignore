@@ -8,3 +8,5 @@ __pycache__/
 *.log
 *.out
 /megatron_output/
+/.idea/
+/.qoder/
