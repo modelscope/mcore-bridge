@@ -138,8 +138,11 @@ class Qwen3NextLoader(ModelLoader):
         lm_model = model.language_model if hasattr(model, 'language_model') else model
         for layer in lm_model.decoder.layers:
             if hasattr(layer.self_attention, 'out_norm'):
-                assert hasattr(layer.self_attention.out_norm, 'zero_centered_gamma')
-                layer.self_attention.out_norm.zero_centered_gamma = False
+                out_norm = layer.self_attention.out_norm
+                if hasattr(out_norm, 'zero_centered_gamma'):
+                    out_norm.zero_centered_gamma = False
+                elif hasattr(out_norm, 'config'):
+                    out_norm.config.layernorm_zero_centered_gamma = False
         return model
 
 
