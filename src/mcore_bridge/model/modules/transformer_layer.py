@@ -2,8 +2,10 @@
 import enum
 import inspect
 import torch
+from contextlib import contextmanager
 from functools import partial
 from megatron.core.extensions.transformer_engine import TEFusedMLP
+from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
@@ -52,6 +54,7 @@ class TransformerLayer(McoreTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        **kwargs,
     ):
         self.submodules_config = submodules
         super(McoreTransformerLayer, self).__init__(config=config, vp_stage=vp_stage)
@@ -134,8 +137,6 @@ class TransformerLayer(McoreTransformerLayer):
 
         # [Module 8: MLP block]
         self.mlp = self._build_mlp(submodules.mlp)
-        if hasattr(self.mlp, 'set_layer_number'):
-            self.mlp.set_layer_number(self.layer_number)
         # [Module 9: BiasDropoutFusion]
         self.mlp_bda = build_module(submodules.mlp_bda)
         self.is_moe_layer = isinstance(self.mlp, MoELayer)
@@ -193,13 +194,19 @@ class TransformerLayer(McoreTransformerLayer):
             if 'mlp' in self.config.recompute_modules:
                 if not self.is_moe_layer:
                     self.recompute_mlp = True
-        if hasattr(self.config, 'fine_grained_activation_offloading'):
-            self.offload_attn_norm = (
-                self.config.fine_grained_activation_offloading and 'attn_norm' in self.config.offload_modules
-                and not isinstance(self.input_layernorm, IdentityOp))
-            self.offload_mlp_norm = (
-                self.config.fine_grained_activation_offloading and 'mlp_norm' in self.config.offload_modules
-                and not isinstance(self.pre_mlp_layernorm, IdentityOp))
+        if hasattr(self, '_set_offload_modules'):
+            from megatron.core.transformer.transformer_layer import _get_offloading_interface
+            self._set_offload_modules()
+            self.off_interface = _get_offloading_interface()
+            self.mlp_norm_manager = None
+        else:
+            if hasattr(self.config, 'fine_grained_activation_offloading'):
+                self.offload_attn_norm = (
+                    self.config.fine_grained_activation_offloading and 'attn_norm' in self.config.offload_modules
+                    and not isinstance(self.input_layernorm, IdentityOp))
+                self.offload_mlp_norm = (
+                    self.config.fine_grained_activation_offloading and 'mlp_norm' in self.config.offload_modules
+                    and not isinstance(self.pre_mlp_layernorm, IdentityOp))
 
         # @jcasper how should we handle nvfuser?
         # Set bias+dropout+add fusion grad_enable execution handler.
@@ -209,33 +216,114 @@ class TransformerLayer(McoreTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+    @contextmanager
+    def _patch_apply_rotary_pos_emb(self):
+        if self.config.apply_rope_fusion:
+            yield
+            return
+
+        _origin_apply_rotary_pos_emb_bshd = rope_utils._apply_rotary_pos_emb_bshd
+
+        def _apply_rotary_pos_emb_bshd(
+            t: torch.Tensor,
+            freqs: torch.Tensor,
+            rotary_interleaved: bool = False,
+            mla_rotary_interleaved: Optional[bool] = None,
+            multi_latent_attention: Optional[bool] = None,
+            mscale: float = 1.0,
+            inverse: bool = False,
+            mla_output_remove_interleaving: bool = False,
+            **kwargs,
+        ) -> torch.Tensor:
+            """Apply rotary positional embedding to input tensor T.
+
+            check https://kexue.fm/archives/8265 for detailed formulas
+
+            Args:
+                t (Tensor): Input tensor T is of shape [seq_length, ... , dim]
+                freqs (Tensor): Rotary Positional embedding tensor freq is of shape [seq_length, ..., dim]
+
+            Returns:
+                Tensor: The input tensor after applying RoPE
+            """
+            mscale = self.config.attention_scaling
+            rot_dim = freqs.shape[-1]
+
+            # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
+            t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
+            if multi_latent_attention is None:
+                multi_latent_attention = self.config.multi_latent_attention
+            if mla_rotary_interleaved is None:
+                mla_rotary_interleaved = multi_latent_attention
+            if mla_rotary_interleaved:
+                x1 = t[..., 0::2]
+                x2 = t[..., 1::2]
+                t = torch.cat((x1, x2), dim=-1)
+
+            # first part is cosine component
+            # second part is sine component, need to change signs with _rotate_half method
+            cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
+            sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
+            if inverse:
+                sin_ = -sin_
+
+            t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
+            # Fallback to original permutation
+            # DSv4 applies rope on V and O, so we need to uninterleave the tensor.
+            # The existing MLA code is safe because the dot product is permutation-invariant.
+            if mla_rotary_interleaved and mla_output_remove_interleaving:
+                x1, x2 = torch.chunk(t, 2, dim=-1)
+                t = torch.stack((x1, x2), dim=-1).flatten(start_dim=-2)
+
+            return torch.cat((t, t_pass), dim=-1)
+
+        rope_utils._apply_rotary_pos_emb_bshd = _apply_rotary_pos_emb_bshd
+        try:
+            yield
+        finally:
+            rope_utils._apply_rotary_pos_emb_bshd = _origin_apply_rotary_pos_emb_bshd
+
     def _build_mlp(self, mlp_spec):
         pg_collection = self.pg_collection
-        if isinstance(mlp_spec, partial):
-            return mlp_spec(config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer)
         additional_mlp_kwargs = {}
-        # import here to avoid circular import
-        from mcore_bridge.model.gpts.glm4 import Glm4MLP
+        if isinstance(mlp_spec, partial):
+            if 'layer_number' in inspect.signature(mlp_spec.func).parameters:
+                additional_mlp_kwargs['layer_number'] = self.layer_number
+            mlp = mlp_spec(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=self.is_mtp_layer,
+                **additional_mlp_kwargs)
+        else:
+            # import here to avoid circular import
+            from mcore_bridge.model.gpts.glm4 import Glm4MLP
+            from mcore_bridge.model.mm_gpts.gemma4 import Gemma4MLP, Gemma4MoELayer
 
-        # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
-        # We can change MLP to accept pg_collection but it makes the logic implicit
-        # The conditional below is to make the logic explicit
-        # if smlp_spec is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(mlp_spec, ModuleSpec):
-            if mlp_spec.module in (MoELayer, TEGroupedMLP, SequentialMLP):
-                additional_mlp_kwargs['pg_collection'] = pg_collection
-                # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
-                if mlp_spec.module == MoELayer and 'is_mtp_layer' in inspect.signature(MoELayer).parameters:
-                    additional_mlp_kwargs['is_mtp_layer'] = self.is_mtp_layer
-            elif mlp_spec.module in (MLP, Glm4MLP):
-                assert hasattr(pg_collection, 'tp'), 'TP process group is required for MLP in TransformerLayer'
-                additional_mlp_kwargs['tp_group'] = pg_collection.tp
-            elif TEFusedMLP is not None and mlp_spec.module == TEFusedMLP:
-                assert hasattr(pg_collection, 'tp'), 'TP process group is required for TEFusedMLP in TransformerLayer'
-                additional_mlp_kwargs['tp_group'] = pg_collection.tp
-            else:
-                logger.warning_once(f'Unknown MLP type: {mlp_spec.module}. Using default kwargs.')
-        return build_module(mlp_spec, config=self.config, **additional_mlp_kwargs)
+            # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
+            # We can change MLP to accept pg_collection but it makes the logic implicit
+            # The conditional below is to make the logic explicit
+            # if smlp_spec is not a ModuleSpec,we dont have to handle passing additional kwargs
+            if isinstance(mlp_spec, ModuleSpec):
+                if mlp_spec.module in (MoELayer, Gemma4MoELayer, TEGroupedMLP, SequentialMLP):
+                    additional_mlp_kwargs['pg_collection'] = pg_collection
+                    # Pass is_mtp_layer flag to MoELayer to distinguish MTP MoE layers.
+                    if mlp_spec.module == MoELayer and 'is_mtp_layer' in inspect.signature(MoELayer).parameters:
+                        additional_mlp_kwargs['is_mtp_layer'] = self.is_mtp_layer
+                elif mlp_spec.module in (MLP, Glm4MLP):
+                    assert hasattr(pg_collection, 'tp'), 'TP process group is required for MLP in TransformerLayer'
+                    additional_mlp_kwargs['tp_group'] = pg_collection.tp
+                elif mlp_spec.module == Gemma4MLP:
+                    additional_mlp_kwargs['layer_number'] = self.layer_number
+                elif TEFusedMLP is not None and mlp_spec.module == TEFusedMLP:
+                    assert hasattr(pg_collection,
+                                   'tp'), 'TP process group is required for TEFusedMLP in TransformerLayer'
+                    additional_mlp_kwargs['tp_group'] = pg_collection.tp
+                else:
+                    logger.warning_once(f'Unknown MLP type: {mlp_spec.module}. Using default kwargs.')
+            mlp = build_module(mlp_spec, config=self.config, **additional_mlp_kwargs)
+        if hasattr(mlp, 'set_layer_number'):
+            mlp.set_layer_number(self.layer_number)
+        return mlp
 
     def forward(self, *args, **kwargs):
         """
@@ -250,7 +338,8 @@ class TransformerLayer(McoreTransformerLayer):
         if padding_mask is not None:
             kwargs['padding_mask'] = padding_mask
             mlp_kwargs['padding_mask'] = padding_mask
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        with self._patch_apply_rotary_pos_emb():
+            hidden_states, context = self._forward_attention(*args, **kwargs)
         # If padding_free is set, attention_mask does not exist.
         mlp_padding_free = self.config.mlp_padding_free and 'attention_mask' in kwargs
         mask = None

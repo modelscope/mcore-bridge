@@ -119,6 +119,7 @@ class ModelConfig(TransformerConfig):
     llm_model_type: Optional[str] = None
     padded_vocab_size: Optional[int] = None
     rope_scaling: Optional[Union[dict, str]] = None
+    attention_scaling: float = 1.
 
     # model
     num_layers: Optional[int] = None
@@ -196,13 +197,25 @@ class ModelConfig(TransformerConfig):
     linear_decoupled_in_proj: bool = False
 
     # dsa
-    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
+    experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = None
     dsa_indexer_n_heads: Optional[int] = None
     dsa_indexer_head_dim: Optional[int] = None
     dsa_indexer_topk: Optional[int] = None
-    dsa_indexer_loss_coeff: Optional[float] = None
+    dsa_indexer_loss_coeff: float = 0.
     dsa_indexer_use_sparse_loss: bool = False
     dsa_indexer_rotary_interleaved: bool = False
+
+    # deepseek-v4
+    csa_window_size: int = 128
+    csa_compress_ratios: Optional[List[int]] = None
+    csa_compress_rotary_base: float = 40000.0
+    o_groups: int = 8
+    o_lora_rank: int = 1024
+    enable_hyper_connections: bool = False
+    num_residual_streams: int = 4
+    mhc_sinkhorn_iterations: int = 20
+    mhc_init_gating_factor: float = 0.01
+    moe_n_hash_layers: int = 0
 
     # mtp
     mtp_decoder_input_detach: bool = False
@@ -289,6 +302,7 @@ class ModelConfig(TransformerConfig):
 
         if self.add_bias_linear:
             self.add_qkv_bias = True
+        self.actual_vocab_size = self.padded_vocab_size
         self.batch_p2p_comm = not self.overlap_p2p_comm
         if self.swiglu:
             self.activation_func = F.silu
@@ -314,6 +328,8 @@ class ModelConfig(TransformerConfig):
             self.mtp_num_layers = 1
         else:
             self.mtp_unroll_steps = self.mtp_num_layers
+        if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
+            self.csa_compress_ratios += [0] * self.mtp_num_layers
         super().__post_init__()
 
         self._check_npu()

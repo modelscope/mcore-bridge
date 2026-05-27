@@ -94,7 +94,7 @@ class Glm4Loader(ModelLoader):
         transformer_layer_spec = super().get_transformer_layer_spec(vp_stage)
         for layer_spec in transformer_layer_spec.layer_specs:
             layer_spec.submodules.self_attention.module = Glm4SelfAttention
-            layer_spec.submodules.mlp.module = Glm4MLP
+            self._set_mlp_spec(layer_spec.submodules, Glm4MLP)
         return transformer_layer_spec
 
 

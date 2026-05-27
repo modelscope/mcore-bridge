@@ -9,6 +9,7 @@ class LLMModelType:
     minimax_m2 = 'minimax_m2'
     hy_v3 = 'hy_v3'
     bailing_moe = 'bailing_moe'
+    deepseek_v4 = 'deepseek_v4'
 
     qwen3_emb = 'qwen3_emb'
 
@@ -29,6 +30,7 @@ class MLLMModelType:
     glm4v_moe = 'glm4v_moe'
     kimi_vl = 'kimi_vl'
     llama4 = 'llama4'
+    gemma4 = 'gemma4'
 
     kimi_k25 = 'kimi_k25'
 

@@ -74,7 +74,7 @@ class MinimaxM2Bridge(GPTBridge):
     hf_mlp_prefix = 'block_sparse_moe'
     hf_expert_bias_key = 'e_score_correction_bias'
 
-    def _set_qk_layernorm(self, mg_attn, hf_state_dict, to_mcore):
+    def _set_qk_layernorm(self, mg_attn, hf_state_dict, to_mcore, **kwargs):
         self._set_state_dict(mg_attn, 'q_norm.weight', hf_state_dict, 'q_norm.weight', to_mcore)
         self._set_state_dict(mg_attn, 'k_norm.weight', hf_state_dict, 'k_norm.weight', to_mcore)
 

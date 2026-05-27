@@ -79,6 +79,7 @@ class MultimodalGPTModel(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         **kwargs,
     ) -> torch.Tensor:
+        extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         if decoder_input is not None:
             pass
         elif self.pre_process:
@@ -90,6 +91,7 @@ class MultimodalGPTModel(MegatronModule):
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
             kwargs = {}
+        kwargs.update(extra_kwargs)
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,

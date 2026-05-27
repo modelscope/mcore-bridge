@@ -2,11 +2,15 @@
 import megatron.core
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.gpt import gpt_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
+from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
+from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from packaging import version
 from torch import nn
 from typing import TYPE_CHECKING, List, Optional, Type, Union
@@ -15,7 +19,7 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
-from .modules import MultiTokenPredictionLayer, TransformerBlock, TransformerLayer
+from .modules import MLASelfAttention, MultiTokenPredictionLayer, TopKRouter, TransformerBlock, TransformerLayer
 
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
@@ -76,6 +80,16 @@ class ModelLoader:
         if self.model_cls is None:
             self.model_cls = MultimodalGPTModel if config.is_multimodal else GPTModel
 
+    def _set_mlp_spec(self, layer_submodules, mlp_module, mlp_key='mlp'):
+        mlp_spec = getattr(layer_submodules, mlp_key)
+        if isinstance(mlp_spec, partial):
+            mlp_spec = partial(
+                mlp_module.as_mlp_submodule if hasattr(mlp_module, 'as_mlp_submodule') else mlp_module, *mlp_spec.args,
+                **mlp_spec.keywords)
+            setattr(layer_submodules, mlp_key, mlp_spec)
+        else:
+            mlp_spec.module = mlp_module
+
     def _replace_spec_dsa(self, layer_spec):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             _get_backend_spec_provider, get_dsa_module_spec_for_backend)
@@ -118,9 +132,29 @@ class ModelLoader:
                 if hasattr(layer_spec.submodules.mlp.submodules, 'shared_experts'):
                     layer_spec.submodules.mlp.submodules.shared_experts.params = {'gate': True}
 
-    def _set_custom_layer(self, transformer_layer_spec):
+    def _set_transformer_layer(self, transformer_layer_spec):
+        if self.config.enable_hyper_connections:
+            return
         for layer_spec in transformer_layer_spec.layer_specs:
-            layer_spec.module = TransformerLayer
+            if layer_spec.module is McoreTransformerLayer:
+                layer_spec.module = TransformerLayer
+
+    def _replace_mla_attention(self, transformer_layer_spec):
+        for layer_spec in transformer_layer_spec.layer_specs:
+            self_attention = layer_spec.submodules.self_attention
+            if self_attention.module is McoreMLASelfAttention:
+                self_attention.module = MLASelfAttention
+
+    def _replace_router(self, transformer_layer_spec, mlp_key='mlp'):
+        for layer_spec in transformer_layer_spec.layer_specs:
+            mlp_spec = getattr(layer_spec.submodules, mlp_key, None)
+            if mlp_spec is not None:
+                if isinstance(mlp_spec, partial):
+                    mlp_submodules = mlp_spec.keywords.get('submodules')
+                else:
+                    mlp_submodules = getattr(mlp_spec, 'submodules', None)
+                if getattr(mlp_submodules, 'router', None) is McoreTopKRouter:
+                    mlp_submodules.router = TopKRouter
 
     def build_model(
         self,
@@ -130,7 +164,9 @@ class ModelLoader:
     ) -> Union['GPTModel', 'MultimodalGPTModel']:
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
         self._set_shared_expert_gate(transformer_layer_spec)
-        self._set_custom_layer(transformer_layer_spec)
+        self._set_transformer_layer(transformer_layer_spec)
+        self._replace_mla_attention(transformer_layer_spec)
+        self._replace_router(transformer_layer_spec)
         mtp_block_spec = None
         if self.config.mtp_num_layers is not None:
             mtp_block_spec = self.get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)

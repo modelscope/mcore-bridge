@@ -18,7 +18,7 @@
 
 
 <p align="center">
-<img src="https://img.shields.io/badge/python-3.11-5be.svg">
+<img src="https://img.shields.io/badge/python-3.12-5be.svg">
 <img src="https://img.shields.io/badge/pytorch-%E2%89%A52.0-orange.svg">
 <a href="https://github.com/NVIDIA/Megatron-LM/"><img src="https://img.shields.io/badge/megatron--core-%E2%89%A50.15-76B900.svg"></a>
 <!-- <a href="https://mcore-bridge.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-blue.svg"></a> -->
@@ -52,7 +52,7 @@ You can contact us and communicate with us by adding our group:
 
 ## 📝 Introduction
 
-**mcore-bridge** is a large language model and multimodal large model definition library built on the Megatron-Core ecosystem, developed by the ModelScope community. It currently supports 300+ text-only models and 200+ multimodal models, including large language models such as Qwen3-Next, GLM5.1, DeepSeek-V3.2, Minimax2.7, Kimi K2.5, and GPT-OSS, as well as multimodal large models such as Qwen3.5-VL, Qwen3-Omni, GLM4.6-V, InternVL3.5, and Ovis2.5.
+**mcore-bridge** is a large language model and multimodal large model definition library built on the Megatron-Core ecosystem, developed by the ModelScope community. It currently supports 300+ text-only models and 200+ multimodal models, including large language models such as Qwen3-Next, GLM5.1, DeepSeek-V3.2, Minimax2.7, Kimi K2.5, and GPT-OSS, as well as multimodal large models such as Qwen3.5, Qwen3-Omni, Gemma4, GLM4.6-V, InternVL3.5, and Ovis2.5.
 
 ------
 
@@ -127,7 +127,7 @@ The following is the list of models supported by MCore-Bridge:
 | Series     | model_type                                            |
 | -------- | ------------------------------------------------------------ |
 | Qwen     | qwen2, qwen2_moe<br />qwen3, qwen3_moe, qwen3_next |
-| DeepSeek | deepseek_v3, deepseek_v32                                    |
+| DeepSeek | deepseek_v3, deepseek_v32, deepseek_v4                        |
 | GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm_moe_dsa |
 | MiniMax  | minimax_m2                                                   |
 | Kimi     | kimi_k2, kimi_k25                                   |
@@ -145,6 +145,7 @@ The following is the list of models supported by MCore-Bridge:
 | Series     | model_type                                            |
 | -------- | ------------------------------------------------------------ |
 | Qwen     | qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe, qwen3_asr<br />qwen3_5, qwen3_5_moe |
+| Gemma     | gemma4                                   |
 | GLM      | glm4v, glm4v_moe |
 | Kimi     | kimi_vl                                   |
 | InternVL | internvl_chat, internvl                           |
@@ -163,7 +164,6 @@ You need to create the following file (test.py), then run `CUDA_VISIBLE_DEVICES=
 The saved model can be used for inference by referring to the [example code in the model card](https://modelscope.cn/models/Qwen/Qwen3.5-35B-A3B).
 
 ```python
-# test env: transformers==5.2.0 megatron-core==0.16.1
 import os
 import torch
 import torch.distributed as dist
@@ -295,6 +295,99 @@ model_dir = snapshot_download('Qwen/Qwen3.5-4B')
 model = Qwen3_5ForConditionalGeneration.from_pretrained(model_dir)
 peft_model = PeftModel.from_pretrained(model, 'Qwen3.5-4B-LoRA')
 ```
+
+### Minimal forward example
+
+Mcore-Bridge integrates seamlessly with the ms-swift template for model training. You can also replace the ms-swift template module with a custom data processing pipeline to suit your own workflow.
+
+The following provides a minimal example demonstrating how to perform a forward pass and compute the loss using a model created with Mcore-Bridge, helping users quickly integrate Mcore-Bridge into other projects.
+
+Create the following file (test.py) and run it with: `CUDA_VISIBLE_DEVICES=0,1 torchrun --nproc_per_node=2 test.py`.
+
+```python
+import os
+import torch
+import torch.distributed as dist
+from megatron.core import mpu
+from modelscope import snapshot_download
+from swift import get_processor, get_template
+from swift.megatron.utils import get_packed_seq_params, get_padding_to
+from swift.utils import to_device
+
+from mcore_bridge import ModelConfig, get_mcore_model, hf_to_mcore_config, set_random_seed
+
+data = {
+    'messages': [{
+        'role': 'user',
+        'content': '<image>describe the image.'
+    }, {
+        'role':
+        'assistant',
+        'content':
+        'The image depicts a close-up of a kitten with striking features. '
+        'The kitten has a white and gray coat with distinct black stripes, '
+        'particularly noticeable on its face and ears. Its eyes are large '
+        'and expressive, with a captivating blue hue that stands out against '
+        "the darker fur around them. The kitten's nose is small and pink, "
+        'and it has long, delicate whiskers extending from either side of its mouth. '
+        "The background is blurred, drawing attention to the kitten's face and "
+        'making it the focal point of the image. The overall impression is '
+        'one of cuteness and charm.'
+    }],
+    'images': ['http://modelscope-open.oss-cn-hangzhou.aliyuncs.com/images/cat.png']
+}
+
+
+def forward_mg_model(mg_model, template):
+    template.use_megatron = True
+    template.set_mode('train')
+    inputs = template.encode(data, return_length=True)
+    mg_inputs = to_device(template.data_collator([inputs], padding_to=get_padding_to(mg_model.config)), 'cuda')
+    text_position_ids = mg_inputs.pop('text_position_ids', None)
+    if text_position_ids is None:
+        text_position_ids = mg_inputs.get('position_ids')
+    for key in ['num_samples', 'attention_mask_2d', 'loss_scale']:
+        mg_inputs.pop(key, None)
+    if template.padding_free:
+        mg_inputs['packed_seq_params'] = get_packed_seq_params(text_position_ids)
+    mg_inputs['labels'] = torch.roll(mg_inputs['labels'], -1, dims=-1)
+    loss = mg_model(**mg_inputs)
+    loss_mask = mg_inputs['labels'] != -100
+    loss = loss * loss_mask
+    return loss.sum() / loss_mask.sum()
+
+
+torch.cuda.set_device(f"cuda:{os.getenv('LOCAL_RANK')}")
+dist.init_process_group(backend='nccl')
+TP, PP, EP, ETP = 2, 1, 2, 1
+mpu.initialize_model_parallel(
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
+)
+set_random_seed(42)
+
+model_dir = snapshot_download('Qwen/Qwen3.5-35B-A3B')
+template = get_template(get_processor(model_dir), padding_free=True)
+config_kwargs = hf_to_mcore_config(template.config)
+config = ModelConfig(
+    params_dtype=torch.bfloat16,
+    tensor_model_parallel_size=TP,
+    pipeline_model_parallel_size=PP,
+    expert_model_parallel_size=EP,
+    expert_tensor_parallel_size=ETP,
+    sequence_parallel=True,
+    mtp_num_layers=1,
+    **config_kwargs)
+
+mg_model = get_mcore_model(config)[0]
+mg_model.cuda()
+config.bridge.load_weights([mg_model], model_dir)
+loss = forward_mg_model(mg_model, template)
+print(f'loss: {loss}')  # loss: 0.8161308169364929
+```
+
 
 ## 🏛 License
 

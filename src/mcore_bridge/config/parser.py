@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import torch.nn.functional as F
+from functools import partial
 from transformers import PretrainedConfig
 from typing import Any, Dict
 
@@ -25,7 +27,7 @@ config_mapping = {
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
     'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],
-    'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k'],
+    'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k', 'top_k_experts'],
     'moe_router_num_groups': ['n_group'],
     'moe_router_group_topk': ['topk_group'],
     'num_moe_experts': ['num_experts', 'n_routed_experts', 'moe_num_experts', 'num_local_experts'],
@@ -54,6 +56,15 @@ config_mapping = {
     'dsa_indexer_head_dim': ['index_head_dim'],
     'dsa_indexer_topk': ['index_topk'],
     'dsa_indexer_rotary_interleaved': ['indexer_rope_interleave'],
+    # deepseek_v4
+    'csa_compress_ratios': ['compress_rates'],
+    'csa_compress_rotary_base': ['compress_rope_theta'],
+    'o_groups': ['o_groups'],
+    'o_lora_rank': ['o_lora_rank'],
+    'num_residual_streams': ['hc_mult'],
+    'mhc_sinkhorn_iterations': ['hc_sinkhorn_iters'],
+    'moe_n_hash_layers': ['mlp_layer_types'],
+    'activation_func_clamp_value': ['swiglu_limit'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
     'partial_rotary_factor': ['partial_rotary_factor'],
@@ -86,7 +97,7 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
                     else:
                         continue
                 else:
-                    if k == 'kv_lora_rank':
+                    if k in {'q_lora_rank', 'kv_lora_rank'}:
                         megatron_config['multi_latent_attention'] = True
                     elif k == 'hf_model_type':
                         if _internal_call:
@@ -132,16 +143,26 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.pop('ffn_hidden_size', None)
         if llm_model_type in {'qwen2_moe', 'qwen3_next'} or hf_model_type == 'qwen3_5_moe':
             res['moe_shared_expert_gate'] = True
-    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1'
+    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1', 'deepseek_v4'
                           } or hf_model_type == 'kimi_vl':
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
-        res.pop('num_query_groups', None)  # https://github.com/NVIDIA/Megatron-LM/issues/1475
         if llm_model_type == 'dots1':
             res['moe_router_score_function'] = 'sigmoid'
         elif llm_model_type == 'deepseek_v32':
             res['experimental_attention_variant'] = 'dsa'
+        elif llm_model_type == 'deepseek_v4':
+            if 'v_head_dim' not in res:
+                res['v_head_dim'] = res['kv_channels']
+            res['experimental_attention_variant'] = 'dsv4_hybrid'
+            res['moe_router_enable_expert_bias'] = True
+            res['csa_window_size'] = window_size
+            res['enable_hyper_connections'] = True
+            csa_compress_ratios = res.pop('csa_compress_ratios', None)
+            res['csa_compress_ratios'] = [csa_compress_ratios.get(layer_type, 0) for layer_type in layer_types]
+            moe_n_hash_layers = res.pop('moe_n_hash_layers', None)
+            res['moe_n_hash_layers'] = len([layer for layer in moe_n_hash_layers if layer == 'hash_moe'])
     elif llm_model_type == 'hunyuan':
         # Since HunYuan’s attention applies RoPE before using q/k_layernorm,
         # which is incompatible with megatron-core, support is not provided here.
@@ -153,6 +174,15 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         n_shared_experts = res.pop('n_shared_experts')
     elif llm_model_type in {'ernie4_5', 'ernie4_5_moe', 'glm4'}:
         res['rotary_interleaved'] = True
+    elif hf_model_type in {'gemma4'}:
+        res['qk_layernorm'] = True
+        res['window_size'] = f'{window_size - 1},0'
+        window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])
+        res['window_attn_skip_freq'] = f'[{window_attn_skip_freq}]'
+        res['softmax_scale'] = 1.
+        res['swiglu'] = False
+        res['gated_linear_unit'] = True
+        res['activation_func'] = partial(F.gelu, approximate='tanh')
     elif llm_model_type == 'gpt_oss':
         res['add_bias_linear'] = True
         res['bias_dropout_fusion'] = False
@@ -161,7 +191,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['quick_geglu'] = True
         res['activation_func_clamp_value'] = 7
         res['glu_linear_offset'] = 1
-        res['window_size'] = f'{window_size},0'
+        res['window_size'] = f'{window_size - 1},0'
         if layer_types is None:
             res['window_attn_skip_freq'] = '2'
         else:

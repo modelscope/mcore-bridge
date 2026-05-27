@@ -507,7 +507,7 @@ class Qwen3NextBridge(GPTBridge):
             hf_state_dict.update(self._set_module(mg_attn, hf_state_dict, 'linear_attn.', to_mcore))
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
-        self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight', to_mcore)
+        self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
@@ -517,8 +517,8 @@ class Qwen3NextBridge(GPTBridge):
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         hf_state_dict.update(
             self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore, is_mtp=is_mtp))
-        self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict,
-                             f'{self.hf_post_attention_layernorm}.weight', to_mcore)
+        self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict, self.hf_post_attention_layernorm_key,
+                             to_mcore)
         return hf_state_dict
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):

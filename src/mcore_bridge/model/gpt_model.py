@@ -11,13 +11,11 @@ from megatron.core.config_logger import has_config_logger_enabled, log_config_to
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.gpt import GPTModel as McoreGPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    gather_from_tensor_model_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+                                                    gather_from_tensor_model_parallel_region)
 from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
@@ -55,6 +53,7 @@ class OutputLayerLinear(TELinear):
 
 class GPTModel(McoreGPTModel):
     config: ModelConfig
+    extra_forward_keys = []
 
     def __init__(
         self,
@@ -67,19 +66,14 @@ class GPTModel(McoreGPTModel):
     ):
         vocab_size = math.ceil(
             config.padded_vocab_size / config.tensor_model_parallel_size) * config.tensor_model_parallel_size
-        hf_rope_scaling = config.rope_scaling
+        self.hf_rope_scaling = config.rope_scaling
         if config.multi_latent_attention:
             config.rope_type = 'rope'  # use transformers implementation
             # Set default value, the following content will not be used. (dummy)
             config.mscale_all_dim = 0.
             config.cache_mla_latents = False
             config.rotary_scaling_factor = 40
-            if hf_rope_scaling and hf_rope_scaling['rope_type'] == 'yarn':
-                # softmax_scale
-                config.mscale = hf_rope_scaling['mscale']
-                config.mscale_all_dim = hf_rope_scaling['mscale_all_dim']
-                config.rotary_scaling_factor = hf_rope_scaling['factor']
-        self.hf_rope_scaling = hf_rope_scaling
+            self._init_mla_softmax_scale(config)
         super().__init__(
             config,
             transformer_layer_spec,
@@ -105,9 +99,7 @@ class GPTModel(McoreGPTModel):
             for i in range(len(self.decoder.layers)):
                 if hasattr(self.decoder.layers[i].self_attention, 'rotary_pos_emb'):
                     del self.decoder.layers[i].self_attention.rotary_pos_emb
-        self.attention_scaling = 1.
-        new_inv_freq, self.attention_scaling = get_rope_inv_freq(config)
-        self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+        self._set_inv_freq()
         if self.config.task_type == 'seq_cls' and self.post_process:
             self.output_layer = OutputLayerLinear(
                 config.hidden_size,
@@ -122,12 +114,10 @@ class GPTModel(McoreGPTModel):
         elif self.config.task_type == 'embedding' and self.post_process:
             self.output_layer = None
 
-        if self.attention_scaling != 1 and config.apply_rope_fusion:
+        if config.attention_scaling != 1 and config.apply_rope_fusion:
             config.apply_rope_fusion = False
             logger.warning(f'`apply_rope_fusion` does not support `attention_scaling`. '
                            f'Setting `config.apply_rope_fusion`: {config.apply_rope_fusion}')
-        if not config.apply_rope_fusion:
-            self._patch_apply_rotary_pos_emb()
         if getattr(self, 'mtp', None) is not None:
             for layer in self.mtp.layers:
                 # compat megatron-core main branch
@@ -141,50 +131,12 @@ class GPTModel(McoreGPTModel):
                 attention.config = copy.copy(attention.config)
                 attention.config.apply_rope_fusion = False
 
-    def _patch_apply_rotary_pos_emb(self):
-        if hasattr(rope_utils, '_origin_apply_rotary_pos_emb_bshd'):
-            return
-        _origin_apply_rotary_pos_emb_bshd = rope_utils._apply_rotary_pos_emb_bshd
-
-        def _apply_rotary_pos_emb_bshd(
-            t: torch.Tensor,
-            freqs: torch.Tensor,
-            rotary_interleaved: bool = False,
-            multi_latent_attention: bool = False,  # not use
-            mscale: float = 1.0,
-            **kwargs,
-        ) -> torch.Tensor:
-            """Apply rotary positional embedding to input tensor T.
-
-            check https://kexue.fm/archives/8265 for detailed formulas
-
-            Args:
-                t (Tensor): Input tensor T is of shape [seq_length, ... , dim]
-                freqs (Tensor): Rotary Positional embedding tensor freq is of shape [seq_length, ..., dim]
-
-            Returns:
-                Tensor: The input tensor after applying RoPE
-            """
-            mscale = self.attention_scaling
-            rot_dim = freqs.shape[-1]
-
-            # ideally t_pass is empty so rotary pos embedding is applied to all tensor t
-            t, t_pass = t[..., :rot_dim], t[..., rot_dim:]
-            if multi_latent_attention:
-                x1 = t[..., 0::2]
-                x2 = t[..., 1::2]
-                t = torch.cat((x1, x2), dim=-1)
-
-            # first part is cosine component
-            # second part is sine component, need to change signs with _rotate_half method
-            cos_ = (torch.cos(freqs) * mscale).to(t.dtype)
-            sin_ = (torch.sin(freqs) * mscale).to(t.dtype)
-
-            t = (t * cos_) + (rope_utils._rotate_half(t, rotary_interleaved) * sin_)
-            return torch.cat((t, t_pass), dim=-1)
-
-        rope_utils._apply_rotary_pos_emb_bshd = _apply_rotary_pos_emb_bshd
-        rope_utils._origin_apply_rotary_pos_emb_bshd = _origin_apply_rotary_pos_emb_bshd
+    def _init_mla_softmax_scale(self, config):
+        if self.hf_rope_scaling and self.hf_rope_scaling['rope_type'] == 'yarn':
+            # softmax_scale
+            config.mscale = self.hf_rope_scaling['mscale']
+            config.mscale_all_dim = self.hf_rope_scaling['mscale_all_dim']
+            config.rotary_scaling_factor = self.hf_rope_scaling['factor']
 
     def _preprocess(
         self,
@@ -217,40 +169,14 @@ class GPTModel(McoreGPTModel):
             # fix LoRA incompatibility with gradient checkpointing
             decoder_input = decoder_input.requires_grad_(True)
 
-        # Rotary positional embeddings (embedding is None for PP intermediate devices)
-        rotary_pos_emb = None
-        rotary_pos_cos = None
-        rotary_pos_sin = None
-        if self.position_embedding_type in {'rope', 'mrope'}:
-            if not self.training and self.config.flash_decode and inference_context:
-                assert (inference_context.is_static_batching()
-                        ), 'GPTModel currently only supports static inference batching.'
-                # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                    inference_context.max_sequence_length,
-                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                )
-            else:
-                rotary_seq_len = RotaryEmbedding.get_rotary_seq_len(self, inference_context, self.decoder,
-                                                                    decoder_input, self.config, packed_seq_params)
-                if self.hf_rope_scaling is not None:
-                    attention_scaling = dynamic_rope_update(self, self.rotary_pos_emb.inv_freq, rotary_seq_len)
-                    if attention_scaling is not None and attention_scaling != self.attention_scaling:
-                        raise ValueError('Currently does not support changing attention_scaling during training. '
-                                         f'self.attention_scaling: {self.attention_scaling}, '
-                                         f'current_attention_scaling: {attention_scaling}.')
-                if self.position_embedding_type == 'mrope':
-                    rotary_pos_emb = self.rotary_pos_emb(
-                        position_ids,
-                        mrope_section=self.mrope_section,
-                        mrope_interleaved=self.config.mrope_interleaved,
-                    )
-                else:
-                    packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-                    rotary_pos_emb = self.rotary_pos_emb(
-                        rotary_seq_len,
-                        packed_seq=packed_seq,
-                    )
+        mtp_decoder_input = decoder_input
+        if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:
+            input_tensor = self.get_input_tensor()
+            input_tensor, mtp_decoder_input = input_tensor.chunk(2, dim=0)
+            self.set_input_tensor(input_tensor)
+
+        rotary_pos_emb, rotary_pos_cos, rotary_pos_sin = self._get_rotary_pos_emb(
+            decoder_input, position_ids, packed_seq_params=packed_seq_params)
 
         if (in_inference_mode and ((self.config.enable_cuda_graph and self.config.cuda_graph_scope != 'full_iteration')
                                    or self.config.flash_decode) and rotary_pos_cos is not None
@@ -270,7 +196,48 @@ class GPTModel(McoreGPTModel):
         if in_inference_mode and not has_config_logger_enabled(self.config):
             decoder_input = WrappedTensor(decoder_input)
 
-        return decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+        return decoder_input, mtp_decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
+
+    def _set_inv_freq(self):
+        new_inv_freq, self.config.attention_scaling = get_rope_inv_freq(self.config)
+        self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+
+    def _get_rotary_pos_emb(self, decoder_input, position_ids, packed_seq_params, inference_context=None):
+        # Rotary positional embeddings (embedding is None for PP intermediate devices)
+        rotary_pos_emb = None
+        rotary_pos_cos = None
+        rotary_pos_sin = None
+        if self.position_embedding_type in {'rope', 'mrope'}:
+            if not self.training and self.config.flash_decode and inference_context:
+                assert (inference_context.is_static_batching()
+                        ), 'GPTModel currently only supports static inference batching.'
+                # Flash decoding uses precomputed cos and sin for RoPE
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
+                    inference_context.max_sequence_length,
+                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                )
+            else:
+                rotary_seq_len = RotaryEmbedding.get_rotary_seq_len(self, inference_context, self.decoder,
+                                                                    decoder_input, self.config, packed_seq_params)
+                if self.hf_rope_scaling is not None:
+                    attention_scaling = dynamic_rope_update(self, self.rotary_pos_emb.inv_freq, rotary_seq_len)
+                    if attention_scaling is not None and attention_scaling != self.config.attention_scaling:
+                        raise ValueError('Currently does not support changing attention_scaling during training. '
+                                         f'config.attention_scaling: {self.config.attention_scaling}, '
+                                         f'current_attention_scaling: {attention_scaling}.')
+                if self.position_embedding_type == 'mrope':
+                    rotary_pos_emb = self.rotary_pos_emb(
+                        position_ids,
+                        mrope_section=self.mrope_section,
+                        mrope_interleaved=self.config.mrope_interleaved,
+                    )
+                else:
+                    packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                    rotary_pos_emb = self.rotary_pos_emb(
+                        rotary_seq_len,
+                        packed_seq=packed_seq,
+                    )
+        return rotary_pos_emb, rotary_pos_cos, rotary_pos_sin
 
     # Code borrowed from NVIDIA/Megatron-LM
     def forward(
@@ -301,8 +268,9 @@ class GPTModel(McoreGPTModel):
         if self.config.position_embedding_type == 'mrope' and position_ids.ndim == 2:  # qwen3_asr
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
         # There is a difference in whether rotary_pos_emb can be fused between the decoder and MTP.
-        decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
+        decoder_input, mtp_decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset = (
             self._preprocess(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -314,26 +282,32 @@ class GPTModel(McoreGPTModel):
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.position_embedding_type == 'rope' and packed_seq and not self.config.apply_rope_fusion:
             assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
-            decoder_rotary_pos_emb = rotary_pos_emb[position_ids[0]]
+            if isinstance(rotary_pos_emb, dict):
+                for k, v in rotary_pos_emb.items():
+                    decoder_rotary_pos_emb[k] = v[position_ids[0]]
+            else:
+                decoder_rotary_pos_emb = rotary_pos_emb[position_ids[0]]
 
-        mtp_decoder_input = decoder_input
-        if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:
-            input_tensor = self.get_input_tensor()
-            input_tensor, mtp_decoder_input = input_tensor.chunk(2, dim=0)
-            self.set_input_tensor(input_tensor)
-        kwargs = {}
-        if mcore_016 and attention_mask is not None:
+        extra_block_kwargs = extra_block_kwargs or {}
+        full_attention_mask = attention_mask
+        if isinstance(full_attention_mask, dict):
+            full_attention_mask = full_attention_mask['full_attention']
+        if mcore_016 and full_attention_mask is not None:
             assert packed_seq_params is None
-            padding_mask = ~((~attention_mask).sum(dim=(1, 2)) > 0)
+            padding_mask = ~((~full_attention_mask).sum(dim=(1, 2)) > 0)
             if self.config.context_parallel_size > 1:
                 padding_mask = split_cp_inputs(padding_mask, None, 1)
             tp_size = self.config.tensor_model_parallel_size
             if self.config.sequence_parallel and tp_size > 1:
                 assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'
                 padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
-            kwargs['padding_mask'] = padding_mask.contiguous()
+            extra_block_kwargs['padding_mask'] = padding_mask.contiguous()
+
+        if self.config.moe_n_hash_layers > 0:
+            extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -342,11 +316,18 @@ class GPTModel(McoreGPTModel):
             rotary_pos_sin=rotary_pos_sin,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
-            **(extra_block_kwargs or {}),
-            **kwargs,
+            **extra_block_kwargs,
         )
 
+        # When mHC + MTP, the decoder returns (contracted, multi-stream).
+        # MTP needs multi-stream; lm_head needs contracted.
+        if isinstance(decoder_output, tuple):
+            hidden_states, extra_block_kwargs['mhc_multistream'] = decoder_output
+        else:
+            hidden_states = decoder_output
+
         # MTP: https://github.com/NVIDIA/Megatron-LM/issues/1661
+        extra_block_kwargs.pop('input_ids', None)
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -366,25 +347,27 @@ class GPTModel(McoreGPTModel):
             inference_context=inference_context,
         )
 
-    def _postprocess(
-        self,
-        hidden_states,
-        input_ids,
-        position_ids,
-        labels,
-        rotary_pos_emb,
-        rotary_pos_cos,
-        rotary_pos_sin,
-        loss_mask=None,
-        decoder_input=None,
-        attention_mask=None,
-        inference_params=None,
-        packed_seq_params=None,
-        sequence_len_offset=None,
-        runtime_gather_output=None,
-        extra_block_kwargs=None,
-        inference_context=None,
-    ):
+    def _forward_output_layer(self, hidden_states, *args, **kwargs):
+        return self.output_layer(hidden_states, *args, **kwargs)[0]
+
+    def _postprocess(self,
+                     hidden_states,
+                     input_ids,
+                     position_ids,
+                     labels,
+                     rotary_pos_emb,
+                     rotary_pos_cos,
+                     rotary_pos_sin,
+                     loss_mask=None,
+                     decoder_input=None,
+                     attention_mask=None,
+                     inference_params=None,
+                     packed_seq_params=None,
+                     sequence_len_offset=None,
+                     runtime_gather_output=None,
+                     extra_block_kwargs=None,
+                     inference_context=None,
+                     **kwargs):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
         Applies Multi-Token Prediction if enabled, generates output logits through
@@ -432,7 +415,7 @@ class GPTModel(McoreGPTModel):
                 loss_mask = torch.ones_like(mtp_labels)
             for mtp_layer_number in range(self.config.mtp_unroll_steps):
                 # output
-                mtp_logits, _ = self.output_layer(
+                mtp_logits = self._forward_output_layer(
                     hidden_states_list[mtp_layer_number + 1],
                     weight=output_weight,
                     runtime_gather_output=runtime_gather_output,
@@ -493,7 +476,7 @@ class GPTModel(McoreGPTModel):
         if self.config.task_type == 'embedding':
             logits = F.normalize(hidden_states, p=2, dim=-1)
         else:
-            logits, _ = self.output_layer(
+            logits = self._forward_output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output)
             if self.config.task_type == 'generative_reranker':
                 logits = gather_from_tensor_model_parallel_region(logits)

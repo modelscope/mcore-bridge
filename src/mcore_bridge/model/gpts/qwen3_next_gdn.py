@@ -26,15 +26,15 @@ class Qwen3NextGDNBridgeMixin(GPTBridge):
                 self._set_linear_attn_state(mg_attn, hf_state_dict, 'linear_attn.', layer_idx, to_mcore))
 
             if self.config.linear_decoupled_in_proj:
-                self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, 'input_layernorm.weight',
+                self._set_state_dict(mg_layer, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key,
                                      to_mcore)
             else:
                 self._set_state_dict(mg_layer, 'self_attention.in_proj.layer_norm_weight', hf_state_dict,
-                                     'input_layernorm.weight', to_mcore)
+                                     self.hf_input_layernorm_key, to_mcore)
         else:
             hf_state_dict.update(self._set_attn_state(mg_attn, hf_state_dict, 'self_attn.', layer_idx, to_mcore))
             self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 'input_layernorm.weight', to_mcore)
+                                 self.hf_input_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):

@@ -273,6 +273,7 @@ class GatedDeltaNet(_GatedDeltaNet):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
+                groups=self.conv_dim // self.tp_size // cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d

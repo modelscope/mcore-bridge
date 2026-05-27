@@ -496,7 +496,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     orig_weights = [weight.data.clone() for weight in orig_weights]
                     delta_weights = self.get_delta_weights(active_adapter)
                     for orig_weight, delta_weight in zip(orig_weights, delta_weights):
-                        orig_weight += delta_weight
+                        orig_weight.data += delta_weight
                     if not all(torch.isfinite(orig_weights[i]).all() for i in range(len(orig_weights))):
                         raise ValueError(
                             f'NaNs detected in the merged weights. The adapter {active_adapter} seems to be broken')

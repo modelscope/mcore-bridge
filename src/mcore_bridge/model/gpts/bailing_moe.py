@@ -71,7 +71,7 @@ class BailingMoeBridge(GPTBridge):
     hf_expert_bias_key = 'gate.expert_bias'
     hf_o_proj_key = 'dense'
 
-    def _set_qkv(self, mg_attn, hf_state_dict, to_mcore: bool):
+    def _set_qkv(self, mg_attn, hf_state_dict, to_mcore: bool, **kwargs):
         self._set_state_dict(mg_attn, 'linear_qkv.weight', hf_state_dict, 'query_key_value.weight', to_mcore)
         assert not self.config.add_bias_linear
         return hf_state_dict
