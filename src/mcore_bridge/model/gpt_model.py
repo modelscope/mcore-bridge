@@ -413,6 +413,9 @@ class GPTModel(McoreGPTModel):
             if loss_mask is None:
                 # if loss_mask is not provided, use all ones as loss_mask
                 loss_mask = torch.ones_like(mtp_labels)
+            # Capture pre-roll token count so calculate_per_token_loss=True can
+            # re-normalize MTP gradients against the main-loss token count.
+            original_num_tokens = (loss_mask & (mtp_labels != -100)).sum()
             for mtp_layer_number in range(self.config.mtp_unroll_steps):
                 # output
                 mtp_logits = self._forward_output_layer(
@@ -449,10 +452,15 @@ class GPTModel(McoreGPTModel):
                         avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
                     )
                 mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_unroll_steps
+                # Clamp to avoid 0/0=NaN when a CP rank's tokens are all rolled out of range.
+                safe_num_tokens = num_tokens.clamp(min=1)
                 if self.config.calculate_per_token_loss:
-                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss)
+                    # finalize_model_grads divides all grads by main-loss total_num_tokens;
+                    # MTP has fewer valid tokens after rolling, so rescale by original_num_tokens.
+                    hidden_states = MTPLossAutoScaler.apply(
+                        hidden_states, mtp_loss_scale * mtp_loss * (original_num_tokens / safe_num_tokens))
                 else:
-                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / num_tokens)
+                    hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens)
         sequence_parallel_override = False
         if in_inference_mode and inference_context.materialize_only_last_token_logits:
             if inference_context.is_static_batching():
