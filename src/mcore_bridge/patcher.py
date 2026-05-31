@@ -195,28 +195,9 @@ def _patch_mrope():
     MultimodalRotaryEmbedding.forward = forward
     _origin_apply_rotary_pos_emb_thd = rope_utils._apply_rotary_pos_emb_thd
 
-    def _apply_rotary_pos_emb_thd(
-        t: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-        freqs: torch.Tensor,
-        rotary_interleaved: bool = False,
-        multi_latent_attention: bool = False,
-        mscale: float = 1.0,
-        cp_group: torch.distributed.ProcessGroup = None,
-        **kwargs,
-    ) -> torch.Tensor:
-        """A baseline implementation of applying RoPE for `thd` format.
-
-        Args:
-            t (Tensor): Input tensor T is of shape [t, h, d]
-            cu_seqlens(Tensor):  Cumulative sum of sequence lengths in a batch for `t`,
-            with shape [b + 1] and dtype torch.int32.
-            freqs (Tensor): Rotary Positional embedding tensor freq is of shape [max_s, 1, 1, d]
-            cp_group (torch.distributed.ProcessGroup): The context parallel group
-
-        Returns:
-            Tensor: Shape [t, h, d]. The input tensor after applying RoPE.
-        """
+    def _apply_rotary_pos_emb_thd(t: torch.Tensor, cu_seqlens: torch.Tensor, freqs: torch.Tensor, *args,
+                                  **kwargs) -> torch.Tensor:
+        cp_group = kwargs.pop('cp_group', None)
         if cp_group is not None:
             cp_size = cp_group.size()
         else:
@@ -225,25 +206,9 @@ def _patch_mrope():
         use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
         if not use_batched_rope:
             logger.warning_once('Using non-batched RoPE, which may affect performance.')
-            return _origin_apply_rotary_pos_emb_thd(
-                t,
-                cu_seqlens,
-                freqs,
-                rotary_interleaved=rotary_interleaved,
-                multi_latent_attention=multi_latent_attention,
-                mscale=mscale,
-                cp_group=cp_group,
-                **kwargs,
-            )
+            return _origin_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, *args, **kwargs)
 
-        return rope_utils._apply_rotary_pos_emb_bshd(
-            t.unsqueeze(1),
-            freqs,
-            rotary_interleaved=rotary_interleaved,
-            multi_latent_attention=multi_latent_attention,
-            mscale=mscale,
-            **kwargs,
-        ).squeeze(1)
+        return rope_utils._apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs, *args, **kwargs).squeeze(1)
 
     rope_utils._apply_rotary_pos_emb_thd = _apply_rotary_pos_emb_thd
 

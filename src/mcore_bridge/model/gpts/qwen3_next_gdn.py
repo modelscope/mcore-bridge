@@ -1,8 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import torch
 import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 from megatron.core.transformer.attention import SelfAttention
+from transformers.utils import is_torch_npu_available
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -138,8 +140,13 @@ class Qwen3NextLoader(ModelLoader):
         lm_model = model.language_model if hasattr(model, 'language_model') else model
         for layer in lm_model.decoder.layers:
             if hasattr(layer.self_attention, 'out_norm'):
-                assert hasattr(layer.self_attention.out_norm, 'zero_centered_gamma')
-                layer.self_attention.out_norm.zero_centered_gamma = False
+                out_norm = layer.self_attention.out_norm
+                out_norm.zero_centered_gamma = False
+                if not is_torch_npu_available():
+                    assert hasattr(out_norm, 'zero_centered_gamma')
+                if hasattr(out_norm, 'config'):
+                    out_norm.config = copy.copy(out_norm.config)
+                    out_norm.config.layernorm_zero_centered_gamma = False
         return model
 
 

@@ -51,7 +51,7 @@
 
 ## 📝 简介
 
-**mcore-bridge** 是由魔搭社区推出的、基于 Megatron-Core 生态构建的大模型与多模态大模型定义库。目前已支持 300+ 纯文本模型与 200+ 多模态模型。其中大语言模型包括 Qwen3-Next、GLM5.1、DeepSeek-V3.2、Minimax2.7、Kimi K2.5、GPT-OSS 等；多模态大模型包括 Qwen3.5、Qwen3-Omni、Gemma4、GLM4.6-V、InternVL3.5、Ovis2.5 等。
+**mcore-bridge** 是由魔搭社区推出的、基于 Megatron-Core 生态构建的大模型与多模态大模型定义库。目前已支持 300+ 纯文本模型与 200+ 多模态模型。其中大语言模型包括 Qwen3-Next、GLM-5.1、DeepSeek-V4、Minimax-2.7、Kimi-K2.5、GPT-OSS 等；多模态大模型包括 Qwen3.5、Qwen3-Omni、Gemma4、GLM4.6-V、InternVL3.5、Ovis2.5 等。
 
 ------
 
@@ -127,7 +127,7 @@ uv pip install -e . --torch-backend=auto
 | GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm_moe_dsa |
 | MiniMax  | minimax_m2                                                   |
 | Kimi     | kimi_k2, kimi_k25                                   |
-| Bailing  | bailing_moe                                                  |
+| Bailing  | bailing_moe, bailing_hybrid                             |
 | InternLM | internlm3                           |
 | Llama    | llama                                                |
 | GPT-OSS  | gpt_oss                                                      |

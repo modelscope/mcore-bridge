@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.transformer import transformer_layer
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.mlp import MLP, apply_swiglu_sharded_factory
 from megatron.core.transformer.spec_utils import build_module

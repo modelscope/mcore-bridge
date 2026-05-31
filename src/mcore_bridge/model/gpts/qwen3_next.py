@@ -81,6 +81,8 @@ class Qwen3NextRMSNorm(torch.nn.Module):
         self.eps = eps
         # Initialize weight to zeros (Zero-Centered), matching HuggingFace Qwen3NextRMSNorm
         self.weight = torch.nn.Parameter(torch.zeros(hidden_size))
+        # Mark weight for SP gradient AllReduce across TP domain (consistent with TENorm/MCoreRMSNorm)
+        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
