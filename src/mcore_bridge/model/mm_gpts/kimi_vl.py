@@ -118,8 +118,10 @@ class KimiK25Vit(HuggingFaceVit):
             dummy_pixels = torch.zeros((h * w, 3, patch_size, patch_size), dtype=dtype, device=inputs_embeds.device)
             dummy_grid = input_ids.new_tensor([[1, h, w]])
             image_features = self._encode_images(dummy_pixels, dummy_grid)
-            inputs_embeds = inputs_embeds + image_features.mean().to(
-                device=inputs_embeds.device, dtype=inputs_embeds.dtype) * 0.
+            # nan_to_num guards against a non-finite value from the all-zero dummy pass
+            # leaking into the text batch (NaN * 0 == NaN in IEEE-754).
+            zero_term = torch.nan_to_num(image_features.mean() * 0.)
+            inputs_embeds = inputs_embeds + zero_term.to(device=inputs_embeds.device, dtype=inputs_embeds.dtype)
         return inputs_embeds
 
 
