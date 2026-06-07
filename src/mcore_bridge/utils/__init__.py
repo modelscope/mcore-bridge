@@ -1,5 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from .dequantizer import Fp8Dequantizer, MxFp4Dequantizer, fp4_to_fp8
+from .dequantizer import Fp8Dequantizer, MxFp4Dequantizer, PackedDequantizer, fp4_to_fp8
 from .env import get_dist_setting, get_node_setting, is_dist, is_last_rank, is_local_master, is_master
 from .import_utils import _LazyModule, is_flash_attn_3_available
 from .logger import get_logger

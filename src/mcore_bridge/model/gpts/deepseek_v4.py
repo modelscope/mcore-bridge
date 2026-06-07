@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import torch
+from contextlib import contextmanager
 from megatron.core import tensor_parallel
-from megatron.core.models.common.embeddings import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from typing import Optional
 
@@ -28,13 +29,43 @@ except ImportError:
     off_interface = None
 
 
+@contextmanager
+def _patch_YarnRotaryEmbedding(config):
+    """Temporarily patch missing rope scaling attrs on config for YarnRotaryEmbedding init.
+
+    YarnRotaryEmbedding requires beta_fast/beta_slow/mscale/mscale_all_dim on config,
+    but DeepSeek-V4 HF config may not include them. This context manager sets defaults
+    on entry and removes them on exit, keeping the config clean (the resulting
+    YarnRotaryEmbedding module will be deleted later anyway).
+    """
+    defaults = {
+        'original_max_position_embeddings': 4096,
+        'beta_fast': 32.0,
+        'beta_slow': 1.0,
+        'mscale': 1.0,
+        'mscale_all_dim': 0.0,
+    }
+    added = []
+    for attr, value in defaults.items():
+        if getattr(config, attr, None) is None:
+            setattr(config, attr, value)
+            added.append(attr)
+    try:
+        yield config
+    finally:
+        # Restore: remove attrs that were temporarily added
+        for attr in added:
+            delattr(config, attr)
+
+
 class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
     def __init__(self, config, *args, **kwargs):
         assert McoreDSv4HybridSelfAttention is not object, (
             'Please install the Megatron-Core dev branch: '
             '`pip install git+https://github.com/NVIDIA/Megatron-LM@dev`')
-        super().__init__(config, *args, **kwargs)
+        with _patch_YarnRotaryEmbedding(config):
+            super().__init__(config, *args, **kwargs)
         self.layer_type = self.config.hf_config.layer_types[self.layer_number - 1]
         self.rope_layer_type = 'main' if self.layer_type == 'sliding_attention' else 'compress'
 
@@ -360,7 +391,7 @@ class DeepseekV4Bridge(GPTBridge):
                     k = k[:-len('.scale')] + '.weight_scale_inv'
                 new_res[k] = v
             res = new_res
-        elif not to_mcore:
+        else:
             res = self._remove_prefix(res, 'model.')
             new_res = {}
             for k, v in res.items():

@@ -1,6 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
-from typing import Tuple
+from typing import Optional, Sequence, Tuple, Union
 
 
 class Fp8Dequantizer:
@@ -77,3 +77,76 @@ def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
     unpacked = unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
     return unpacked.to(torch.float8_e4m3fn)
+
+
+class PackedDequantizer:
+    """Dequantize INT4/INT8 weights packed into int32 (compressed-tensors `pack_quantized` format).
+
+    Mirrors ``compressed_tensors.compressors.pack_quantized.PackedDequantizer.decompress``
+    but exposes a simple ``convert(...)`` API consistent with the other dequantizers in this module.
+
+    Quantization parameters (num_bits, symmetric, strategy) are extracted from
+    ``quantization_config`` at init time (i.e. ``hf_config.quantization_config``).
+    """
+
+    # Strategies that store the zero-point in a packed int32 layout.
+    _PACK_ZP_STRATEGIES = ('group', 'channel')
+
+    def __init__(self, quantization_config: dict):
+        # Extract settings from the first (and usually only) config_groups entry.
+        config_groups = quantization_config.get('config_groups', {})
+        if config_groups:
+            group_cfg = next(iter(config_groups.values()))
+            weights_cfg = group_cfg.get('weights', {})
+        else:
+            weights_cfg = {}
+
+        self.num_bits: int = weights_cfg.get('num_bits', 4)
+        self.symmetric: bool = weights_cfg.get('symmetric', True)
+        self.strategy: str = weights_cfg.get('strategy', 'group')
+
+    def convert(
+        self,
+        packed: torch.Tensor,
+        scale: torch.Tensor,
+        original_shape: Union[torch.Size, torch.Tensor, Sequence[int]],
+        zero_point: Optional[torch.Tensor] = None,
+        g_idx: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Unpack ``weight_packed`` and dequantize it back to a float weight tensor.
+
+        :param packed: int32 packed weight tensor (``weight_packed``).
+        :param scale: per-channel / per-group scale tensor (``weight_scale``).
+        :param original_shape: original (unpacked) weight shape (``weight_shape``).
+        :param zero_point: optional zero-point. For asymmetric GROUP/CHANNEL strategies it is
+            still packed in int32 and will be unpacked here; for symmetric quantization it is
+            ignored.
+        :param g_idx: optional group index mapping (``weight_g_idx``).
+        :return: dequantized float weight tensor with shape ``original_shape``.
+        """
+        from compressed_tensors.compressors.pack_quantized.helpers import unpack_from_int32
+        from compressed_tensors.quantization.lifecycle.forward import dequantize
+
+        if isinstance(original_shape, torch.Tensor):
+            original_shape = tuple(int(x) for x in original_shape.tolist())
+        else:
+            original_shape = tuple(int(x) for x in original_shape)
+
+        num_bits = self.num_bits
+        symmetric = self.symmetric
+        strategy = self.strategy
+
+        # Unpack zero_point before dequantization if it was stored in packed int32 form.
+        if (not symmetric) and strategy in self._PACK_ZP_STRATEGIES:
+            assert zero_point is not None, 'Asymmetric quant requires zero-point values'
+            original_zp_shape = (*original_shape[:-1], scale.shape[-1])
+            zero_point = unpack_from_int32(zero_point, num_bits, original_zp_shape, packed_dim=0)
+
+        unpacked = unpack_from_int32(packed, num_bits, original_shape)
+        weight = dequantize(
+            x_q=unpacked,
+            scale=scale,
+            zero_point=zero_point,
+            g_idx=g_idx,
+        )
+        return weight

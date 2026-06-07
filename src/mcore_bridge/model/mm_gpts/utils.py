@@ -52,11 +52,18 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
         self.hf_config = hf_config
         self.prepare_attn_impl()
         with patch_get_dynamic_module():
-            self.prepare_model(hf_config)
+            if config.language_model_only:
+                self.prepare_language_model(hf_config)
+            else:
+                self.prepare_model(hf_config)
+
         self.to(device='cuda')
 
     @abstractmethod
     def prepare_model(self, hf_config: PretrainedConfig):
+        pass
+
+    def prepare_language_model(self, hf_config: PretrainedConfig):
         pass
 
     def prepare_attn_impl(self):
@@ -67,6 +74,9 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
     @abstractmethod
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
         pass
+
+    def get_inputs_embeds_language_model(self, inputs_embeds, **kwargs):
+        return inputs_embeds
 
     @staticmethod
     def _get_vision_config(hf_config):

@@ -74,14 +74,21 @@ class Gemma4Vit(HuggingFaceVit):
         self.embed_audio = (
             Gemma4MultimodalEmbedder(hf_config.audio_config, hf_config.text_config).to(dtype)
             if hf_config.audio_config is not None else None)
-        self.register_buffer('embed_scale', torch.tensor(hf_config.hidden_size**0.5).to(dtype), persistent=False)
+        self.prepare_language_model(hf_config)
         self.model_cls = Gemma4Model
 
-    def get_inputs_embeds(self, inputs_embeds, **kwargs):
-        input_ids = kwargs.get('input_ids')
-        inputs_embeds = inputs_embeds * self.embed_scale.to(inputs_embeds.dtype)
+    def prepare_language_model(self, hf_config: PretrainedConfig):
+        self.register_buffer(
+            'embed_scale', torch.tensor(hf_config.hidden_size**0.5).to(hf_config.torch_dtype), persistent=False)
 
+    def get_inputs_embeds_language_model(self, inputs_embeds, **kwargs):
+        inputs_embeds = inputs_embeds * self.embed_scale.to(inputs_embeds.dtype)
+        return {'inputs_embeds': inputs_embeds, 'llm_input_ids': kwargs.get('input_ids')}
+
+    def get_inputs_embeds(self, inputs_embeds, **kwargs):
         hf_config = self.hf_config
+        res = self.get_inputs_embeds_language_model(inputs_embeds, **kwargs)
+
         pixel_values = kwargs.get('pixel_values')
         pixel_values_videos = kwargs.get('pixel_values_videos')
         input_features = kwargs.get('input_features')
@@ -89,12 +96,15 @@ class Gemma4Vit(HuggingFaceVit):
         image_position_ids = kwargs.get('image_position_ids')
         video_position_ids = kwargs.get('video_position_ids')
 
+        input_ids = kwargs.get('input_ids')
         image_mask = input_ids == hf_config.image_token_id
         video_mask = input_ids == hf_config.video_token_id
         audio_mask = input_ids == hf_config.audio_token_id
         multimodal_mask = image_mask | video_mask | audio_mask
         llm_input_ids = input_ids.clone()
         llm_input_ids[multimodal_mask] = hf_config.text_config.pad_token_id
+
+        inputs_embeds = res['inputs_embeds']
 
         if pixel_values is not None:
             with self.patch_hf_config():
@@ -121,7 +131,9 @@ class Gemma4Vit(HuggingFaceVit):
             audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
             audio_mask_e = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
             inputs_embeds = inputs_embeds.masked_scatter(audio_mask_e, audio_features)
-        return {'inputs_embeds': inputs_embeds, 'llm_input_ids': llm_input_ids}
+        res['inputs_embeds'] = inputs_embeds
+        res['llm_input_ids'] = llm_input_ids
+        return res
 
 
 class Gemma4SelfAttention(SelfAttention):
@@ -166,7 +178,7 @@ class Gemma4SelfAttention(SelfAttention):
         orig_k_layernorm = submodules.k_layernorm
         config.kv_channels = self.head_dim
         config.num_query_groups = self.num_key_value_heads
-        if self.is_sliding and config.window_size is None:
+        if text_config.use_bidirectional_attention == 'vision':
             kwargs['attn_mask_type'] = AttnMaskType.arbitrary
         if self.is_kv_shared_layer:
             submodules.k_layernorm = IdentityOp
@@ -291,10 +303,10 @@ class Gemma4SelfAttention(SelfAttention):
         packed_seq_params = kwargs.get('packed_seq_params')
         attention_bias = kwargs.get('attention_bias')
         mixed_qkv, _ = self.linear_qkv(hidden_states)
-        if getattr(self, 'world_size', None) is not None and self.config.num_query_groups < self.world_size:
+        if getattr(self, 'world_size', None) is not None and self.num_key_value_heads < self.world_size:
             mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (self.world_size // self.config.num_query_groups)
-            size = mixed_qkv.size()[-1] // self.config.num_query_groups
+            idx = get_tensor_model_parallel_rank() // (self.world_size // self.num_key_value_heads)
+            size = mixed_qkv.size()[-1] // self.num_key_value_heads
             mixed_qkv = mixed_qkv[:, :, idx * size:(idx + 1) * size]
 
         thd_format = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
@@ -327,9 +339,9 @@ class Gemma4SelfAttention(SelfAttention):
                 value = value.squeeze(1)
         # Query [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
-        if getattr(self, 'world_size', None) is not None and self.config.num_query_groups < self.world_size:
-            idx = get_tensor_model_parallel_rank() % (self.world_size // self.config.num_query_groups)
-            size = query.shape[2] // (self.world_size // self.config.num_query_groups)
+        if getattr(self, 'world_size', None) is not None and self.num_key_value_heads < self.world_size:
+            idx = get_tensor_model_parallel_rank() % (self.world_size // self.num_key_value_heads)
+            size = query.shape[2] // (self.world_size // self.num_key_value_heads)
             query = query[:, :, idx * size:(idx + 1) * size, :]
         query = self.q_layernorm(query)
         if isinstance(rotary_pos_emb, torch.Tensor):
@@ -609,23 +621,24 @@ class Gemma4TextGPTModel(GPTModel):
         extra_block_kwargs['shared_kv_states'] = shared_kv_states
         kwargs['extra_block_kwargs'] = extra_block_kwargs
         attention_mask = kwargs.get('attention_mask')
-        kwargs['attention_mask'] = {'sliding_attention': attention_mask, 'full_attention': attention_mask}
+        attention_mask = {'sliding_attention': attention_mask, 'full_attention': attention_mask}
         if self.text_config.use_bidirectional_attention == 'vision':
-            kwargs['attention_mask']['sliding_attention'] = self._create_sliding_attention_mask(
-                attention_mask, mm_token_type_ids)
+            self._update_attention_mask(attention_mask, mm_token_type_ids)
+        kwargs['attention_mask'] = attention_mask
         hidden_states = super().forward(*args, **kwargs)
         if self.hidden_size_per_layer_input and not self.post_process:
             hidden_states = self._pack_pp_output(hidden_states, per_layer_inputs, shared_kv_states)
         return hidden_states
 
-    def _create_sliding_attention_mask(self, attention_mask, mm_token_type_ids):
+    def _update_attention_mask(self, attention_mask, mm_token_type_ids):
+        sliding_attention = attention_mask['sliding_attention']
+        full_attention = attention_mask['full_attention']
+        # sliding
         window_size = self.text_config.sliding_window - 1
-        seq_len = attention_mask.shape[-1]
-
-        window_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=attention_mask.device)
+        seq_len = sliding_attention.shape[-1]
+        window_mask = torch.ones(seq_len, seq_len, dtype=torch.bool, device=sliding_attention.device)
         window_mask = ~torch.triu(window_mask, diagonal=-window_size)
-
-        attention_mask = attention_mask | window_mask
+        sliding_attention = sliding_attention | window_mask
         if mm_token_type_ids is not None:
             is_vision = mm_token_type_ids > 0
             is_prev_vision = torch.roll(is_vision, shifts=1, dims=-1)
@@ -635,8 +648,10 @@ class Gemma4TextGPTModel(GPTModel):
             q_group = vision_group_ids.unsqueeze(1).unsqueeze(-1)
             k_group = vision_group_ids.unsqueeze(1).unsqueeze(-2)
             same_vision_group = (q_group == k_group) & (q_group >= 0) & (k_group >= 0)
-            attention_mask = attention_mask & ~same_vision_group
-        return attention_mask
+            sliding_attention = sliding_attention & ~same_vision_group
+            full_attention = full_attention & ~same_vision_group
+        attention_mask['sliding_attention'] = sliding_attention
+        attention_mask['full_attention'] = full_attention
 
     def _pack_pp_output(self, hidden_states, per_layer_inputs, shared_kv_states):
         per_layer_inputs = per_layer_inputs.view(*hidden_states.shape[:2], -1)
@@ -852,5 +867,64 @@ register_model(
         ['gemma4'],
         bridge_cls=Gemma4Bridge,
         visual_cls=Gemma4Vit,
+        loader=Gemma4Loader,
+    ))
+
+
+class Gemma4UnifiedVit(Gemma4Vit):
+    module_mapping = {
+        'model.embed_vision': 'embed_vision',
+        'model.embed_audio': 'embed_audio',
+    }
+    _vision_tower = []
+
+    def prepare_model(self, hf_config: PretrainedConfig):
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import (Gemma4UnifiedModel,
+                                                                                Gemma4UnifiedMultimodalEmbedder,
+                                                                                Gemma4UnifiedVisionEmbedder)
+        dtype = hf_config.torch_dtype
+        self.embed_vision = (
+            Gemma4UnifiedVisionEmbedder(hf_config.vision_config, hf_config.text_config).to(dtype)
+            if hf_config.vision_config is not None else None)
+
+        self.embed_audio = (
+            Gemma4UnifiedMultimodalEmbedder(hf_config.audio_config, hf_config.text_config).to(dtype)
+            if hf_config.audio_config is not None else None)
+        self.prepare_language_model(hf_config)
+        self.model_cls = Gemma4UnifiedModel
+
+
+class Gemma4UnifiedBridge(Gemma4Bridge):
+
+    def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
+        res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
+        new_state_dict = {}
+        if to_mcore:
+            for k, v in res.items():
+                if k.startswith('model.embed_vision.embedding_projection.'):
+                    new_state_dict['model.embed_vision.multimodal_embedder.embedding_projection.'
+                                   + k[len('model.embed_vision.embedding_projection.'):]] = v
+                elif k.startswith('model.vision_embedder.'):
+                    new_state_dict['model.embed_vision.' + k[len('model.vision_embedder.'):]] = v
+                else:
+                    new_state_dict[k] = v
+        else:
+            for k, v in res.items():
+                if k.startswith('model.embed_vision.multimodal_embedder.'):
+                    new_state_dict['model.embed_vision.' + k[len('model.embed_vision.multimodal_embedder.'):]] = v
+                elif k.startswith('model.embed_vision.'):
+                    new_state_dict['model.vision_embedder.' + k[len('model.embed_vision.'):]] = v
+                else:
+                    new_state_dict[k] = v
+        res = new_state_dict
+        return res
+
+
+register_model(
+    ModelMeta(
+        ModelType.gemma4_unified,
+        ['gemma4_unified'],
+        bridge_cls=Gemma4UnifiedBridge,
+        visual_cls=Gemma4UnifiedVit,
         loader=Gemma4Loader,
     ))

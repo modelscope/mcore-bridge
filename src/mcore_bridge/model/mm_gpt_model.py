@@ -47,7 +47,10 @@ class MultimodalGPTModel(MegatronModule):
             _self.reduce_scatter_embeddings = reduce_scatter_embeddings
             packed_seq_params = kwargs.get('packed_seq_params')
             if self.visual is not None:
-                res = self.visual.get_inputs_embeds(res, **kwargs)
+                if self.config.language_model_only:
+                    res = self.visual.get_inputs_embeds_language_model(res, **kwargs)
+                else:
+                    res = self.visual.get_inputs_embeds(res, **kwargs)
                 kwargs.clear()
                 if isinstance(res, dict):
                     # compat dict

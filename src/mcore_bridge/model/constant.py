@@ -32,6 +32,7 @@ class MLLMModelType:
     kimi_vl = 'kimi_vl'
     llama4 = 'llama4'
     gemma4 = 'gemma4'
+    gemma4_unified = 'gemma4_unified'
 
     kimi_k25 = 'kimi_k25'
 

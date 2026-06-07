@@ -130,7 +130,7 @@ The following is the list of models supported by MCore-Bridge:
 | DeepSeek | deepseek_v3, deepseek_v32, deepseek_v4                        |
 | GLM      | glm4, glm4_moe, glm4_moe_lite<br />glm_moe_dsa |
 | MiniMax  | minimax_m2                                                   |
-| Kimi     | kimi_k2, kimi_k25                                   |
+| Kimi     | kimi_k2                                             |
 | Bailing  | bailing_moe, bailing_hybrid                             |
 | InternLM | internlm3                           |
 | Llama    | llama                                                |
@@ -145,9 +145,9 @@ The following is the list of models supported by MCore-Bridge:
 | Series     | model_type                                            |
 | -------- | ------------------------------------------------------------ |
 | Qwen     | qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe, qwen3_asr<br />qwen3_5, qwen3_5_moe |
-| Gemma     | gemma4                                   |
+| Gemma     | gemma4, gemma4_unified                                   |
 | GLM      | glm4v, glm4v_moe |
-| Kimi     | kimi_vl                                   |
+| Kimi     | kimi_vl, kimi_k25                                   |
 | InternVL | internvl_chat, internvl                           |
 | Ovis     | ovis2_5                                                      |
 | Llama    | llama4                                                |

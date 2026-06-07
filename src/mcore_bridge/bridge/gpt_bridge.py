@@ -15,8 +15,8 @@ from typing import Callable, List, Optional, Union
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
-from mcore_bridge.utils import (MxFp4Dequantizer, SafetensorLazyLoader, StreamingSafetensorSaver, deep_getattr,
-                                gc_collect, get_logger, is_master, unwrap_model)
+from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
+                                deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
 
 logger = get_logger()
 
@@ -81,6 +81,10 @@ class GPTBridge:
 
         self._fp8_quantizer = None
         self.mxfp4_quantizer = MxFp4Dequantizer()
+        quantization_config = getattr(self.config.hf_config, 'quantization_config', None)
+        self.packed_quantizer = None
+        if isinstance(quantization_config, dict) and quantization_config.get('quant_method') == 'compressed-tensors':
+            self.packed_quantizer = PackedDequantizer(quantization_config)
 
         dp_size = dist.get_world_size() // self.etp_size // self.ep_size // self.pp_size
         expert_decoder_rank_generator = mpu.RankGenerator(
@@ -923,10 +927,21 @@ class GPTBridge:
                         weight_list = []
                         start_idx = ep_rank * num_local_experts
                         for i in range(num_local_experts):
-                            gate_proj_weight = hf_state_dict[f'{start_idx + i}.gate_proj.weight'].load()
-                            up_proj_weight = hf_state_dict[f'{start_idx + i}.up_proj.weight'].load()
-                            weight_list.append(torch.stack([gate_proj_weight, up_proj_weight], dim=0))
+                            if f'{start_idx + i}.gate_proj.weight_packed' in hf_state_dict:
+                                weight = []
+                                for key in ['gate_proj', 'up_proj']:
+                                    weight_packed = hf_state_dict[f'{start_idx + i}.{key}.weight_packed'].load()
+                                    weight_scale = hf_state_dict[f'{start_idx + i}.{key}.weight_scale'].load()
+                                    weight_shape = hf_state_dict[f'{start_idx + i}.{key}.weight_shape'].load()
+                                    weight.append(
+                                        self.packed_quantizer.convert(weight_packed, weight_scale, weight_shape))
+                            else:
+                                gate_proj_weight = hf_state_dict[f'{start_idx + i}.gate_proj.weight'].load()
+                                up_proj_weight = hf_state_dict[f'{start_idx + i}.up_proj.weight'].load()
+                                weight = [gate_proj_weight, up_proj_weight]
+                            weight_list.append(torch.stack(weight, dim=0))
                         gate_up_proj_weight = torch.concat(weight_list, dim=0)
+                        del weight_list
                         if has_scale_inv:
                             scale_inv_list = []
                             for i in range(num_local_experts):
@@ -934,7 +949,6 @@ class GPTBridge:
                                 up_scale_inv = hf_state_dict[f'{start_idx + i}.up_proj.weight_scale_inv'].load()
                                 scale_inv_list.append(torch.stack([gate_scale_inv, up_scale_inv], dim=0))
                             gate_up_scale_inv = torch.concat(scale_inv_list, dim=0)
-                        del weight_list
                     else:
                         gate_proj_weight = hf_state_dict['gate_proj.weight'].load()
                         up_proj_weight = hf_state_dict['up_proj.weight'].load()
@@ -1162,11 +1176,19 @@ class GPTBridge:
                             down_proj_bias = down_proj_bias[ep_rank * num_local_experts:(ep_rank + 1)
                                                             * num_local_experts]
                     else:
-                        down_proj_weight = torch.concat([
-                            hf_state_dict[f'{i + ep_rank * num_local_experts}.down_proj.weight'].load()
-                            for i in range(num_local_experts)
-                        ],
-                                                        dim=0)
+                        weight_list = []
+                        start_idx = ep_rank * num_local_experts
+                        for i in range(num_local_experts):
+                            if f'{start_idx + i}.down_proj.weight_packed' in hf_state_dict:
+                                weight_packed = hf_state_dict[f'{start_idx + i}.down_proj.weight_packed'].load()
+                                weight_scale = hf_state_dict[f'{start_idx + i}.down_proj.weight_scale'].load()
+                                weight_shape = hf_state_dict[f'{start_idx + i}.down_proj.weight_shape'].load()
+                                weight_list.append(
+                                    self.packed_quantizer.convert(weight_packed, weight_scale, weight_shape))
+                            else:
+                                weight_list.append(hf_state_dict[f'{start_idx + i}.down_proj.weight'].load())
+                        down_proj_weight = torch.concat(weight_list, dim=0)
+                        del weight_list
                         if has_scale_inv:
                             down_scale_inv = torch.concat([
                                 hf_state_dict[f'{i + ep_rank * num_local_experts}.down_proj.weight_scale_inv'].load()
@@ -1677,7 +1699,7 @@ class GPTBridge:
         else:
             hf_state_dict = {}
         self._set_word_embeddings(mg_model, hf_state_dict, to_mcore)
-        if self.is_multimodal:
+        if self.is_multimodal and not self.config.language_model_only:
             for prefix, mg_prefix in self.module_mapping.items():
                 mg_module = deep_getattr(mg_model, f'visual.{mg_prefix}')
                 hf_state_dict.update(self._set_module(mg_module, hf_state_dict, f'{hf_prefix}{prefix}.', to_mcore))

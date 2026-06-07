@@ -11,7 +11,7 @@ class Qwen3EmbBridge(GPTBridge):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
         if to_mcore:
             res = self._add_prefix(res, 'model.')
-        elif not to_mcore:
+        else:
             res = self._remove_prefix(res, 'model.')
         return res
 

@@ -1,3 +1,4 @@
+import inspect
 import peft
 import sys
 import torch
@@ -9,6 +10,7 @@ from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_e
 from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock, get_mtp_layer_offset
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
@@ -211,6 +213,26 @@ def _patch_mrope():
         return rope_utils._apply_rotary_pos_emb_bshd(t.unsqueeze(1), freqs, *args, **kwargs).squeeze(1)
 
     rope_utils._apply_rotary_pos_emb_thd = _apply_rotary_pos_emb_thd
+
+    origin_apply_rotary_pos_emb = rope_utils.apply_rotary_pos_emb
+    has_mla_rotary_interleaved = 'mla_rotary_interleaved' in inspect.signature(origin_apply_rotary_pos_emb).parameters
+
+    def apply_rotary_pos_emb(
+        t: torch.Tensor,
+        freqs: torch.Tensor,
+        config: TransformerConfig,
+        cu_seqlens: Optional[torch.Tensor] = None,
+        mscale: float = 1.0,
+        cp_group: torch.distributed.ProcessGroup = None,
+        mla_rotary_interleaved: Optional[bool] = None,
+        **kwargs,
+    ):
+        if has_mla_rotary_interleaved or mla_rotary_interleaved is not None:
+            kwargs['mla_rotary_interleaved'] = mla_rotary_interleaved
+        return origin_apply_rotary_pos_emb(
+            t, freqs, config, cu_seqlens=cu_seqlens, mscale=mscale, cp_group=cp_group, **kwargs)
+
+    rope_utils.apply_rotary_pos_emb = apply_rotary_pos_emb
 
 
 def _patch_dsa():
