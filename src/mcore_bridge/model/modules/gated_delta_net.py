@@ -196,8 +196,11 @@ class GatedDeltaNet(_GatedDeltaNet):
                 fp8_context = nullcontext()
             with fp8_context:
                 ba, _ = self.in_proj_ba(hidden_states)
-            qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_device, qkvz.shape[-1] // num_key_heads_per_device))
-            ba = ba.view(ba.shape[:-1] + (num_key_heads_per_device, ba.shape[-1] // num_key_heads_per_device))
+            # Use num_key_heads // tp_size (not further divided by cp_size) because
+            # the linear outputs are only TP-split at this point; CP a2a happens later.
+            num_key_heads_per_tp = self.num_key_heads // self.tp_size
+            qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_tp, qkvz.shape[-1] // num_key_heads_per_tp))
+            ba = ba.view(ba.shape[:-1] + (num_key_heads_per_tp, ba.shape[-1] // num_key_heads_per_tp))
             qkvzba = torch.concat([qkvz, ba], dim=-1).view(*qkvz.shape[:2], -1)
         else:
             qkvzba, _ = self.in_proj(hidden_states)
