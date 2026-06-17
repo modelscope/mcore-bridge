@@ -215,6 +215,9 @@ class GPTBridge:
                 tensor = tensor.view(torch.uint8)
                 param._rowwise_data.data.copy_(tensor)
                 self._copy_scale_inv(param, hf_scale_inv)
+                # Regenerate columnwise data in-place from freshly-loaded rowwise data
+                if hasattr(param, '_create_columnwise') and param._columnwise_data is not None:
+                    param._create_columnwise()
                 del param.get_high_precision_init_val
         else:
             if hf_scale_inv is not None:
