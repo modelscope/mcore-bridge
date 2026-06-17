@@ -33,6 +33,7 @@ from .rope import dynamic_rope_update, get_rope_inv_freq
 logger = get_logger()
 
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
+mcore_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class OutputLayerLinear(TELinear):
@@ -507,12 +508,23 @@ class GPTModel(McoreGPTModel):
                 if self.training:
                     mtp_loss_for_log = (
                         torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0))
-                    MTPLossLoggingHelper.save_loss_to_tracker(
-                        mtp_loss_for_log,
-                        mtp_layer_number,
-                        self.config.mtp_unroll_steps,
-                        avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
-                    )
+                    avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+                    if hasattr(MTPLossLoggingHelper, 'save_metrics_to_tracker'):
+                        # mcore >= 0.19 main branch: save_metrics_to_tracker with correct/total
+                        from megatron.core.transformer.multi_token_prediction import _compute_mtp_acceptance_counts
+                        correct, total = _compute_mtp_acceptance_counts(
+                            mtp_logits, mtp_labels, loss_mask_, output_layer=None, runtime_gather_output=True)
+                        MTPLossLoggingHelper.save_metrics_to_tracker(
+                            mtp_loss_for_log,
+                            correct,
+                            total,
+                            mtp_layer_number,
+                            self.config.mtp_unroll_steps,
+                            avg_group=avg_group)
+                    else:
+                        # mcore < 0.19: original signature
+                        MTPLossLoggingHelper.save_loss_to_tracker(
+                            mtp_loss_for_log, mtp_layer_number, self.config.mtp_unroll_steps, avg_group=avg_group)
                 mtp_loss_scale = self.config.mtp_loss_scaling_factor / self.config.mtp_unroll_steps
                 # Clamp to avoid 0/0=NaN when a CP rank's tokens are all rolled out of range.
                 safe_num_tokens = num_tokens.clamp(min=1)
