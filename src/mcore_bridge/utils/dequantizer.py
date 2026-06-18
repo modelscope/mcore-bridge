@@ -5,8 +5,10 @@ from typing import Optional, Sequence, Tuple, Union
 
 class Fp8Dequantizer:
 
-    def __init__(self, block_size: Tuple[int, int] = (None, None)):
+    def __init__(self, block_size: Tuple[int, int] = (128, 128)):
         # Set to None to enable automatic selection.
+        if block_size in {None, 'auto'}:
+            block_size = (None, None)
         self.block_size = block_size
 
     def convert(

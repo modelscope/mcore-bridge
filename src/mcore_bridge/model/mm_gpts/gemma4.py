@@ -21,7 +21,6 @@ from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.utils import make_viewless_tensor, nvtx_range_pop, nvtx_range_push
-from swift.utils import get_logger
 from torch import Tensor, nn
 from transformers import AutoModel, PretrainedConfig
 from transformers.utils.versions import require_version
@@ -29,6 +28,7 @@ from typing import Optional, Tuple
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.config import ModelConfig
+from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
 from ..gpt_model import GPTModel

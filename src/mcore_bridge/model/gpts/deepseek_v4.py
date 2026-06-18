@@ -503,7 +503,7 @@ class DeepseekV4Bridge(GPTBridge):
         tensor = fp4_to_fp8(tensor)
         tensor = tensor.reshape(*param.shape)
         scale_inv = scale_inv.reshape(-1, scale_inv.shape[-1])
-        tensor = Fp8Dequantizer().convert(tensor, scale_inv)
+        tensor = Fp8Dequantizer(block_size='auto').convert(tensor, scale_inv)
         if self._is_fp8_param(param):
             param._high_precision_init_val.copy_(tensor)
         param.data.copy_(tensor)
