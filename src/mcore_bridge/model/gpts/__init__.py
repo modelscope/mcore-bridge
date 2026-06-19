@@ -1,2 +1,3 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from . import bailing_hybrid, bailing_moe, deepseek_v4, glm4, hunyuan, llm, minimax_m2, olmoe, qwen3_emb, qwen3_next
+from . import (bailing_hybrid, bailing_moe, deepseek_v4, glm4, hunyuan, llm, minimax_m2, olmo2, olmoe, qwen3_emb,
+               qwen3_next)

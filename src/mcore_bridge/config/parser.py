@@ -231,6 +231,12 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['add_qkv_bias'] = False
     elif llm_model_type == 'olmoe':
         res['qk_layernorm'] = True
+    elif llm_model_type in {'olmo2', 'olmo3'}:
+        res['qk_layernorm'] = True
+        if llm_model_type == 'olmo3' and window_size is not None and layer_types is not None:
+            res['window_size'] = f'{window_size - 1},0'
+            window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])
+            res['window_attn_skip_freq'] = f'[{window_attn_skip_freq}]'
     elif hf_model_type == 'llama4':
         qk_layernorm = res.pop('qk_layernorm', False)
         if qk_layernorm:

@@ -5,6 +5,8 @@ class LLMModelType:
 
     qwen3_next = 'qwen3_next'
     olmoe = 'olmoe'
+    olmo2 = 'olmo2'
+    olmo3 = 'olmo3'
     glm4 = 'glm4'
     minimax_m2 = 'minimax_m2'
     hy_v3 = 'hy_v3'
