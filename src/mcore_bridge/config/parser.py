@@ -26,7 +26,7 @@ config_mapping = {
     'hf_model_type': ['model_type'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
-    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],
+    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size', 'shared_intermediate_size'],
     'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k', 'top_k_experts'],
     'moe_router_num_groups': ['n_group'],
     'moe_router_group_topk': ['topk_group'],
@@ -229,6 +229,20 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.setdefault('linear_attention_freq', 4)
     elif llm_model_type == 'minimax_m2':
         res['add_qkv_bias'] = False
+    elif hf_model_type == 'minimax_m3_vl':
+        text_config = hf_config.text_config
+        res['add_qkv_bias'] = False
+        # Fix intermediate sizes: intermediate_size is MoE expert size, dense_intermediate_size is for dense MLP
+        res['moe_ffn_hidden_size'] = res['ffn_hidden_size']
+        res['ffn_hidden_size'] = text_config.dense_intermediate_size
+        moe_layer_freq_list = text_config.mlp_layer_types
+        if isinstance(moe_layer_freq_list, list):
+            res['moe_layer_freq'] = f"[{','.join('0' if x == 'dense' else '1' for x in moe_layer_freq_list)}]"
+        res['swiglu'] = False
+        res['quick_geglu'] = True
+        res['activation_func_clamp_value'] = 7
+        res['glu_linear_offset'] = 1
+        res['layernorm_zero_centered_gamma'] = True
     elif llm_model_type == 'olmoe':
         res['qk_layernorm'] = True
     elif hf_model_type == 'llama4':

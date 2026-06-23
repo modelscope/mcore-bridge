@@ -7,6 +7,7 @@ class LLMModelType:
     olmoe = 'olmoe'
     glm4 = 'glm4'
     minimax_m2 = 'minimax_m2'
+    minimax_m3_vl = 'minimax_m3_vl'
     hy_v3 = 'hy_v3'
     bailing_moe = 'bailing_moe'
     bailing_hybrid = 'bailing_hybrid'
