@@ -270,9 +270,12 @@ class GPTBridge:
             incompatible_keys = mg_module.load_state_dict(hf_state_dict, strict=False)
             missing_keys = incompatible_keys.missing_keys
             if self._peft_format:
+                # In multi-LoRA mode, only the current adapter slot is saved/loaded.
+                # Other idle slots (e.g. lora_1~N) are not in the checkpoint and
+                # their absence is expected — only validate the active adapter.
                 missing_keys = [
-                    k for k in incompatible_keys.missing_keys
-                    if '.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k
+                    k for k in incompatible_keys.missing_keys if
+                    ('.lora_A.' in k or '.lora_B.' in k or '.modules_to_save.' in k) and f'.{self._adapter_name}.' in k
                 ]
             assert len(missing_keys) == 0, f'incompatible_keys.missing_keys: {missing_keys}'
             return {}
