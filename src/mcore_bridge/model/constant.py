@@ -39,6 +39,8 @@ class MLLMModelType:
 
     llava_onevision1_5 = 'llava_onevision1_5'
 
+    minicpmv4_6 = 'minicpmv4_6'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass
