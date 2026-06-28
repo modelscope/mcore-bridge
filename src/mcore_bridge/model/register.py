@@ -20,7 +20,8 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
-from .modules import MLASelfAttention, MultiTokenPredictionLayer, TopKRouter, TransformerBlock, TransformerLayer
+from .modules import (DSAIndexer, MLASelfAttention, MultiTokenPredictionLayer, TopKRouter, TransformerBlock,
+                      TransformerLayer)
 
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
@@ -96,6 +97,8 @@ class ModelLoader:
             _get_backend_spec_provider, get_dsa_module_spec_for_backend)
         backend = _get_backend_spec_provider(config=self.config)
         dsa_spec = get_dsa_module_spec_for_backend(self.config, backend)
+        if getattr(dsa_spec.submodules.core_attention.submodules, 'indexer', None) is not None:
+            dsa_spec.submodules.core_attention.submodules.indexer.module = DSAIndexer
         if self.config.qk_layernorm:
             linear_q_up_proj = backend.column_parallel_linear()
             # fix megatron-core

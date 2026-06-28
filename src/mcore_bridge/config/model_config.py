@@ -173,8 +173,8 @@ class ModelConfig(TransformerConfig):
     moe_router_bias_update_rate: float = 1e-3
     moe_router_enable_expert_bias: bool = False
     moe_router_topk_scaling_factor: Optional[float] = None
-    moe_router_load_balancing_type: Literal['aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn',
-                                            'none'] = 'aux_loss'
+    # 'aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'
+    moe_router_load_balancing_type: Union[str, List[str]] = 'aux_loss'
     moe_shared_expert_gate: bool = False
 
     # mla

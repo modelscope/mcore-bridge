@@ -120,6 +120,10 @@ def test_gemma4():
     _test_model('google/gemma-4-E2B-it')
 
 
+def test_minicpmv4_6():
+    _test_model('openbmb/MiniCPM-V-4.6')
+
+
 if __name__ == '__main__':
     # test_qwen2_5_vl()
     # test_qwen2_vl()
@@ -141,4 +145,5 @@ if __name__ == '__main__':
     # test_qwen3_5()
     # test_llava_onevision1_5()
     # test_qwen3_asr()
-    test_gemma4()
+    # test_gemma4()
+    test_minicpmv4_6()

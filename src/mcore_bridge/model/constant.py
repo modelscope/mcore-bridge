@@ -11,6 +11,7 @@ class LLMModelType:
     bailing_moe = 'bailing_moe'
     bailing_hybrid = 'bailing_hybrid'
     deepseek_v4 = 'deepseek_v4'
+    glm_moe_dsa = 'glm_moe_dsa'
 
     qwen3_emb = 'qwen3_emb'
 
@@ -37,6 +38,8 @@ class MLLMModelType:
     kimi_k25 = 'kimi_k25'
 
     llava_onevision1_5 = 'llava_onevision1_5'
+
+    minicpmv4_6 = 'minicpmv4_6'
 
 
 class ModelType(LLMModelType, MLLMModelType):
