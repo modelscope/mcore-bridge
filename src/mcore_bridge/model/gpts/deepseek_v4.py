@@ -495,31 +495,66 @@ class DeepseekV4Bridge(GPTBridge):
 
         HF stores a single wo_a.weight of shape [G*R, D].
         GroupedLinear stores per-gemm weight{i} each of shape [R, D].
+
+        PP-aware: uses _get_weight/_set_weight for correct distributed communication.
         """
+        import torch.distributed as dist
+        from mcore_bridge.tuners import LoraParallelLinear
+        from peft.utils import ModulesToSaveWrapper
+
         o_groups = self.config.o_groups
+        group_proj = None if mg_attn is None else mg_attn.linear_o_group_proj
+
+        is_lora = isinstance(group_proj, LoraParallelLinear)
+        is_modules_to_save = isinstance(group_proj, ModulesToSaveWrapper)
+
+        if not to_mcore and self.pp_size > 1:
+            state = torch.tensor([is_lora, is_modules_to_save], dtype=torch.bool, device='cuda')
+            dist.all_reduce(state, group=self.pp_group)
+            is_lora, is_modules_to_save = state[0].item(), state[1].item()
+
+        if is_modules_to_save and self._peft_format:
+            raise NotImplementedError(
+                "FP8 grouped linear_o_group_proj as modules_to_save is not yet supported."
+            )
+
+        if is_lora and self._peft_format:
+            raise NotImplementedError(
+                "FP8 grouped linear_o_group_proj LoRA adapter export is not yet supported. "
+                "Use merge_lora=True or exclude linear_o_group_proj from target_modules."
+            )
+
+        if self._peft_format:
+            return
+
         if to_mcore:
             hf_weight = hf_state_dict['wo_a.weight'].load()
             hf_scale_inv = None
             if 'wo_a.weight_scale_inv' in hf_state_dict:
                 hf_scale_inv = hf_state_dict['wo_a.weight_scale_inv'].load()
-            weights = hf_weight.chunk(o_groups, dim=0)
-            scale_invs = hf_scale_inv.chunk(o_groups, dim=0) if hf_scale_inv is not None else [None] * o_groups
-            for i, (w, s) in enumerate(zip(weights, scale_invs)):
-                param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
-                self._set_param(param, w, s)
+
+            base_proj = (group_proj.base_layer
+                         if isinstance(group_proj, LoraParallelLinear) else group_proj)
+            params = [getattr(base_proj, f'weight{i}') for i in range(o_groups)]
+
+            self._set_weight(params, hf_weight, 'linear_o_group_proj.weight',
+                             is_expert=False, hf_scale_inv=hf_scale_inv)
         else:
-            weights = []
-            scale_invs = []
-            for i in range(o_groups):
-                param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
-                if self._is_fp8_param(param):
-                    weights.append(param._rowwise_data)
-                    scale_invs.append(param._rowwise_scale_inv)
-                else:
-                    weights.append(param.data)
-            hf_state_dict['wo_a.weight'] = torch.cat(weights, dim=0).view(torch.float8_e4m3fn)
-            if scale_invs:
-                hf_state_dict['wo_a.weight_scale_inv'] = torch.cat(scale_invs, dim=0)
+            base_proj = None
+            if group_proj is not None:
+                base_proj = (group_proj.base_layer
+                             if isinstance(group_proj, LoraParallelLinear) else group_proj)
+
+            params = None
+            if base_proj is not None:
+                params = [getattr(base_proj, f'weight{i}') for i in range(o_groups)]
+
+            weight, scale_inv = self._get_weight(
+                params, 'linear_o_group_proj.weight', is_expert=False)
+            if weight is not None:
+                hf_state_dict['wo_a.weight'] = weight
+            if scale_inv is not None:
+                hf_state_dict['wo_a.weight_scale_inv'] = scale_inv
 
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
