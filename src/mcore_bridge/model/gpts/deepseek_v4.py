@@ -102,7 +102,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
         # Attention heads [s, b, n*h]
-        assert (hidden_states.ndim == 3), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        assert (hidden_states.ndim == 3), f'hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D'
         if packed_seq_params is not None:
             assert (packed_seq_params.local_cp_size
                     is None), 'dynamic_context_parallel is not supported with MLA yet and is planned for future. \
@@ -499,8 +499,9 @@ class DeepseekV4Bridge(GPTBridge):
         PP-aware: uses _get_weight/_set_weight for correct distributed communication.
         """
         import torch.distributed as dist
-        from mcore_bridge.tuners import LoraParallelLinear
         from peft.utils import ModulesToSaveWrapper
+
+        from mcore_bridge.tuners import LoraParallelLinear
 
         o_groups = self.config.o_groups
         group_proj = None if mg_attn is None else mg_attn.linear_o_group_proj
@@ -514,15 +515,11 @@ class DeepseekV4Bridge(GPTBridge):
             is_lora, is_modules_to_save = state[0].item(), state[1].item()
 
         if is_modules_to_save and self._peft_format:
-            raise NotImplementedError(
-                "FP8 grouped linear_o_group_proj as modules_to_save is not yet supported."
-            )
+            raise NotImplementedError('FP8 grouped linear_o_group_proj as modules_to_save is not yet supported.')
 
         if is_lora and self._peft_format:
-            raise NotImplementedError(
-                "FP8 grouped linear_o_group_proj LoRA adapter export is not yet supported. "
-                "Use merge_lora=True or exclude linear_o_group_proj from target_modules."
-            )
+            raise NotImplementedError('FP8 grouped linear_o_group_proj LoRA adapter export is not yet supported. '
+                                      'Use merge_lora=True or exclude linear_o_group_proj from target_modules.')
 
         if self._peft_format:
             return
@@ -533,24 +530,21 @@ class DeepseekV4Bridge(GPTBridge):
             if 'wo_a.weight_scale_inv' in hf_state_dict:
                 hf_scale_inv = hf_state_dict['wo_a.weight_scale_inv'].load()
 
-            base_proj = (group_proj.base_layer
-                         if isinstance(group_proj, LoraParallelLinear) else group_proj)
+            base_proj = (group_proj.base_layer if isinstance(group_proj, LoraParallelLinear) else group_proj)
             params = [getattr(base_proj, f'weight{i}') for i in range(o_groups)]
 
-            self._set_weight(params, hf_weight, 'linear_o_group_proj.weight',
-                             is_expert=False, hf_scale_inv=hf_scale_inv)
+            self._set_weight(
+                params, hf_weight, 'linear_o_group_proj.weight', is_expert=False, hf_scale_inv=hf_scale_inv)
         else:
             base_proj = None
             if group_proj is not None:
-                base_proj = (group_proj.base_layer
-                             if isinstance(group_proj, LoraParallelLinear) else group_proj)
+                base_proj = (group_proj.base_layer if isinstance(group_proj, LoraParallelLinear) else group_proj)
 
             params = None
             if base_proj is not None:
                 params = [getattr(base_proj, f'weight{i}') for i in range(o_groups)]
 
-            weight, scale_inv = self._get_weight(
-                params, 'linear_o_group_proj.weight', is_expert=False)
+            weight, scale_inv = self._get_weight(params, 'linear_o_group_proj.weight', is_expert=False)
             if weight is not None:
                 hf_state_dict['wo_a.weight'] = weight
             if scale_inv is not None:
