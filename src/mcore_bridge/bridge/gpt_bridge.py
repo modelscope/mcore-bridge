@@ -409,9 +409,13 @@ class GPTBridge:
                 tensor = [t._rowwise_data for t in tensor]
             del mg_weight
             assert isinstance(tensor, (list, tuple)), f'mg_key: {mg_key}'
-            tensor = torch.concat(tensor, dim=0)
+            # Skip full-size cat copy when single shard (TP==1) to avoid OOM in colocate sync
+            tensor = tensor[0] if len(tensor) == 1 else torch.concat(tensor, dim=0)
             if mg_scale_inv is not None:
-                mg_scale_inv = torch.concat(mg_scale_inv, dim=0)
+                mg_scale_inv = (
+                    mg_scale_inv[0] if isinstance(mg_scale_inv,
+                                                  (list, tuple)) and len(mg_scale_inv) == 1 else torch.concat(
+                                                      mg_scale_inv, dim=0))
         num_local_experts = self.config.num_moe_experts // self.ep_size if is_expert else 1
         tp_dim = self._get_tp_split_dim(mg_key)
         is_linear_fc1 = (mg_key is not None and mg_key.split('.', 1)[0] == 'linear_fc1' and tp_dim is not None)
