@@ -4,6 +4,7 @@ import megatron.core
 import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.multi_token_prediction import roll_tensor as mcore_roll_tensor
@@ -29,7 +30,7 @@ def unwrap_model(models, module_instances=None):
         pass
     if module_instances is None:
         from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
-        module_instances = (DDP, torch_FSDP, Float16Module)
+        module_instances = (DDP, torch_FSDP, Float16Module, megatron_FSDP)
 
     return_list = True
     if not isinstance(models, list):

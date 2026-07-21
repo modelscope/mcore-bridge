@@ -409,9 +409,10 @@ class GPTBridge:
                 tensor = [t._rowwise_data for t in tensor]
             del mg_weight
             assert isinstance(tensor, (list, tuple)), f'mg_key: {mg_key}'
-            tensor = torch.concat(tensor, dim=0)
+            # Skip full-size cat copy when single shard (TP==1) to avoid OOM in colocate sync
+            tensor = tensor[0] if len(tensor) == 1 else torch.concat(tensor, dim=0)
             if mg_scale_inv is not None:
-                mg_scale_inv = torch.concat(mg_scale_inv, dim=0)
+                mg_scale_inv = mg_scale_inv[0] if len(mg_scale_inv) == 1 else torch.concat(mg_scale_inv, dim=0)
         num_local_experts = self.config.num_moe_experts // self.ep_size if is_expert else 1
         tp_dim = self._get_tp_split_dim(mg_key)
         is_linear_fc1 = (mg_key is not None and mg_key.split('.', 1)[0] == 'linear_fc1' and tp_dim is not None)
@@ -507,9 +508,9 @@ class GPTBridge:
             if to_mcore:
                 assert mg_param is not None, f'mg_module: {mg_module}, mg_key: {mg_key}'
                 hf_weight = hf_state_dict[hf_key].load()
-                if module_key in {
-                        'embedding.word_embeddings', 'output_layer'
-                } and hf_weight.shape[0] < self.config.padded_vocab_size and self.config.task_type != 'seq_cls':
+                if hf_weight.shape[0] < self.config.padded_vocab_size and (module_key == 'embedding.word_embeddings'
+                                                                           or module_key == 'output_layer'
+                                                                           and self.config.task_type != 'seq_cls'):
                     hf_weight = F.pad(hf_weight, (0, 0, 0, self.config.padded_vocab_size - hf_weight.shape[0]))
                 hf_scale_inv = None
                 if f'{hf_key}_scale_inv' in hf_state_dict:

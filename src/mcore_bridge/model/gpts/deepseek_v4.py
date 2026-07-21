@@ -508,18 +508,15 @@ class DeepseekV4Bridge(GPTBridge):
                 param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
                 self._set_param(param, w, s)
         else:
-            weights = []
-            scale_invs = []
-            for i in range(o_groups):
-                param = getattr(mg_attn.linear_o_group_proj, f'weight{i}')
-                if self._is_fp8_param(param):
-                    weights.append(param._rowwise_data)
-                    scale_invs.append(param._rowwise_scale_inv)
-                else:
-                    weights.append(param.data)
-            hf_state_dict['wo_a.weight'] = torch.cat(weights, dim=0).view(torch.float8_e4m3fn)
-            if scale_invs:
-                hf_state_dict['wo_a.weight_scale_inv'] = torch.cat(scale_invs, dim=0)
+            if mg_attn is None:
+                mg_weight = None
+            else:
+                mg_weight = [getattr(mg_attn.linear_o_group_proj, f'weight{i}') for i in range(o_groups)]
+            weight, scale_inv = self._get_weight(mg_weight, 'linear_o_group_proj.weight0')
+            if weight is not None:
+                hf_state_dict['wo_a.weight'] = weight
+            if scale_inv is not None:
+                hf_state_dict['wo_a.weight_scale_inv'] = scale_inv
 
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)

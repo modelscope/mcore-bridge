@@ -253,6 +253,10 @@ class MLASelfAttention(McoreMLASelfAttention):
         else:
             extra_kwargs = {}
             if self.config.experimental_attention_variant == 'dsa':
+                if packed_seq_params is not None or self.config.context_parallel_size > 1:
+                    raise ImportError('Please install the megatron-core main branch to support `DSAttention` '
+                                      'padding_free/context parallelism: '
+                                      '`pip install git+https://github.com/NVIDIA/Megatron-LM.git`')
                 # For dsa we need to pass in the original hidden states and the compressed
                 # query representation.
                 extra_kwargs['x'] = hidden_states

@@ -42,8 +42,11 @@ class DSAIndexer(McoreDSAIndexer):
         # =========================================
         # Gather inputs if sp is enabled
         # =========================================
-        packed_seq_params, rotary_pos_emb = packed_seq_params  # patch
-        assert packed_seq_params is None, 'Packed sequence is not supported for DSAttention'
+        if isinstance(packed_seq_params, tuple):
+            packed_seq_params, rotary_pos_emb = packed_seq_params  # patch
+        elif packed_seq_params is not None:
+            rotary_pos_emb = packed_seq_params.rotary_pos_emb
+        cu_seqlens = packed_seq_params.cu_seqlens_q if packed_seq_params is not None else None
 
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
             x = gather_from_sequence_parallel_region(x, group=self.pg_collection.tp)
@@ -62,7 +65,7 @@ class DSAIndexer(McoreDSAIndexer):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb)  # mscale will be passed in by patch
+        q = self._apply_rope(q, rotary_pos_emb, cu_seqlens)  # mscale will be passed in by patch
 
         # =========================================
         # k linear and apply rope to k
@@ -72,7 +75,7 @@ class DSAIndexer(McoreDSAIndexer):
         k = self.k_norm(k)
         # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
         k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
-        k = self._apply_rope(k, rotary_pos_emb)
+        k = self._apply_rope(k, rotary_pos_emb, cu_seqlens)
         # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
         k = k.reshape(seqlen, bsz, self.index_head_dim)
 
@@ -91,24 +94,30 @@ class DSAIndexer(McoreDSAIndexer):
 
         return q, k, weights
 
-    def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor):
+    def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, cu_seqlens: Optional[torch.Tensor] = None):
         """Apply RoPE to the input tensor."""
         # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
         x_pe, x_nope = torch.split(
             x, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1)
         origin_multi_latent_attention = self.config.multi_latent_attention
+        squeezed_batch_dim = False
+        if cu_seqlens is not None and x_pe.ndim == 4 and x_pe.size(1) == 1:
+            x_pe = x_pe.squeeze(1)
+            squeezed_batch_dim = True
         try:
             self.config.multi_latent_attention = self.config.dsa_indexer_rotary_interleaved
             x_pe = apply_rotary_pos_emb(
                 x_pe,
                 rotary_pos_emb,
                 config=self.config,
-                cu_seqlens=None,
+                cu_seqlens=cu_seqlens,
                 cp_group=self.pg_collection.cp,
             )
         finally:
             self.config.multi_latent_attention = origin_multi_latent_attention
+        if squeezed_batch_dim:
+            x_pe = x_pe.unsqueeze(1)
         # [seqlen, batch, *, index_head_dim]
         x = torch.cat([x_pe, x_nope], dim=-1)
         return x

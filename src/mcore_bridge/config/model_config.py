@@ -204,6 +204,8 @@ class ModelConfig(TransformerConfig):
     dsa_indexer_loss_coeff: float = 0.
     dsa_indexer_use_sparse_loss: bool = False
     dsa_indexer_rotary_interleaved: bool = False
+    dsa_indexer_topk_freq: int = 1
+    dsa_indexer_skip_topk_offset: int = 0
 
     # deepseek-v4
     csa_window_size: int = 128
