@@ -9,6 +9,7 @@ from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.gpt import gpt_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.transformer.enums import LayerType
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
@@ -135,7 +136,53 @@ class ModelLoader:
                 self._replace_spec_dsa(layer_spec)
         return transformer_layer_spec
 
+    def _get_mtp_transformer_layer_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        layout = getattr(self.config, 'pipeline_model_parallel_layout', None)
+        if layout is None:
+            return transformer_layer_spec
+
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        vp_rank = vp_stage or 0
+        stage = layout.layout[pp_rank][vp_rank]
+        if LayerType.mtp not in stage or LayerType.decoder in stage:
+            return transformer_layer_spec
+
+        fallback_layout = deepcopy(layout)
+        stage_index = vp_rank * fallback_layout.pipeline_model_parallel_size + pp_rank
+        for previous_stage_index in range(stage_index - 1, -1, -1):
+            previous_pp_rank = previous_stage_index % fallback_layout.pipeline_model_parallel_size
+            previous_vp_rank = previous_stage_index // fallback_layout.pipeline_model_parallel_size
+            previous_stage = fallback_layout.layout[previous_pp_rank][previous_vp_rank]
+            decoder_count = previous_stage.count(LayerType.decoder)
+            if decoder_count:
+                break
+        else:
+            raise ValueError('Unable to build an MTP-only pipeline stage without a preceding decoder stage.')
+
+        previous_stage[:] = [layer_type for layer_type in previous_stage if layer_type is not LayerType.decoder]
+        fallback_stage = fallback_layout.layout[pp_rank][vp_rank]
+        mtp_index = fallback_stage.index(LayerType.mtp)
+        fallback_stage[mtp_index:mtp_index] = [LayerType.decoder] * decoder_count
+        fallback_layout.flatten_layout = [
+            layer_type for virtual_stages in zip(*fallback_layout.layout) for stage in virtual_stages
+            for layer_type in stage
+        ]
+
+        self.config.pipeline_model_parallel_layout = fallback_layout
+        try:
+            transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
+        finally:
+            self.config.pipeline_model_parallel_layout = layout
+
+        self._set_shared_expert_gate(transformer_layer_spec)
+        self._set_transformer_layer(transformer_layer_spec)
+        self._replace_mla_attention(transformer_layer_spec)
+        self._replace_router(transformer_layer_spec)
+        return transformer_layer_spec
+
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        transformer_layer_spec = self._get_mtp_transformer_layer_spec(
+            transformer_layer_spec, vp_stage=vp_stage)
         mtp_block_spec = get_gpt_mtp_block_spec(
             self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
         if mtp_block_spec is not None:
