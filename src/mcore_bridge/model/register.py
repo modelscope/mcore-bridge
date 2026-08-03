@@ -160,7 +160,11 @@ class ModelLoader:
 
     def _replace_mla_attention(self, transformer_layer_spec):
         for layer_spec in transformer_layer_spec.layer_specs:
-            self_attention = layer_spec.submodules.self_attention
+            # Hybrid models (e.g. nemotron_h) may have layers with no attention submodule
+            # at all (MambaLayer) or with it replaced by IdentityOp (FFN-only layers).
+            self_attention = getattr(layer_spec.submodules, 'self_attention', None)
+            if not hasattr(self_attention, 'module'):
+                continue
             if self_attention.module is McoreMLASelfAttention:
                 self_attention.module = MLASelfAttention
             elif getattr(self_attention.module, '__name__', None) == 'AbsorbedMLASelfAttention':
