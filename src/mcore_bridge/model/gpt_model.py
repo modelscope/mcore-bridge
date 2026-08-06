@@ -216,10 +216,11 @@ class GPTModel(McoreGPTModel):
                 assert (inference_context.is_static_batching()
                         ), 'GPTModel currently only supports static inference batching.'
                 # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                    inference_context.max_sequence_length,
-                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                )
+                max_sequence_length = inference_context.max_sequence_length
+                if max_sequence_length not in self.rotary_pos_emb_cache:
+                    self.rotary_pos_emb_cache[max_sequence_length] = self.rotary_pos_emb.get_cos_sin(
+                        max_sequence_length)
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache[max_sequence_length]
             else:
                 rotary_seq_len = RotaryEmbedding.get_rotary_seq_len(self, inference_context, self.decoder,
                                                                     decoder_input, self.config, packed_seq_params)
