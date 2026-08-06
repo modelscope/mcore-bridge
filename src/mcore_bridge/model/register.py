@@ -9,11 +9,13 @@ from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.gpt import gpt_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from packaging import version
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from mcore_bridge.bridge import GPTBridge
@@ -125,6 +127,12 @@ class ModelLoader:
         for i, layer_spec in enumerate(transformer_layer_spec.layer_specs):
             transformer_layer_spec.layer_specs[i] = deepcopy(layer_spec)
 
+    def _replace_unfused_attention(self, transformer_layer_spec):
+        if not is_torch_npu_available() or self.config.attention_backend.name != 'unfused':
+            return
+        for layer_spec in transformer_layer_spec.layer_specs:
+            layer_spec.submodules.self_attention.submodules.core_attention = DotProductAttention
+
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         with self._patch_experimental_attention_variant():
             transformer_layer_spec = get_gpt_decoder_block_spec(
@@ -134,6 +142,7 @@ class ModelLoader:
                 qk_l2_norm=self.config.qk_l2_norm,
                 vp_stage=vp_stage)
             self._deepcopy_layer_spec(transformer_layer_spec)
+            self._replace_unfused_attention(transformer_layer_spec)
         if self.config.experimental_attention_variant == 'dsa':
             for layer_spec in transformer_layer_spec.layer_specs:
                 self._replace_spec_dsa(layer_spec)

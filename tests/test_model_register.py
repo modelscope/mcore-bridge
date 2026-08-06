@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcore_bridge.bridge.gpt_bridge import GPTBridge
-from mcore_bridge.model.register import ModelLoader
+from mcore_bridge.model.register import DotProductAttention, ModelLoader
 
 
 class TestModelLoader(unittest.TestCase):
@@ -16,6 +16,7 @@ class TestModelLoader(unittest.TestCase):
             experimental_attention_variant=None,
             normalization='RMSNorm',
             qk_l2_norm=False,
+            attention_backend=SimpleNamespace(name='flash'),
         )
         return loader
 
@@ -27,6 +28,22 @@ class TestModelLoader(unittest.TestCase):
                     get_spec.return_value = SimpleNamespace(layer_specs=[])
                     loader.get_transformer_layer_spec()
                 self.assertEqual(get_spec.call_args.kwargs['use_transformer_engine'], expected)
+
+    @patch('mcore_bridge.model.register.is_torch_npu_available', return_value=True)
+    def test_unfused_attention_uses_mcore_dot_product_on_npu(self, _):
+        loader = self._get_loader('transformer_engine')
+        loader.config.attention_backend.name = 'unfused'
+        core_attention = object()
+        transformer_layer_spec = SimpleNamespace(layer_specs=[
+            SimpleNamespace(
+                submodules=SimpleNamespace(
+                    self_attention=SimpleNamespace(submodules=SimpleNamespace(core_attention=core_attention))))
+        ])
+
+        loader._replace_unfused_attention(transformer_layer_spec)
+
+        self.assertIs(transformer_layer_spec.layer_specs[0].submodules.self_attention.submodules.core_attention,
+                      DotProductAttention)
 
     def test_transformer_impl_controls_mtp_layer_spec(self):
         for transformer_impl, expected in [('local', False), ('transformer_engine', True)]:
