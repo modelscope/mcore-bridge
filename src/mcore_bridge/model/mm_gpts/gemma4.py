@@ -840,14 +840,20 @@ class Gemma4Loader(ModelLoader):
         num_moe_experts = self.config.num_moe_experts
         self.config.num_moe_experts = None
         layer_specs = get_gpt_decoder_block_spec(
-            self.config, use_transformer_engine=True, normalization=self.config.normalization, vp_stage=vp_stage)
+            self.config,
+            use_transformer_engine=self.use_transformer_engine,
+            normalization=self.config.normalization,
+            vp_stage=vp_stage)
         for layer_spec in layer_specs.layer_specs:
             layer_spec.submodules.self_attention.module = Gemma4SelfAttention
             self._set_mlp_spec(layer_spec.submodules, Gemma4MLP)
         if num_moe_experts is not None:
             self.config.num_moe_experts = num_moe_experts
             moe_layer_specs = get_gpt_decoder_block_spec(
-                self.config, use_transformer_engine=True, normalization=self.config.normalization, vp_stage=vp_stage)
+                self.config,
+                use_transformer_engine=self.use_transformer_engine,
+                normalization=self.config.normalization,
+                vp_stage=vp_stage)
             for layer_spec, moe_layer_spec in zip(layer_specs.layer_specs, moe_layer_specs.layer_specs):
                 layer_spec.submodules.experts_mlp = moe_layer_spec.submodules.mlp
                 self._set_mlp_spec(layer_spec.submodules, Gemma4MoELayer, mlp_key='experts_mlp')

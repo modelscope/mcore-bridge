@@ -82,6 +82,10 @@ class ModelLoader:
         if self.model_cls is None:
             self.model_cls = MultimodalGPTModel if config.is_multimodal else GPTModel
 
+    @property
+    def use_transformer_engine(self):
+        return self.config.transformer_impl == 'transformer_engine'
+
     def _set_mlp_spec(self, layer_submodules, mlp_module, mlp_key='mlp'):
         mlp_spec = getattr(layer_submodules, mlp_key)
         if isinstance(mlp_spec, partial):
@@ -125,7 +129,7 @@ class ModelLoader:
         with self._patch_experimental_attention_variant():
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 self.config,
-                use_transformer_engine=True,
+                use_transformer_engine=self.use_transformer_engine,
                 normalization=self.config.normalization,
                 qk_l2_norm=self.config.qk_l2_norm,
                 vp_stage=vp_stage)
@@ -137,7 +141,7 @@ class ModelLoader:
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
         mtp_block_spec = get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
+            self.config, transformer_layer_spec, use_transformer_engine=self.use_transformer_engine, vp_stage=vp_stage)
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 layer_spec.module = MultiTokenPredictionLayer
