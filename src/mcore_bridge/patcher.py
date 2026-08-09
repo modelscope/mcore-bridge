@@ -197,16 +197,17 @@ def _patch_mrope():
     def _apply_rotary_pos_emb_thd(t: torch.Tensor, cu_seqlens: torch.Tensor, freqs: torch.Tensor, *args,
                                   **kwargs) -> torch.Tensor:
         cp_group = kwargs.pop('cp_group', None)
-        if cp_group is not None:
-            cp_size = cp_group.size()
-        else:
-            cp_size = mpu.get_context_parallel_world_size()
+        if cp_group is None:
             cp_group = mpu.get_context_parallel_group()
-        cu_seqlens_for_batched = cu_seqlens // cp_size
-        use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
-        # The determination of mla_output_remove_interleaving: a quick solution for identifying deepseek_v4
-        # (TODO: refactor)
-        if not use_batched_rope and not kwargs.get('mla_output_remove_interleaving', False):
+        # The fast path below reinterprets the thd tensor as bshd and multiplies it by `freqs`
+        # directly, which is only valid when `freqs` is already expanded per token. Compare against
+        # the token count of `t` itself rather than deriving one from `cu_seqlens`: callers that
+        # change the sequence length -- e.g. deepseek_v4's CSA compressor, which shortens kv and
+        # passes the compressed cu_seqlens -- must fall back to the upstream thd kernel, which
+        # aligns freqs per segment. For an ordinary packed batch both are equal, so the fast path
+        # is preserved.
+        use_batched_rope = freqs.dim() >= 1 and freqs.shape[0] == t.shape[0]
+        if not use_batched_rope:
             logger.warning_once('Using non-batched RoPE, which may affect performance.')
             return _origin_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, *args, cp_group=cp_group, **kwargs)
 

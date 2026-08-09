@@ -60,6 +60,38 @@ def _patch_YarnRotaryEmbedding(config):
             delattr(config, attr)
 
 
+def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
+    """Apply DSv4's MLA RoPE to a tensor whose frequencies are already expanded per token.
+
+    `GPTModel` pre-indexes the rotary table by `position_ids`, so `freqs` is row-aligned with
+    `t`: row i holds the frequency of token i. That holds for every layout DSv4 supports --
+    unpacked, packed (thd), and packed CP: swift CP-splits `position_ids` with the same
+    partition mode as the hidden states, so the pre-indexed frequencies come out rank-local
+    while still carrying absolute positions. The multiply is therefore purely elementwise and
+    needs no `cu_seqlens`-based segment alignment, under any `cp_partition_mode`.
+
+    Enforcing that invariant here matters: when it does not hold, the generic
+    `apply_rotary_pos_emb` thd path re-derives positions from `cu_seqlens` assuming a *zigzag*
+    CP split, which is wrong for DSv4's contiguous split and would corrupt positions silently.
+    Asserting row alignment turns any future layout change into an immediate, explicit failure.
+    """
+    assert freqs.shape[0] == t.shape[0], (
+        f'DSv4 MLA RoPE expects per-token frequencies row-aligned with the input, got '
+        f'freqs.shape[0]={freqs.shape[0]} vs tokens={t.shape[0]}. `GPTModel` must pre-index the '
+        'rotary table by `position_ids` (requires `apply_rope_fusion=False`), and under CP the '
+        '`position_ids` must be split with the same partition mode as the hidden states.')
+    return apply_rotary_pos_emb(
+        t,
+        freqs,
+        config=config,
+        cu_seqlens=cu_seqlens,
+        cp_group=cp_group,
+        mla_rotary_interleaved=True,
+        mla_output_remove_interleaving=True,
+        inverse=inverse,
+    )
+
+
 class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
     def __init__(self, config, *args, **kwargs):
@@ -153,6 +185,15 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
             otherwise, they maintain the unpacked shape [s, b, ...]. In subsequent code comments,
             we uniformly use [num_tokens, ...] to denote [s, b, ...] or [t, ...] for two cases.
+
+            RoPE frequency layout: `GPTModel` pre-indexes the rotary table by `position_ids`
+            (see gpt_model.py, the `not apply_rope_fusion` branch), so `rotary_pos_emb` here is
+            already expanded per token -- row i belongs to token i -- rather than being a
+            position->frequency lookup table. Every RoPE call below is therefore an elementwise
+            multiply; see `_apply_mla_rope` for why that invariant is asserted. Under CP the
+            frequencies arrive rank-local because `position_ids` is split alongside the hidden
+            states, which is also why the boundary rows carry their own frequencies
+            (`boundary_rotary_pos_emb`) instead of being re-derived from positions.
             """
             # q_compressed: [num_tokens, q_lora_rank]
             # q: [num_tokens, n * (qk_head_dim + qk_pos_emb_head_dim)]
@@ -166,6 +207,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             if boundary_kv_compressed is not None:
                 boundary_rows = boundary_kv_compressed.shape[0]
                 kv_projection_input = torch.cat([boundary_kv_compressed, kv_compressed], dim=0)
+                # The boundary rows precede this rank's block, so their frequencies must precede
+                # too -- keeping kv_rotary_pos_emb row-aligned with kv_projection_input.
                 kv_rotary_pos_emb = torch.cat([boundary_rotary_pos_emb, rotary_pos_emb], dim=0)
             else:
                 kv_projection_input = kv_compressed
@@ -182,14 +225,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             # RoPE and query (shared for wkv and latent)
             # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-            q_pos_emb = apply_rotary_pos_emb(
+            q_pos_emb = _apply_mla_rope(
                 q_pos_emb,
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_q,
                 cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                mla_output_remove_interleaving=True,
             )
             # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
             query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -197,14 +238,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-            k_pos_emb = apply_rotary_pos_emb(
+            k_pos_emb = _apply_mla_rope(
                 k_pos_emb,
                 kv_rotary_pos_emb,
                 config=self.config,
                 cu_seqlens=cu_seqlens_kv,
                 cp_group=self.pg_collection.cp,
-                mla_rotary_interleaved=True,
-                mla_output_remove_interleaving=True,
             )
 
             # Single head: key = value = [num_tokens, 1, v_head_dim]
@@ -384,15 +423,13 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             rot_part_in = rot_part.squeeze(1)
         else:
             rot_part_in = rot_part
-        rot_part_out = apply_rotary_pos_emb(
+        rot_part_out = _apply_mla_rope(
             rot_part_in,
             rotary_pos_emb,
-            self.config,
+            config=self.config,
             cu_seqlens=cu_seqlens_kv,
             cp_group=self.pg_collection.cp,
-            mla_rotary_interleaved=True,
             inverse=True,
-            mla_output_remove_interleaving=True,
         )
         if packed_seq:
             rot_part = rot_part_out.unsqueeze(1)
