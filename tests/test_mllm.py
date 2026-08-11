@@ -125,7 +125,7 @@ def test_minicpmv4_6():
 
 
 def test_muse_glimmer():
-    _test_model('AI-ModelScope/Muse-Glimmer-30B')
+    _test_model('meta-models/Muse-Glimmer-30B')
 
 
 if __name__ == '__main__':

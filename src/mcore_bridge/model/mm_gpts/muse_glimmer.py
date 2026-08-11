@@ -265,8 +265,12 @@ class MuseGlimmerBridge(MultimodalGPTBridge):
 
     def _set_layer_attn(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
         hf_state_dict = super()._set_layer_attn(mg_layer, hf_state_dict, layer_idx, to_mcore)
-        self._set_state_dict(mg_layer, 'self_attention.gate_proj.weight', hf_state_dict,
-                             f'{self.hf_attn_prefix}.gate_proj.weight', to_mcore)
+        # The module has to be `self_attention` rather than the layer: `_get_tp_split_dim` resolves LoRA
+        # keys from the *front* (`key.lora_B.default.weight`), so any extra prefix would hide `gate_proj`
+        # from `additional_dim0_keys` and the adapter would be saved as an un-gathered TP shard.
+        mg_attn = None if mg_layer is None else mg_layer.self_attention
+        self._set_state_dict(mg_attn, 'gate_proj.weight', hf_state_dict, f'{self.hf_attn_prefix}.gate_proj.weight',
+                             to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
