@@ -198,7 +198,6 @@ class ModelConfig(TransformerConfig):
 
     # nemotron_h (hybrid mamba2 + attention + moe)
     hybrid_layer_pattern: Optional[str] = None
-    mtp_hybrid_layer_pattern: Optional[str] = None
 
     # dsa
     experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = None

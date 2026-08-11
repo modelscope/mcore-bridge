@@ -75,6 +75,7 @@ config_mapping = {
     'mamba_num_groups': ['n_groups', 'mamba_num_groups'],
     'hybrid_layer_pattern': ['hybrid_override_pattern'],
     'fp32_residual_connection': ['residual_in_fp32'],
+    'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
     'partial_rotary_factor': ['partial_rotary_factor'],
@@ -264,7 +265,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['moe_router_score_function'] = 'sigmoid'
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
     elif llm_model_type == 'nemotron_h':
-        pattern = res.get('hybrid_layer_pattern')
         res['is_hybrid_model'] = True
         res['position_embedding_type'] = 'none'
         # relu^2 ("relu2") activation: non-gated, so fc1 is a single up_proj (no gate_proj).
@@ -277,14 +277,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['moe_router_score_function'] = 'sigmoid'
         res['moe_router_enable_expert_bias'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
-        moe_layer_freq = ['1' if ch == 'E' else '0' for ch in pattern]
-        res['moe_layer_freq'] = f"[{','.join(moe_layer_freq)}]"
-        if 'E' not in pattern:
-            res.pop('num_moe_experts', None)
-        # MTP: HF exposes num_nextn_predict_layers + its own mtp_hybrid_override_pattern.
-        mtp_pattern = getattr(hf_config, 'mtp_hybrid_override_pattern', None)
-        if mtp_pattern:
-            res['mtp_hybrid_layer_pattern'] = mtp_pattern
 
     if 'partial_rotary_factor' not in res and 'partial_rotary_factor' in rope_scaling:
         res['partial_rotary_factor'] = rope_scaling['partial_rotary_factor']

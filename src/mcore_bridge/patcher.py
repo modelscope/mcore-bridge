@@ -8,6 +8,7 @@ from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELinea
 from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock, get_mtp_layer_offset
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
@@ -237,9 +238,25 @@ def _patch_mrope():
 
 
 def _patch_mtp():
+    """Unroll the MTP block over `mtp_unroll_steps` for the GPTModel build.
+
+    This rewrite drives the layer with `decoder_input` / `layer_number`, which only the
+    GPTModel-path MTP layer accepts. `HybridStack`-based MTP layers take neither, and
+    upstream's own `MultiTokenPredictionBlock.forward` already unrolls them, so hybrid
+    models must keep the upstream implementation.
+    """
+    origin_forward = MultiTokenPredictionBlock.forward
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
+        if getattr(self.config, 'is_hybrid_model', False):
+            return origin_forward(
+                self,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                **kwargs)
         # get hidden states from previous mtp stages
         get_offset_kwargs = {} if self.vp_stage is None else {'vp_stage': self.vp_stage}
         mtp_decoder_input = decoder_input = kwargs.pop('decoder_input', None)
@@ -283,6 +300,27 @@ def _patch_mtp():
     MultiTokenPredictionBlock.forward = forward
 
 
+def _patch_moe_expert_bias_padding_mask():
+    """Align the padding mask with `routing_map` in `TopKRouter._apply_expert_bias`.
+
+    `TopKRouter.routing` flattens `padding_mask` to `[num_tokens]`, but
+    `_apply_expert_bias` then computes `routing_map & (~padding_mask)` against a
+    `[num_tokens, num_experts]` map, so the 1-D mask broadcasts over the expert dim and
+    raises a size mismatch. Restore the trailing dim so it broadcasts over experts instead.
+
+    Only reachable with `moe_router_enable_expert_bias` and a non-None `padding_mask`,
+    i.e. non-packed batches -- packed runs pass `padding_mask=None` and never hit it.
+    """
+    origin_apply_expert_bias = TopKRouter._apply_expert_bias
+
+    def _apply_expert_bias(self, routing_map, padding_mask=None):
+        if padding_mask is not None and padding_mask.dim() == routing_map.dim() - 1:
+            padding_mask = padding_mask.unsqueeze(-1)
+        return origin_apply_expert_bias(self, routing_map, padding_mask=padding_mask)
+
+    TopKRouter._apply_expert_bias = _apply_expert_bias
+
+
 def apply_patch():
     _patch_flash_attn()
     _patch_transformer_engine()
@@ -297,4 +335,5 @@ def apply_patch():
     _patch_TELinear()
     _patch_mrope()
     _patch_mtp()
+    _patch_moe_expert_bias_padding_mask()
     from mcore_bridge import tuners  # apply patch
