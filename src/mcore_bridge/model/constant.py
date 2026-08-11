@@ -41,6 +41,8 @@ class MLLMModelType:
 
     minicpmv4_6 = 'minicpmv4_6'
 
+    muse_glimmer = 'muse_glimmer'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass

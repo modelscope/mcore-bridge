@@ -198,6 +198,15 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['swiglu'] = False
         res['gated_linear_unit'] = True
         res['activation_func'] = partial(F.gelu, approximate='tanh')
+    elif hf_model_type == 'muse_glimmer':
+        # 39 sliding layers (window 2048) interleaved with 13 full-attention layers; the latter are
+        # exactly the NoPE layers (`layer_rope_theta == 0`).
+        res['window_size'] = f'{window_size - 1},0'
+        window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])
+        res['window_attn_skip_freq'] = f'[{window_attn_skip_freq}]'
+        # The four per-layer norms are `CenteredRMSNorm` (`x * (1.0 + w)`). The final `norm` is a plain
+        # RMSNorm, so `MuseGlimmerLoader.build_model` opts that single module back out.
+        res['layernorm_zero_centered_gamma'] = True
     elif llm_model_type == 'gpt_oss':
         res['add_bias_linear'] = True
         res['bias_dropout_fusion'] = False
