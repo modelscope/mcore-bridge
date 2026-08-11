@@ -185,9 +185,10 @@ class NemotronHBridge(GPTBridge):
     def _set_mamba_packed(self, mg_param, hf_state_dict, hf_key, block_sizes, to_mcore: bool):
         """Load/export a packed Mamba tensor whose dim-0 blocks are each TP-sharded.
 
-        `mg_param` may be None on a PP rank that does not own this layer; the TP all-gather
-        still has to run collectively, so pass None straight through to `_all_gather_tp`
-        (which tolerates None) and only touch it when this rank actually holds the weight.
+        `mg_param` is None on a PP rank that does not own this layer. Both collectives still
+        have to run on every rank: the TP all-gather tolerates None, and the PP broadcast is
+        what actually hands the merged tensor to the non-owning ranks -- returning early
+        instead would drop this layer from the export entirely.
         """
         if to_mcore:
             if mg_param is None:
@@ -198,9 +199,9 @@ class NemotronHBridge(GPTBridge):
             self._set_weight(mg_param, self._split_packed_dim0(weight, block_sizes), None)
         else:
             gathered = self._all_gather_tp(None if mg_param is None else mg_param.data, 0, False)
-            if gathered is None:
-                return
-            merged = self._merge_packed_dim0(gathered, block_sizes)
+            merged = None if gathered is None else self._merge_packed_dim0(gathered, block_sizes)
+            # Non-owning PP ranks receive the merged tensor here; owning ranks send it.
+            merged = self._broadcast_ep_pp(merged, False)
             # `_all_gather_tp` leaves the result on cuda; the generic export path applies
             # `_target_device` when it writes into hf_state_dict, so do the same here.
             if self._target_device is not None:
