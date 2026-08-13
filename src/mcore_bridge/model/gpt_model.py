@@ -88,6 +88,9 @@ class GPTModel(McoreGPTModel):
             share_embeddings_and_output_weights=not config.untie_embeddings_and_output_weights,
             position_embedding_type=config.position_embedding_type,
             rotary_base=config.rotary_base,
+            **({
+                'rotary_percent': config.partial_rotary_factor or 1.0
+            } if config.use_accuracy_compatible else {}),
             mtp_block_spec=mtp_block_spec,
             vp_stage=vp_stage,
         )
@@ -205,8 +208,9 @@ class GPTModel(McoreGPTModel):
     def _set_inv_freq(self):
         if getattr(self, 'rotary_pos_emb', None) is None:
             return
-        new_inv_freq, self.config.attention_scaling = get_rope_inv_freq(self.config)
-        self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+        if not self.config.use_accuracy_compatible:
+            new_inv_freq, self.config.attention_scaling = get_rope_inv_freq(self.config)
+            self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
 
     def _get_rotary_pos_emb(self, decoder_input, position_ids, packed_seq_params, inference_context=None):
         # Rotary positional embeddings (embedding is None for PP intermediate devices)

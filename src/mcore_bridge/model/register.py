@@ -7,6 +7,7 @@ from functools import partial
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.models.gpt import gpt_layer_specs as _gpt_layer_specs
 from megatron.core.models.gpt import gpt_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
@@ -26,6 +27,8 @@ from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, Mu
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
     from .mm_gpt_model import MultimodalGPTModel
+
+from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
 MODEL_MAPPING = {}
 logger = get_logger()
@@ -123,12 +126,19 @@ class ModelLoader:
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         with self._patch_experimental_attention_variant():
-            transformer_layer_spec = get_gpt_decoder_block_spec(
-                self.config,
-                use_transformer_engine=True,
-                normalization=self.config.normalization,
-                qk_l2_norm=self.config.qk_l2_norm,
-                vp_stage=vp_stage)
+            use_transformer_engine = not self.config.use_accuracy_compatible
+            original_ln_impl = _gpt_layer_specs.LNImpl
+            if not use_transformer_engine:
+                _gpt_layer_specs.LNImpl = WrappedTorchNorm
+            try:
+                transformer_layer_spec = get_gpt_decoder_block_spec(
+                    self.config,
+                    use_transformer_engine=use_transformer_engine,
+                    normalization=self.config.normalization,
+                    qk_l2_norm=self.config.qk_l2_norm,
+                    vp_stage=vp_stage)
+            finally:
+                _gpt_layer_specs.LNImpl = original_ln_impl
             self._deepcopy_layer_spec(transformer_layer_spec)
         if self.config.experimental_attention_variant == 'dsa':
             for layer_spec in transformer_layer_spec.layer_specs:
@@ -136,8 +146,15 @@ class ModelLoader:
         return transformer_layer_spec
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
+        use_transformer_engine = not self.config.use_accuracy_compatible
+        original_ln_impl = _gpt_layer_specs.LNImpl
+        if not use_transformer_engine:
+            _gpt_layer_specs.LNImpl = WrappedTorchNorm
+        try:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                self.config, transformer_layer_spec, use_transformer_engine=use_transformer_engine, vp_stage=vp_stage)
+        finally:
+            _gpt_layer_specs.LNImpl = original_ln_impl
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 layer_spec.module = MultiTokenPredictionLayer

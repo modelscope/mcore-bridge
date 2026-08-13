@@ -114,6 +114,8 @@ def tuple_type(x):
 
 @dataclass
 class ModelConfig(TransformerConfig):
+    # Use native Megatron modules and accuracy-compatible kernels for alignment.
+    use_accuracy_compatible: bool = False
     mcore_model_type: Optional[str] = None  # Inferred from hf_model_type by default
     hf_model_type: Optional[str] = None
     llm_model_type: Optional[str] = None
@@ -291,6 +293,8 @@ class ModelConfig(TransformerConfig):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
+        if self.use_accuracy_compatible:
+            self.persist_layer_norm = False
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
                             'experimental attention variant requires megatron-core>=0.16.0')

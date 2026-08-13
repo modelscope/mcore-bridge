@@ -1630,6 +1630,8 @@ class GPTBridge:
 
     def _set_layer_attn(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool):
         mg_attn = None if mg_layer is None else mg_layer.self_attention
+        attn_ln_name = ('input_layernorm.weight'
+                        if self.config.use_accuracy_compatible else 'self_attention.linear_qkv.layer_norm_weight')
         if self.config.multi_latent_attention:
             hf_state_dict.update(
                 self._set_mla_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
@@ -1638,13 +1640,14 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 self.hf_input_layernorm_key, to_mcore)
+            self._set_state_dict(mg_layer, attn_ln_name, hf_state_dict, self.hf_input_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         is_moe = True if hasattr(mg_mlp, 'experts') else False
+        mlp_ln_name = ('pre_mlp_layernorm.weight'
+                       if self.config.use_accuracy_compatible else 'mlp.linear_fc1.layer_norm_weight')
         if not to_mcore:
             is_moe = torch.tensor([is_moe], dtype=torch.bool, device='cuda')
             if self.pp_size > 1:
@@ -1658,8 +1661,7 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
-                                 self.hf_post_attention_layernorm_key, to_mcore)
+            self._set_state_dict(mg_layer, mlp_ln_name, hf_state_dict, self.hf_post_attention_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_hyper_connection(self, mg_layer, hf_state_dict, layer_idx, to_mcore):
