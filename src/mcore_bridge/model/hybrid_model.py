@@ -33,18 +33,15 @@ class HybridModel(McoreHybridModel):
         post_process: bool = True,
         vp_stage: Optional[int] = None,
     ):
-        # `ModelLoader.build_model` passes the stack spec positionally as
-        # `transformer_layer_spec`; upstream names the same argument `hybrid_stack_spec`.
-        # MTP needs no separate spec here: upstream derives it from the `/` suffix of
-        # `hybrid_layer_pattern`.
         vocab_size = math.ceil(
             config.padded_vocab_size / config.tensor_model_parallel_size) * config.tensor_model_parallel_size
+        hybrid_layer_pattern = self._resolve_hybrid_layer_pattern(config)
         super().__init__(
             config,
             transformer_layer_spec,
             vocab_size,
             config.max_position_embeddings,
-            hybrid_layer_pattern=config.hybrid_layer_pattern,
+            hybrid_layer_pattern=hybrid_layer_pattern,
             pre_process=pre_process,
             post_process=post_process,
             share_embeddings_and_output_weights=not config.untie_embeddings_and_output_weights,
@@ -52,6 +49,15 @@ class HybridModel(McoreHybridModel):
             rotary_base=config.rotary_base,
             vp_stage=vp_stage,
         )
+
+    @staticmethod
+    def _resolve_hybrid_layer_pattern(config: ModelConfig) -> Optional[str]:
+        pattern = config.hybrid_layer_pattern
+        mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
+        mtp_num_layers = config.mtp_num_layers
+        if (pattern and mtp_pattern and mtp_num_layers and '/' not in pattern):
+            pattern = pattern + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
+        return pattern
 
     def _get_padding_mask(self, attention_mask) -> Optional[torch.Tensor]:
         """Mark fully-padded sequence positions, sharded to match the hidden states."""
