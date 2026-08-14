@@ -203,6 +203,8 @@ class GPTModel(McoreGPTModel):
         return decoder_input, mtp_decoder_input, rotary_pos_emb, rotary_pos_cos, rotary_pos_sin, sequence_len_offset
 
     def _set_inv_freq(self):
+        if getattr(self, 'rotary_pos_emb', None) is None:
+            return
         new_inv_freq, self.config.attention_scaling = get_rope_inv_freq(self.config)
         self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
 

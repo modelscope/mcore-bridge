@@ -6,6 +6,8 @@ import transformer_engine
 from contextlib import nullcontext
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
+                                                    scatter_to_sequence_parallel_region)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
@@ -139,6 +141,39 @@ class GatedDeltaNet(_GatedDeltaNet):
                 tp_group=self.pg_collection.tp,
             )
 
+    @staticmethod
+    def _resolve_cu_seqlens(cu_seqlens_padded, cu_seqlens_actual, total_seq_len, cp_size: int = 1):
+        cu_seqlens = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens_actual
+        if cu_seqlens is None:
+            return None
+        cu_seqlens = cu_seqlens.reshape(-1)
+        if cu_seqlens.numel() > 0 and cu_seqlens[0] != 0:
+            total_cu = cu_seqlens[-1]
+            if total_cu == total_seq_len:
+                cu_seqlens = torch.cat([
+                    torch.zeros(1, dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+                    cu_seqlens,
+                ])
+            elif total_cu - cu_seqlens[0] == total_seq_len:
+                cu_seqlens = cu_seqlens - cu_seqlens[0]
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if not (cu_seqlens[-1].eq(total_seq_len) & (seq_lengths % cp_size).eq(0).all()):
+            return None
+        return cu_seqlens
+
+    def _set_linear_sequence_parallel(self, enabled: bool) -> dict[str, bool]:
+        saved = {}
+        for name in ('in_proj', 'in_proj_qkvz', 'in_proj_ba', 'out_proj'):
+            module = getattr(self, name, None)
+            if module is not None and hasattr(module, 'sequence_parallel'):
+                saved[name] = module.sequence_parallel
+                module.sequence_parallel = enabled
+        return saved
+
+    def _restore_linear_sequence_parallel(self, saved: dict[str, bool]) -> None:
+        for name, enabled in saved.items():
+            getattr(self, name).sequence_parallel = enabled
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -173,213 +208,248 @@ class GatedDeltaNet(_GatedDeltaNet):
         # TODO: Deal with attention_mask (There is an issue when left padding is used.)
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        seq_len, batch, _ = hidden_states.shape
-        cp_size = self.config.context_parallel_size
-        seq_len = seq_len * self.sp_size * cp_size
+        use_sp = self.config.sequence_parallel and self.tp_size > 1
+        tp_group = self.pg_collection.tp
+        saved_linear_sp = {}
+        if use_sp:
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states,
+                tensor_parallel_output_grad=False,
+                group=tp_group,
+            )
+            saved_linear_sp = self._set_linear_sequence_parallel(False)
 
-        if inference_context is not None:
-            assert (
-                inference_context.is_static_batching()), 'GDN does not currently support dynamic inference batching.'
-            assert not self.config.sequence_parallel
-            # TODO: support inference
-            raise NotImplementedError('GDN does not support inference for now.')
-
-        cu_seqlens = None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
-        # Input projection
-        num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
-        nvtx_range_push(suffix='in_proj')
-        if self.config.linear_decoupled_in_proj:
-            qkvz, _ = self.in_proj_qkvz(hidden_states)
-            if self.config.fp8_param:
-                fp8_context = transformer_engine.pytorch.fp8_autocast(enabled=False)
+        try:
+            seq_len, batch, _ = hidden_states.shape
+            cp_size = self.config.context_parallel_size
+            if use_sp:
+                seq_len = seq_len * cp_size
             else:
-                fp8_context = nullcontext()
-            with fp8_context:
-                ba, _ = self.in_proj_ba(hidden_states)
-            # Use num_key_heads // tp_size (not further divided by cp_size) because
-            # the linear outputs are only TP-split at this point; CP a2a happens later.
-            num_key_heads_per_tp = self.num_key_heads // self.tp_size
-            qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_tp, qkvz.shape[-1] // num_key_heads_per_tp))
-            ba = ba.view(ba.shape[:-1] + (num_key_heads_per_tp, ba.shape[-1] // num_key_heads_per_tp))
-            qkvzba = torch.concat([qkvz, ba], dim=-1).view(*qkvz.shape[:2], -1)
-        else:
-            qkvzba, _ = self.in_proj(hidden_states)
-        nvtx_range_pop(suffix='in_proj')
+                seq_len = seq_len * self.sp_size * cp_size
 
-        if cp_size > 1:
-            from megatron.core.ssm.gated_delta_net import tensor_a2a_cp2hp, tensor_a2a_hp2cp
-            if cu_seqlens is not None:
-                unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens // self.cp_size, dim=0)
-                outputs = []
-                for qkvzba_i in unpacked_qkvzba:
-                    qkvzba_i = tensor_a2a_cp2hp(
-                        qkvzba_i,
+            if inference_context is not None:
+                assert (inference_context.is_static_batching()
+                        ), 'GDN does not currently support dynamic inference batching.'
+                assert not self.config.sequence_parallel
+                # TODO: support inference
+                raise NotImplementedError('GDN does not support inference for now.')
+
+            cu_seqlens = None
+            if packed_seq_params is not None:
+                total_seq_len = seq_len
+                cu_seqlens = self._resolve_cu_seqlens(
+                    getattr(packed_seq_params, 'cu_seqlens_q_padded', None),
+                    packed_seq_params.cu_seqlens_q,
+                    total_seq_len,
+                    cp_size=cp_size,
+                )
+                if cu_seqlens is None:
+                    cu_seqlens = packed_seq_params.cu_seqlens_q
+            # Input projection
+            num_key_heads_per_device = self.num_key_heads // self.tp_size // cp_size
+            nvtx_range_push(suffix='in_proj')
+            if self.config.linear_decoupled_in_proj:
+                qkvz, _ = self.in_proj_qkvz(hidden_states)
+                if self.config.fp8_param:
+                    fp8_context = transformer_engine.pytorch.fp8_autocast(enabled=False)
+                else:
+                    fp8_context = nullcontext()
+                with fp8_context:
+                    ba, _ = self.in_proj_ba(hidden_states)
+                # Use num_key_heads // tp_size (not further divided by cp_size) because
+                # the linear outputs are only TP-split at this point; CP a2a happens later.
+                num_key_heads_per_tp = self.num_key_heads // self.tp_size
+                qkvz = qkvz.view(qkvz.shape[:-1] + (num_key_heads_per_tp, qkvz.shape[-1] // num_key_heads_per_tp))
+                ba = ba.view(ba.shape[:-1] + (num_key_heads_per_tp, ba.shape[-1] // num_key_heads_per_tp))
+                qkvzba = torch.concat([qkvz, ba], dim=-1).view(*qkvz.shape[:2], -1)
+            else:
+                qkvzba, _ = self.in_proj(hidden_states)
+            nvtx_range_pop(suffix='in_proj')
+
+            if cp_size > 1:
+                from megatron.core.ssm.gated_delta_net import tensor_a2a_cp2hp, tensor_a2a_hp2cp
+                if cu_seqlens is not None:
+                    unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens // self.cp_size, dim=0)
+                    outputs = []
+                    for qkvzba_i in unpacked_qkvzba:
+                        qkvzba_i = tensor_a2a_cp2hp(
+                            qkvzba_i,
+                            seq_dim=0,
+                            head_dim=-1,
+                            cp_group=self.pg_collection.cp,
+                        )
+                        outputs.append(qkvzba_i)
+                    qkvzba = torch.cat(outputs, dim=0)
+                else:
+                    # CP All to All: CP to HP
+                    qkvzba = tensor_a2a_cp2hp(
+                        qkvzba,
                         seq_dim=0,
                         head_dim=-1,
                         cp_group=self.pg_collection.cp,
                     )
-                    outputs.append(qkvzba_i)
-                qkvzba = torch.cat(outputs, dim=0)
-            else:
-                # CP All to All: CP to HP
-                qkvzba = tensor_a2a_cp2hp(
-                    qkvzba,
-                    seq_dim=0,
-                    head_dim=-1,
-                    cp_group=self.pg_collection.cp,
-                )
-        # Transpose: s b x --> b s x
-        # From sbhd to bshd format
-        qkvzba = qkvzba.view(qkvzba.shape[:-1]
-                             + (num_key_heads_per_device, qkvzba.shape[-1] // num_key_heads_per_device))
-        qkvzba = qkvzba.transpose(0, 1)
-        qkv, gate, beta, alpha = torch.split(
-            qkvzba,
-            [
-                (self.qk_dim * 2 + self.v_dim) // self.num_key_heads,
-                self.v_dim // self.num_key_heads,
-                self.num_value_heads // self.num_key_heads,
-                self.num_value_heads // self.num_key_heads,
-            ],
-            dim=-1,
-        )
-        gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
-        beta = beta.reshape(batch, seq_len, -1)
-        alpha = alpha.reshape(batch, seq_len, -1)
-        qkv = qkv.reshape(batch, seq_len, -1)
-
-        # Convolution on qkv
-        nvtx_range_push(suffix='conv1d')
-        if cp_size > 1:
-            conv1d_weight = get_parameter_local_cp(
-                self.conv1d.weight,
-                dim=0,
-                cp_group=self.pg_collection.cp,
+            # Transpose: s b x --> b s x
+            # From sbhd to bshd format
+            qkvzba = qkvzba.view(qkvzba.shape[:-1]
+                                 + (num_key_heads_per_device, qkvzba.shape[-1] // num_key_heads_per_device))
+            qkvzba = qkvzba.transpose(0, 1)
+            qkv, gate, beta, alpha = torch.split(
+                qkvzba,
+                [
+                    (self.qk_dim * 2 + self.v_dim) // self.num_key_heads,
+                    self.v_dim // self.num_key_heads,
+                    self.num_value_heads // self.num_key_heads,
+                    self.num_value_heads // self.num_key_heads,
+                ],
+                dim=-1,
             )
-            conv1d_bias = (
-                get_parameter_local_cp(
-                    self.conv1d.bias,
+            gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+            beta = beta.reshape(batch, seq_len, -1)
+            alpha = alpha.reshape(batch, seq_len, -1)
+            qkv = qkv.reshape(batch, seq_len, -1)
+
+            # Convolution on qkv
+            nvtx_range_push(suffix='conv1d')
+            if cp_size > 1:
+                conv1d_weight = get_parameter_local_cp(
+                    self.conv1d.weight,
                     dim=0,
                     cp_group=self.pg_collection.cp,
-                ) if self.conv_bias else None)
-        else:
-            conv1d_weight = self.conv1d.weight
-            conv1d_bias = self.conv1d.bias
-
-        if (causal_conv1d is None) or self.config.deterministic_mode:
-            assert cu_seqlens is None, 'Packed sequences are not supported when fla is not available.'
-            qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
-            conv_out = F.conv1d(
-                input=qkv,
-                weight=conv1d_weight,
-                bias=conv1d_bias,
-                stride=self.conv1d.stride,
-                padding=self.conv1d.padding,
-                dilation=self.conv1d.dilation,
-                groups=self.conv_dim // self.tp_size // cp_size,
-            )
-            qkv = self.act_fn(conv_out[..., :seq_len])
-            qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
-        else:
-            assert self.activation in ['silu', 'swish']
-            qkv = causal_conv1d(
-                x=qkv,
-                weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
-                bias=conv1d_bias,
-                activation=self.activation,
-                cu_seqlens=cu_seqlens,
-            )[0]
-        nvtx_range_pop(suffix='conv1d')
-        # Split qkv into query, key, and value
-        qkv = qkv.view(qkv.shape[:-1] + (num_key_heads_per_device, qkv.shape[-1] // num_key_heads_per_device))
-        query, key, value = torch.split(
-            qkv,
-            [self.qk_dim // self.num_key_heads, self.qk_dim // self.num_key_heads, self.v_dim // self.num_key_heads],
-            dim=-1,
-        )
-        query = query.reshape(batch, seq_len, -1, self.key_head_dim)
-        key = key.reshape(batch, seq_len, -1, self.key_head_dim)
-        value = value.reshape(batch, seq_len, -1, self.value_head_dim)
-        # Apply L2 norm to query and key
-        if self.use_qk_l2norm:
-            query = l2norm(query.contiguous())
-            key = l2norm(key.contiguous())
-        if self.num_value_heads // self.num_key_heads > 1:
-            query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
-            key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
-
-        # Make contiguous
-        query = query.contiguous()
-        key = key.contiguous()
-        value = value.contiguous()
-        gate = gate.contiguous()
-        beta = beta.contiguous()
-        alpha = alpha.contiguous()
-
-        # Calculate g and beta
-        nvtx_range_push(suffix='g_and_beta')
-        if cp_size > 1:
-            A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-            dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
-        else:
-            A_log_local_cp, dt_bias_local_cp = self.A_log, self.dt_bias
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-        beta = beta.sigmoid()
-        nvtx_range_pop(suffix='g_and_beta')
-
-        nvtx_range_push(suffix='gated_delta_rule')
-        if self.config.deterministic_mode:
-            assert cu_seqlens is None, ('cu_seqlens is not supported for torch_chunk_gated_delta_rule for now.')
-            core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-            )
-        else:
-            core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
-                query,
-                key,
-                value,
-                g=g,
-                beta=beta,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=False,
-                cu_seqlens=cu_seqlens,
-            )
-        nvtx_range_pop(suffix='gated_delta_rule')
-
-        # RMSNorm
-        nvtx_range_push(suffix='gated_norm')
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix='gated_norm')
-
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
-        if cp_size > 1:
-            if cu_seqlens is not None:
-                unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens, dim=0)
-                outputs = []
-                for norm_out_i in unpacked_norm_out:
-                    norm_out_i = tensor_a2a_hp2cp(norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
-                    outputs.append(norm_out_i)
-                norm_out = torch.cat(outputs, dim=0)
+                )
+                conv1d_bias = (
+                    get_parameter_local_cp(
+                        self.conv1d.bias,
+                        dim=0,
+                        cp_group=self.pg_collection.cp,
+                    ) if self.conv_bias else None)
             else:
-                norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+                conv1d_weight = self.conv1d.weight
+                conv1d_bias = self.conv1d.bias
 
-        # Output projection
-        nvtx_range_push(suffix='out_proj')
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix='out_proj')
+            if (causal_conv1d is None) or self.config.deterministic_mode:
+                assert cu_seqlens is None, 'Packed sequences are not supported when fla is not available.'
+                qkv = qkv.transpose(1, 2).contiguous()  # b, s, d -> b, d, s
+                conv_out = F.conv1d(
+                    input=qkv,
+                    weight=conv1d_weight,
+                    bias=conv1d_bias,
+                    stride=self.conv1d.stride,
+                    padding=self.conv1d.padding,
+                    dilation=self.conv1d.dilation,
+                    groups=self.conv_dim // self.tp_size // cp_size,
+                )
+                qkv = self.act_fn(conv_out[..., :seq_len])
+                qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
+            else:
+                assert self.activation in ['silu', 'swish']
+                qkv = causal_conv1d(
+                    x=qkv,
+                    weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
+                    bias=conv1d_bias,
+                    activation=self.activation,
+                    cu_seqlens=cu_seqlens,
+                )[0]
+            nvtx_range_pop(suffix='conv1d')
+            # Split qkv into query, key, and value
+            qkv = qkv.view(qkv.shape[:-1] + (num_key_heads_per_device, qkv.shape[-1] // num_key_heads_per_device))
+            query, key, value = torch.split(
+                qkv,
+                [
+                    self.qk_dim // self.num_key_heads, self.qk_dim // self.num_key_heads,
+                    self.v_dim // self.num_key_heads
+                ],
+                dim=-1,
+            )
+            query = query.reshape(batch, seq_len, -1, self.key_head_dim)
+            key = key.reshape(batch, seq_len, -1, self.key_head_dim)
+            value = value.reshape(batch, seq_len, -1, self.value_head_dim)
+            # Apply L2 norm to query and key
+            if self.use_qk_l2norm:
+                query = l2norm(query.contiguous())
+                key = l2norm(key.contiguous())
+            if self.num_value_heads // self.num_key_heads > 1:
+                query = query.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
+                key = key.repeat_interleave(self.num_value_heads // self.num_key_heads, dim=2)
 
-        return out, out_bias
+            # Make contiguous
+            query = query.contiguous()
+            key = key.contiguous()
+            value = value.contiguous()
+            gate = gate.contiguous()
+            beta = beta.contiguous()
+            alpha = alpha.contiguous()
+
+            # Calculate g and beta
+            nvtx_range_push(suffix='g_and_beta')
+            if cp_size > 1:
+                A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
+                dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=self.pg_collection.cp)
+            else:
+                A_log_local_cp, dt_bias_local_cp = self.A_log, self.dt_bias
+            g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+            beta = beta.sigmoid()
+            nvtx_range_pop(suffix='g_and_beta')
+
+            nvtx_range_push(suffix='gated_delta_rule')
+            if self.config.deterministic_mode:
+                assert cu_seqlens is None, ('cu_seqlens is not supported for torch_chunk_gated_delta_rule for now.')
+                core_attn_out, last_recurrent_state = torch_chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=False,
+                )
+            else:
+                core_attn_out, last_recurrent_state = chunk_gated_delta_rule(
+                    query,
+                    key,
+                    value,
+                    g=g,
+                    beta=beta,
+                    initial_state=None,
+                    output_final_state=False,
+                    use_qk_l2norm_in_kernel=False,
+                    cu_seqlens=cu_seqlens,
+                )
+            nvtx_range_pop(suffix='gated_delta_rule')
+
+            # RMSNorm
+            nvtx_range_push(suffix='gated_norm')
+            norm_out = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix='gated_norm')
+
+            # Transpose: b s x --> s b x
+            # From bshd back to sbhd format
+            norm_out = norm_out.reshape(batch, seq_len, -1)
+            norm_out = norm_out.transpose(0, 1).contiguous()
+            if cp_size > 1:
+                if cu_seqlens is not None:
+                    unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens, dim=0)
+                    outputs = []
+                    for norm_out_i in unpacked_norm_out:
+                        norm_out_i = tensor_a2a_hp2cp(
+                            norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+                        outputs.append(norm_out_i)
+                    norm_out = torch.cat(outputs, dim=0)
+                else:
+                    norm_out = tensor_a2a_hp2cp(norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp)
+
+            # Output projection
+            nvtx_range_push(suffix='out_proj')
+            out, out_bias = self.out_proj(norm_out)
+            nvtx_range_pop(suffix='out_proj')
+
+            if use_sp:
+                out = scatter_to_sequence_parallel_region(out, group=tp_group)
+
+            return out, out_bias
+        finally:
+            if saved_linear_sp:
+                self._restore_linear_sequence_parallel(saved_linear_sp)
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None, tp_group=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

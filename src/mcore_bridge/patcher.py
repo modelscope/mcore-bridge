@@ -8,6 +8,7 @@ from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELinea
 from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock, get_mtp_layer_offset
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
@@ -197,16 +198,17 @@ def _patch_mrope():
     def _apply_rotary_pos_emb_thd(t: torch.Tensor, cu_seqlens: torch.Tensor, freqs: torch.Tensor, *args,
                                   **kwargs) -> torch.Tensor:
         cp_group = kwargs.pop('cp_group', None)
-        if cp_group is not None:
-            cp_size = cp_group.size()
-        else:
-            cp_size = mpu.get_context_parallel_world_size()
+        if cp_group is None:
             cp_group = mpu.get_context_parallel_group()
-        cu_seqlens_for_batched = cu_seqlens // cp_size
-        use_batched_rope = (freqs.dim() >= 1 and freqs.shape[0] == cu_seqlens_for_batched[-1]).item()
-        # The determination of mla_output_remove_interleaving: a quick solution for identifying deepseek_v4
-        # (TODO: refactor)
-        if not use_batched_rope and not kwargs.get('mla_output_remove_interleaving', False):
+        # The fast path below reinterprets the thd tensor as bshd and multiplies it by `freqs`
+        # directly, which is only valid when `freqs` is already expanded per token. Compare against
+        # the token count of `t` itself rather than deriving one from `cu_seqlens`: callers that
+        # change the sequence length -- e.g. deepseek_v4's CSA compressor, which shortens kv and
+        # passes the compressed cu_seqlens -- must fall back to the upstream thd kernel, which
+        # aligns freqs per segment. For an ordinary packed batch both are equal, so the fast path
+        # is preserved.
+        use_batched_rope = freqs.dim() >= 1 and freqs.shape[0] == t.shape[0]
+        if not use_batched_rope:
             logger.warning_once('Using non-batched RoPE, which may affect performance.')
             return _origin_apply_rotary_pos_emb_thd(t, cu_seqlens, freqs, *args, cp_group=cp_group, **kwargs)
 
@@ -237,9 +239,25 @@ def _patch_mrope():
 
 
 def _patch_mtp():
+    """Unroll the MTP block over `mtp_unroll_steps` for the GPTModel build.
+
+    This rewrite drives the layer with `decoder_input` / `layer_number`, which only the
+    GPTModel-path MTP layer accepts. `HybridStack`-based MTP layers take neither, and
+    upstream's own `MultiTokenPredictionBlock.forward` already unrolls them, so hybrid
+    models must keep the upstream implementation.
+    """
+    origin_forward = MultiTokenPredictionBlock.forward
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
+        if getattr(self.config, 'is_hybrid_model', False):
+            return origin_forward(
+                self,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                **kwargs)
         # get hidden states from previous mtp stages
         get_offset_kwargs = {} if self.vp_stage is None else {'vp_stage': self.vp_stage}
         mtp_decoder_input = decoder_input = kwargs.pop('decoder_input', None)
@@ -283,6 +301,27 @@ def _patch_mtp():
     MultiTokenPredictionBlock.forward = forward
 
 
+def _patch_moe_expert_bias_padding_mask():
+    """Align the padding mask with `routing_map` in `TopKRouter._apply_expert_bias`.
+
+    `TopKRouter.routing` flattens `padding_mask` to `[num_tokens]`, but
+    `_apply_expert_bias` then computes `routing_map & (~padding_mask)` against a
+    `[num_tokens, num_experts]` map, so the 1-D mask broadcasts over the expert dim and
+    raises a size mismatch. Restore the trailing dim so it broadcasts over experts instead.
+
+    Only reachable with `moe_router_enable_expert_bias` and a non-None `padding_mask`,
+    i.e. non-packed batches -- packed runs pass `padding_mask=None` and never hit it.
+    """
+    origin_apply_expert_bias = TopKRouter._apply_expert_bias
+
+    def _apply_expert_bias(self, routing_map, padding_mask=None):
+        if padding_mask is not None and padding_mask.dim() == routing_map.dim() - 1:
+            padding_mask = padding_mask.unsqueeze(-1)
+        return origin_apply_expert_bias(self, routing_map, padding_mask=padding_mask)
+
+    TopKRouter._apply_expert_bias = _apply_expert_bias
+
+
 def apply_patch():
     _patch_flash_attn()
     _patch_transformer_engine()
@@ -297,4 +336,5 @@ def apply_patch():
     _patch_TELinear()
     _patch_mrope()
     _patch_mtp()
+    _patch_moe_expert_bias_padding_mask()
     from mcore_bridge import tuners  # apply patch

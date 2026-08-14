@@ -162,6 +162,10 @@ def test_bailing():
     _test_model('inclusionAI/Ling-mini-2.0')
 
 
+def test_nemotron_h():
+    _test_model('nv-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16')
+
+
 if __name__ == '__main__':
     # test_qwen2()
     # test_llama2()
@@ -195,4 +199,5 @@ if __name__ == '__main__':
     # test_minimax_m2()
     # test_glm4_moe_lite()
     # test_olmoe()
-    test_bailing()
+    # test_bailing()
+    test_nemotron_h()

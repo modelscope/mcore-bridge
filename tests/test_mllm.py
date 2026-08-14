@@ -124,6 +124,10 @@ def test_minicpmv4_6():
     _test_model('openbmb/MiniCPM-V-4.6')
 
 
+def test_muse_glimmer():
+    _test_model('meta-models/Muse-Glimmer-30B')
+
+
 if __name__ == '__main__':
     # test_qwen2_5_vl()
     # test_qwen2_vl()
@@ -146,4 +150,5 @@ if __name__ == '__main__':
     # test_llava_onevision1_5()
     # test_qwen3_asr()
     # test_gemma4()
-    test_minicpmv4_6()
+    # test_minicpmv4_6()
+    test_muse_glimmer()

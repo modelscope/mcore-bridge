@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch.nn.functional as F
 from functools import partial
+from megatron.core.activations import squared_relu
 from transformers import PretrainedConfig
 from typing import Any, Dict
 
@@ -14,7 +15,7 @@ config_mapping = {
     'num_attention_heads': ['num_attention_heads'],
     'num_query_groups': ['num_key_value_heads'],
     'max_position_embeddings': ['max_position_embeddings'],
-    'layernorm_epsilon': ['rms_norm_eps'],
+    'layernorm_epsilon': ['rms_norm_eps', 'layer_norm_epsilon'],
     'rotary_base': ['rope_theta'],
     'padded_vocab_size': ['vocab_size'],
     'attention_dropout': ['attention_dropout'],
@@ -26,7 +27,7 @@ config_mapping = {
     'hf_model_type': ['model_type'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
-    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size'],
+    'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size', 'moe_shared_expert_intermediate_size'],
     'moe_router_topk': ['num_experts_per_tok', 'moe_topk', 'moe_k', 'top_k_experts'],
     'moe_router_num_groups': ['n_group'],
     'moe_router_group_topk': ['topk_group'],
@@ -67,6 +68,14 @@ config_mapping = {
     'mhc_sinkhorn_iterations': ['hc_sinkhorn_iters'],
     'moe_n_hash_layers': ['mlp_layer_types'],
     'activation_func_clamp_value': ['swiglu_limit'],
+    # nemotron_h / mamba2
+    'mamba_num_heads': ['mamba_num_heads'],
+    'mamba_head_dim': ['mamba_head_dim'],
+    'mamba_state_dim': ['ssm_state_size', 'mamba_state_dim'],
+    'mamba_num_groups': ['n_groups', 'mamba_num_groups'],
+    'hybrid_layer_pattern': ['hybrid_override_pattern'],
+    'fp32_residual_connection': ['residual_in_fp32'],
+    'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
     'partial_rotary_factor': ['partial_rotary_factor'],
@@ -198,6 +207,15 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['swiglu'] = False
         res['gated_linear_unit'] = True
         res['activation_func'] = partial(F.gelu, approximate='tanh')
+    elif hf_model_type == 'muse_glimmer':
+        # 39 sliding layers (window 2048) interleaved with 13 full-attention layers; the latter are
+        # exactly the NoPE layers (`layer_rope_theta == 0`).
+        res['window_size'] = f'{window_size - 1},0'
+        window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])
+        res['window_attn_skip_freq'] = f'[{window_attn_skip_freq}]'
+        # The four per-layer norms are `CenteredRMSNorm` (`x * (1.0 + w)`). The final `norm` is a plain
+        # RMSNorm, so `MuseGlimmerLoader.build_model` opts that single module back out.
+        res['layernorm_zero_centered_gamma'] = True
     elif llm_model_type == 'gpt_oss':
         res['add_bias_linear'] = True
         res['bias_dropout_fusion'] = False
@@ -254,6 +272,19 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['qk_layernorm'] = True
         res['add_qkv_bias'] = False
         res['moe_router_score_function'] = 'sigmoid'
+        res['moe_router_load_balancing_type'] = 'seq_aux_loss'
+    elif llm_model_type == 'nemotron_h':
+        res['is_hybrid_model'] = True
+        res['position_embedding_type'] = 'none'
+        # relu^2 ("relu2") activation: non-gated, so fc1 is a single up_proj (no gate_proj).
+        res['swiglu'] = False
+        res['gated_linear_unit'] = False
+        res['activation_func'] = squared_relu
+        res['add_bias_linear'] = False
+        res['add_qkv_bias'] = False
+        res['qk_layernorm'] = False
+        res['moe_router_score_function'] = 'sigmoid'
+        res['moe_router_enable_expert_bias'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
 
     if 'partial_rotary_factor' not in res and 'partial_rotary_factor' in rope_scaling:

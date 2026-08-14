@@ -12,6 +12,7 @@ class LLMModelType:
     bailing_hybrid = 'bailing_hybrid'
     deepseek_v4 = 'deepseek_v4'
     glm_moe_dsa = 'glm_moe_dsa'
+    nemotron_h = 'nemotron_h'
 
     qwen3_emb = 'qwen3_emb'
 
@@ -40,6 +41,8 @@ class MLLMModelType:
     llava_onevision1_5 = 'llava_onevision1_5'
 
     minicpmv4_6 = 'minicpmv4_6'
+
+    muse_glimmer = 'muse_glimmer'
 
 
 class ModelType(LLMModelType, MLLMModelType):

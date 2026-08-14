@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import os
 import re
 import torch
 import torch.distributed as dist
@@ -61,6 +62,7 @@ class GPTBridge:
         self._peft_format = False
         self._adapter_name = 'default'
         self._is_saving = False
+        self._source_model_dir = None
         self.model_type = config.hf_model_type
         self.llm_model_type = config.llm_model_type
         self.is_multimodal = config.is_multimodal
@@ -1915,6 +1917,8 @@ class GPTBridge:
         """
         self._peft_format = peft_format
         self._adapter_name = adapter_name
+        if not peft_format:
+            self._source_model_dir = hf_model_dir
         mg_models = unwrap_model(mg_models)
         self._disable_tqdm = False
         self._is_saving = False
@@ -1997,6 +2001,7 @@ class GPTBridge:
         adapter_name: str = 'default',
         converter: Optional[Callable] = None,
         max_shard_size: str = '5GB',
+        save_missing_weights: Union[bool, str] = False,
     ) -> None:
         """Save Megatron model checkpoint in safetensors (HuggingFace) format.
 
@@ -2013,10 +2018,15 @@ class GPTBridge:
             adapter_name: Name of the adapter for PEFT models. Defaults to 'default'.
             converter: Used to perform key-value conversion on the newly exported state_dict.
             max_shard_size: Maximum size of a single storage file, default is '5GB'.
+            save_missing_weights: Whether to copy tensors that exist in the source checkpoint but are
+                absent from the exported weights, such as submodules Megatron does not support. Pass a
+                path to specify the source checkpoint, otherwise the one recorded by `load_weights` is
+                used. Ignored when `peft_format` is True.
         """
         gc_collect()
         saver = StreamingSafetensorSaver(save_dir=output_dir, max_shard_size=max_shard_size, peft_format=peft_format)
         mg_models = unwrap_model(mg_models)
+        saved_keys = set()
         for k, v in self.export_weights(
                 mg_models,
                 target_device='cpu',
@@ -2028,8 +2038,36 @@ class GPTBridge:
                 disable_tqdm=False,
                 _is_saving=True):
             saver.add_tensor(k, v)
+            saved_keys.add(k)
+        if save_missing_weights and not peft_format:
+            source_model_dir = save_missing_weights if isinstance(save_missing_weights, str) else None
+            self._save_missing_weights(saver, saved_keys, source_model_dir)
         saver.finalize()
         dist.barrier()  # Ensure all weights are saved completely
+
+    def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
+        """Copy tensors present in the source checkpoint but absent from the exported ones.
+
+        Megatron only materializes the modules it knows about, so weights of unsupported
+        submodules (for instance the DSpark stages under `mtp.*`) would silently vanish
+        from the exported checkpoint. Restoring them verbatim keeps the saved model
+        functionally complete.
+        """
+        source_model_dir = source_model_dir or self._source_model_dir
+        if source_model_dir is None or not is_master():
+            return
+        if not os.path.isdir(source_model_dir):
+            logger.warning(f'Source model dir does not exist, skip restoring missing weights: {source_model_dir}')
+            return
+        with SafetensorLazyLoader(source_model_dir) as loader:
+            state_dict = loader.get_state_dict()
+            missing_keys = sorted(set(state_dict.keys()) - saved_keys)
+            if not missing_keys:
+                return
+            logger.info(f'Restoring {len(missing_keys)} weights from the source checkpoint '
+                        f'that were not exported by Megatron, e.g. {missing_keys[:3]}.')
+            for key in missing_keys:
+                saver.add_tensor(key, state_dict[key].load())
 
     @contextmanager
     def _patch_hf_initialize_weight(self):
