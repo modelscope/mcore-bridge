@@ -581,3 +581,15 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         if origin_device.type == 'cpu':
             self.to(device=origin_device)
+
+    @property
+    def sequence_parallel(self):
+        return self.base_layer.sequence_parallel
+
+    @sequence_parallel.setter
+    def sequence_parallel(self, value: bool):
+        self.base_layer.sequence_parallel = value
+        for adapter in self.lora_A.keys():
+            self.lora_A[adapter].sequence_parallel = value
+        for adapter in self.lora_B.keys():
+            self.lora_B[adapter].sequence_parallel = value
