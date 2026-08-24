@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine
 from contextlib import nullcontext
@@ -161,18 +162,21 @@ class GatedDeltaNet(_GatedDeltaNet):
             return None
         return cu_seqlens
 
-    def _set_linear_sequence_parallel(self, enabled: bool) -> dict[str, bool]:
-        saved = {}
+    def _set_linear_sequence_parallel(self, enabled: bool) -> list[tuple[nn.Module, bool]]:
+        saved: list[tuple[nn.Module, bool]] = []
         for name in ('in_proj', 'in_proj_qkvz', 'in_proj_ba', 'out_proj'):
             module = getattr(self, name, None)
-            if module is not None and hasattr(module, 'sequence_parallel'):
-                saved[name] = module.sequence_parallel
-                module.sequence_parallel = enabled
+            if module is None:
+                continue
+            for sub in module.modules():
+                if hasattr(sub, 'sequence_parallel'):
+                    saved.append((sub, sub.sequence_parallel))
+                    sub.sequence_parallel = enabled
         return saved
 
-    def _restore_linear_sequence_parallel(self, saved: dict[str, bool]) -> None:
-        for name, enabled in saved.items():
-            getattr(self, name).sequence_parallel = enabled
+    def _restore_linear_sequence_parallel(self, saved: list[tuple[nn.Module, bool]]) -> None:
+        for module, enabled in saved:
+            module.sequence_parallel = enabled
 
     def forward(
         self,
@@ -210,7 +214,7 @@ class GatedDeltaNet(_GatedDeltaNet):
 
         use_sp = self.config.sequence_parallel and self.tp_size > 1
         tp_group = self.pg_collection.tp
-        saved_linear_sp = {}
+        saved_linear_sp = []
         if use_sp:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states,
