@@ -196,6 +196,26 @@ class ModelConfig(TransformerConfig):
     attention_output_gate: bool = False
     linear_decoupled_in_proj: bool = False
 
+    # qwen3.8-flash-next (HC + PLE + QSA)
+    hc_count: Optional[int] = None
+    hc_lowrank: Optional[int] = None
+    ple_layer_ids: Optional[List[int]] = None
+    ple_embed_dim: Optional[int] = None
+    ple_conv_kernel_size: Optional[int] = None
+    ngram_size: Optional[int] = None
+    heads_per_ngram: Optional[int] = None
+    ngram_vocab_size_base: Optional[int] = None
+    make_ngram_vocab_size_divisible_by: Optional[int] = None
+    split_ngram_parts: Optional[int] = None
+    ple_seed: Optional[int] = None
+    eos_token_id: Optional[int] = None
+    indexer_n_heads: Optional[int] = None
+    indexer_kv_heads: Optional[int] = None
+    indexer_head_dim: Optional[int] = None
+    indexer_budget: Optional[int] = None
+    indexer_compress_ratio: Optional[int] = None
+    output_gate_type: Optional[str] = None
+
     # nemotron_h (hybrid mamba2 + attention + moe)
     hybrid_layer_pattern: Optional[str] = None
 

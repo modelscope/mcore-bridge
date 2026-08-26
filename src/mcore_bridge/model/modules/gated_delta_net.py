@@ -161,18 +161,28 @@ class GatedDeltaNet(_GatedDeltaNet):
             return None
         return cu_seqlens
 
-    def _set_linear_sequence_parallel(self, enabled: bool) -> dict[str, bool]:
+    def _set_linear_sequence_parallel(self, enabled: bool) -> dict[str, list]:
+        # Walk submodules, not just the top-level module: with LoRA the linear is
+        # wrapped (LoraParallelLinear copies `sequence_parallel` onto itself), so
+        # flipping only the wrapper leaves the inner base_layer still in SP mode
+        # and it gathers a second time over an already-gathered sequence
+        # (upstream megatron-bridge PR #172, fixing #162/#169).
         saved = {}
         for name in ('in_proj', 'in_proj_qkvz', 'in_proj_ba', 'out_proj'):
             module = getattr(self, name, None)
-            if module is not None and hasattr(module, 'sequence_parallel'):
-                saved[name] = module.sequence_parallel
-                module.sequence_parallel = enabled
+            if module is None:
+                continue
+            states = [(sub, sub.sequence_parallel) for sub in module.modules() if hasattr(sub, 'sequence_parallel')]
+            if states:
+                saved[name] = states
+                for sub, _ in states:
+                    sub.sequence_parallel = enabled
         return saved
 
-    def _restore_linear_sequence_parallel(self, saved: dict[str, bool]) -> None:
-        for name, enabled in saved.items():
-            getattr(self, name).sequence_parallel = enabled
+    def _restore_linear_sequence_parallel(self, saved: dict[str, list]) -> None:
+        for states in saved.values():
+            for sub, enabled in states:
+                sub.sequence_parallel = enabled
 
     def forward(
         self,

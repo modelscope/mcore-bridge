@@ -309,7 +309,7 @@ class GPTModel(McoreGPTModel):
                 padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
             extra_block_kwargs['padding_mask'] = padding_mask.contiguous()
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None):
             extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.
