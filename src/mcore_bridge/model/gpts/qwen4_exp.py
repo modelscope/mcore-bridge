@@ -18,7 +18,7 @@ from typing import List, Optional
 
 from mcore_bridge.utils import get_local_layer_specs, get_logger
 
-from ..modules import (GatedDeltaNet, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, QSAIndexer, TransformerBlock,
+from ..modules import (GatedDeltaNet, QSAIndexer, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
                        TransformerLayer)
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
@@ -54,8 +54,8 @@ class Qwen4ExpLayer(TransformerLayer):
         super().__init__(config, submodules, layer_number, **kwargs)
         self.ple = None
         if self.layer_number in config.ple_layer_ids:
-            self.ple = Qwen4ExpTextPLELayer(config, config.ple_layer_ids.index(self.layer_number),
-                                            pg_collection=self.pg_collection)
+            self.ple = Qwen4ExpTextPLELayer(
+                config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
         is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
         if not is_linear_attention and getattr(config, 'indexer_n_heads', None) is not None:
             self.self_attention.indexer = QSAIndexer(config)
@@ -206,8 +206,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                 dist.all_reduce(is_moe, group=self.pp_group)
         if is_moe:
             hf_state_dict.update(
-                self._set_moe_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore,
-                                    is_mtp=is_mtp))
+                self._set_moe_state(
+                    mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore, is_mtp=is_mtp))
         else:
             hf_state_dict.update(
                 self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
@@ -265,8 +265,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         emb = ple.ple_embedding.ngram_embedding if ple is not None else None
         dtype = emb.weight.dtype if emb is not None else self.config.params_dtype
         device = emb.weight.device if emb is not None else torch.cuda.current_device()
-        per_partition = (emb.num_embeddings_per_partition if emb is not None
-                         else (total + tp_size - 1) // tp_size)
+        per_partition = (emb.num_embeddings_per_partition if emb is not None else (total + tp_size - 1) // tp_size)
         tp_start = tp_rank * per_partition if emb is not None else 0
         tp_end = min((tp_rank + 1) * per_partition, total) if emb is not None else 0
         if to_mcore:
@@ -406,8 +405,7 @@ class Qwen4ExpLoader(ModelLoader):
         # it can be exercised; QSA layers run dense attention, which mcore's
         # attention already supports under CP.
         if getattr(config, 'mtp_num_layers', None):
-            raise NotImplementedError(
-                'Qwen4-Exp MTP is not supported yet')
+            raise NotImplementedError('Qwen4-Exp MTP is not supported yet')
         moe_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,

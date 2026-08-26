@@ -81,6 +81,7 @@ def _nth_prime_after(start: int, count: int) -> int:
 
 
 class Qwen4ExpTextNGramEmbedding(nn.Module):
+
     def __init__(self, config, ple_layer_index: int):
         super().__init__()
         self.ngram_size = config.ngram_size
@@ -124,10 +125,9 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             self.head_vocab_sizes.append(size)
             self.head_offsets.append(self.total_vocab_size)
             self.total_vocab_size += size
-        self.register_buffer('ngram_heads_vocab_sizes', torch.tensor(self.head_vocab_sizes, dtype=torch.long),
-                             persistent=True)
-        self.register_buffer('ngram_heads_offsets', torch.tensor(self.head_offsets, dtype=torch.long),
-                             persistent=True)
+        self.register_buffer(
+            'ngram_heads_vocab_sizes', torch.tensor(self.head_vocab_sizes, dtype=torch.long), persistent=True)
+        self.register_buffer('ngram_heads_offsets', torch.tensor(self.head_offsets, dtype=torch.long), persistent=True)
         ngram_vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / ngram_vocab_divisor) * ngram_vocab_divisor
         # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
@@ -227,15 +227,24 @@ class Qwen4ExpTextPLELayer(nn.Module):
         self.value_proj = nn.Linear(ple_embed_dim, self.hidden_size, bias=False, dtype=config.params_dtype)
         # mcore's config field layernorm_epsilon corresponds to HF's rms_norm_eps;
         # the grouped norm is the mcore subclass adding dtype/SP-flag construction.
-        self.norm_key = Qwen4ExpTextGroupedRMSNorm(hc_hidden_size, group_size=self.hidden_size,
-                                                   eps=config.layernorm_epsilon, dtype=config.params_dtype,
-                                                   sequence_parallel=config.sequence_parallel)
-        self.norm_query = Qwen4ExpTextGroupedRMSNorm(hc_hidden_size, group_size=self.hidden_size,
-                                                     eps=config.layernorm_epsilon, dtype=config.params_dtype,
-                                                     sequence_parallel=config.sequence_parallel)
-        self.norm_conv = Qwen4ExpTextGroupedRMSNorm(hc_hidden_size, group_size=self.hidden_size,
-                                                    eps=config.layernorm_epsilon, dtype=config.params_dtype,
-                                                    sequence_parallel=config.sequence_parallel)
+        self.norm_key = Qwen4ExpTextGroupedRMSNorm(
+            hc_hidden_size,
+            group_size=self.hidden_size,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
+            sequence_parallel=config.sequence_parallel)
+        self.norm_query = Qwen4ExpTextGroupedRMSNorm(
+            hc_hidden_size,
+            group_size=self.hidden_size,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
+            sequence_parallel=config.sequence_parallel)
+        self.norm_conv = Qwen4ExpTextGroupedRMSNorm(
+            hc_hidden_size,
+            group_size=self.hidden_size,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
+            sequence_parallel=config.sequence_parallel)
         self.conv1d = nn.Conv1d(
             hc_hidden_size,
             hc_hidden_size,
@@ -298,10 +307,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
             elif int(cu[-1]) - int(cu[0]) == total:
                 cu = cu - cu[0]
         if not (cu.numel() > 0 and int(cu[-1]) == total):
-            raise ValueError(
-                f'PLE cannot align cu_seqlens (last={int(cu[-1]) if cu.numel() else None}, '
-                f'first={int(cu[0]) if cu.numel() else None}) with the gathered sequence '
-                f'length {total} under sequence parallelism.')
+            raise ValueError(f'PLE cannot align cu_seqlens (last={int(cu[-1]) if cu.numel() else None}, '
+                             f'first={int(cu[0]) if cu.numel() else None}) with the gathered sequence '
+                             f'length {total} under sequence parallelism.')
         return cu
 
     def forward(
@@ -318,9 +326,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
         (undoing SP first, then the CP zigzag), ``compute`` runs on the full
         sequence, and the additive output is scattered back.
         """
-        sp_on = (self.pg_collection is not None
-                 and getattr(self.config, 'sequence_parallel', False)
-                 and getattr(self.config, 'tensor_model_parallel_size', 1) > 1)
+        sp_on = (
+            self.pg_collection is not None and getattr(self.config, 'sequence_parallel', False)
+            and getattr(self.config, 'tensor_model_parallel_size', 1) > 1)
         cp_on = getattr(self.config, 'context_parallel_size', 1) > 1
         if not (sp_on or cp_on):
             return self._forward_impl(hidden_states, input_ids, packed_seq_params)
@@ -342,18 +350,16 @@ class Qwen4ExpTextPLELayer(nn.Module):
             if input_ids.shape[-1] != hidden_states.shape[0]:
                 input_ids = reconstruct_tensor_cp(input_ids, psp_for_cp, dim=1)
         elif input_ids.shape[-1] != hidden_states.shape[0]:
-            raise ValueError(
-                f'PLE input_ids length {input_ids.shape[-1]} does not match the gathered '
-                f'sequence length {hidden_states.shape[0]} under sequence parallelism; '
-                'gpt_model is expected to pass the full, unsharded input_ids.')
+            raise ValueError(f'PLE input_ids length {input_ids.shape[-1]} does not match the gathered '
+                             f'sequence length {hidden_states.shape[0]} under sequence parallelism; '
+                             'gpt_model is expected to pass the full, unsharded input_ids.')
 
         if thd:
             # SP keeps one global cu_seqlens copy per rank; normalize padded/offset
             # forms against the gathered total so cu indexes the full sequence.
             # copy.copy (not dataclasses.replace) preserves dynamically attached
             # fields such as `num_samples` that the data pipeline relies on.
-            cu = self._normalize_cu_seqlens(
-                getattr(packed_seq_params, 'cu_seqlens_q', None), hidden_states.shape[0])
+            cu = self._normalize_cu_seqlens(getattr(packed_seq_params, 'cu_seqlens_q', None), hidden_states.shape[0])
             psp = copy.copy(packed_seq_params)
             psp.cu_seqlens_q = cu
             packed_seq_params = psp

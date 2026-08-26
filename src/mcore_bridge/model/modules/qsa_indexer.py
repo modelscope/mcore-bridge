@@ -3,7 +3,9 @@ import math
 import torch
 from torch import nn
 
+
 class Qwen4ExpTextRMSNorm(nn.Module):
+
     def __init__(self, dim: int, eps: float = 1e-6, dtype=None, sequence_parallel: bool = False):
         super().__init__()
         self.eps = eps
@@ -41,10 +43,14 @@ class QSAIndexer(nn.Module):
             bias=False,
             dtype=config.params_dtype)
         self.q_layernorm = Qwen4ExpTextRMSNorm(
-            self.index_head_dim, eps=config.layernorm_epsilon, dtype=config.params_dtype,
+            self.index_head_dim,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
             sequence_parallel=config.sequence_parallel)
         self.k_layernorm = Qwen4ExpTextRMSNorm(
-            self.index_head_dim, eps=config.layernorm_epsilon, dtype=config.params_dtype,
+            self.index_head_dim,
+            eps=config.layernorm_epsilon,
+            dtype=config.params_dtype,
             sequence_parallel=config.sequence_parallel)
         setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
 
@@ -123,14 +129,14 @@ class QSAIndexer(nn.Module):
         scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)  # [b, s, nb]
 
         # ---- restrict to blocks fully inside the causal prefix ----
-        n_blocks = (torch.arange(s, device=device) + 1) // R                      # [s]
+        n_blocks = (torch.arange(s, device=device) + 1) // R  # [s]
         block_ids = torch.arange(max_blocks, device=device)
         scores = scores.masked_fill((block_ids[None, :] >= n_blocks[:, None])[None], float('-inf'))
 
         # ---- top-k blocks -> token mask ----
         k = min(self.block_topk, max_blocks)
-        top_blocks = scores.topk(k, dim=-1).indices                              # [b, s, k]
-        keep = top_blocks < n_blocks[None, :, None]        # drop the -inf padding slots
+        top_blocks = scores.topk(k, dim=-1).indices  # [b, s, k]
+        keep = top_blocks < n_blocks[None, :, None]  # drop the -inf padding slots
         tok = (top_blocks.unsqueeze(-1) * R + torch.arange(R, device=device)).flatten(-2)
         keep_tok = keep.unsqueeze(-1).expand(-1, -1, -1, R).flatten(-2)
 
@@ -145,4 +151,4 @@ class QSAIndexer(nn.Module):
         # invariant explicit so a future layout change fails loudly instead of
         # silently attending to the future)
         allowed &= (pos[None, :] <= pos[:, None])[None]
-        return ~allowed.unsqueeze(1)                       # True == masked out
+        return ~allowed.unsqueeze(1)  # True == masked out

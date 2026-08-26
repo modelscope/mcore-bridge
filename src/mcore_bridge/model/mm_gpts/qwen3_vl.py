@@ -80,8 +80,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 deepstack_visual_embeds = visual_res.deepstack_features
             else:
                 image_embeds, deepstack_visual_embeds = visual_res
-            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0)
-                                       if deepstack_visual_embeds else None)
+            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0) if deepstack_visual_embeds else None)
             inputs_embeds = inputs_embeds + image_embeds.mean().to(device=inputs_embeds.device) * 0.
             visual_pos_masks = None
         else:
@@ -138,8 +137,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                     embed_joint[video_mask_joint, :] = vid_embed
                     deepstack_visual_embeds.append(embed_joint)
 
-            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0)
-                                       if deepstack_visual_embeds else None)
+            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0) if deepstack_visual_embeds else None)
             visual_pos_masks = visual_pos_masks.transpose(0, 1)
             # compat cp
             if self.config.context_parallel_size > 1:
