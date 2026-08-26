@@ -255,9 +255,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
             dtype=config.params_dtype,
         )
         nn.init.zeros_(self.conv1d.weight)
+        replicated_prefixes = ('key_proj', 'value_proj', 'norm_key', 'norm_query', 'norm_conv', 'conv1d')
         for name, param in self.named_parameters():
-            if name.startswith(('key_proj', 'value_proj')) or name.endswith('norm.weight') or name.startswith(
-                ('norm_key', 'norm_query', 'norm_conv')) or name.startswith('conv1d'):
+            if name.startswith(replicated_prefixes) or name.endswith('norm.weight'):
                 # Replicated across TP; reduce grads across TP when SP is on.
                 setattr(param, 'sequence_parallel', config.sequence_parallel)
 

@@ -434,7 +434,6 @@ class Qwen4ExpLoader(ModelLoader):
         moe_pattern = self._get_moe_layer_pattern()
         layer_specs = []
         for layer_idx, is_linear_attention in enumerate(config.linear_attention_freq):
-            from copy import deepcopy
             layer_spec = deepcopy(moe_spec if moe_pattern[layer_idx] else dense_spec)
             if is_linear_attention:
                 layer_spec.submodules.self_attention = deepcopy(gdn_spec)
