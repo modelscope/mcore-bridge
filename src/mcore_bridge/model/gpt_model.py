@@ -134,6 +134,23 @@ class GPTModel(McoreGPTModel):
                 attention = layer.transformer_layer.self_attention
                 attention.config = copy.copy(attention.config)
                 attention.config.apply_rope_fusion = False
+            if config.mtp_freeze:
+                self._freeze_mtp()
+
+    def _freeze_mtp(self):
+        """Drop the MTP layers out of the optimizer while keeping them loadable and exportable.
+
+        ``self.mtp`` owns only the MTP-specific parameters -- enorm / hnorm / eh_proj / the inner
+        transformer layer / final_layernorm. The embedding and the output layer it reads are the
+        main model's, reached through the ``embedding=`` argument and
+        ``shared_embedding_or_output_weight()``, so nothing shared is frozen here.
+        """
+        frozen = 0
+        for param in self.mtp.parameters():
+            if param.requires_grad:
+                param.requires_grad = False
+                frozen += 1
+        logger.info(f'mtp_freeze: {frozen} MTP parameters excluded from the optimizer.')
 
     def _init_mla_softmax_scale(self, config):
         if self.hf_rope_scaling and self.hf_rope_scaling['rope_type'] == 'yarn':
@@ -260,6 +277,7 @@ class GPTModel(McoreGPTModel):
         *,
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[torch.Tensor] = None,
+        mtp_labels: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -270,6 +288,12 @@ class GPTModel(McoreGPTModel):
         Args:
             runtime_gather_output (bool): Gather output at runtime. Default None means
                 `parallel_output` arg in the constructor will be used.
+            mtp_labels: Targets for the Multi-Token Prediction heads only, in the same
+                already-shifted layout as ``labels`` (``target[i]`` is the token predicted at
+                position ``i``). Exists so a caller that computes its main loss outside the model
+                -- every RL trainer, which needs per-token log-probs and therefore passes
+                ``labels=None`` -- can still train the MTP heads. Ignored when ``labels`` is given,
+                since the MTP heads then already have their targets.
         """
         if self.config.position_embedding_type == 'mrope' and position_ids.ndim == 2:  # qwen3_asr
             position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
@@ -339,6 +363,7 @@ class GPTModel(McoreGPTModel):
             input_ids=input_ids,
             position_ids=position_ids,
             labels=labels,
+            mtp_labels=mtp_labels,
             rotary_pos_emb=rotary_pos_emb,
             rotary_pos_cos=rotary_pos_cos,
             rotary_pos_sin=rotary_pos_sin,
@@ -435,18 +460,26 @@ class GPTModel(McoreGPTModel):
                      runtime_gather_output=None,
                      extra_block_kwargs=None,
                      inference_context=None,
+                     mtp_labels=None,
                      **kwargs):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
         Applies Multi-Token Prediction if enabled, generates output logits through
         the output layer, and computes language model loss when labels are provided.
+
+        ``mtp_labels`` drives the MTP heads when the main loss is *not* computed here. See
+        :meth:`forward` for the layout; it is ignored once ``labels`` is available.
         """
         if not self.post_process:
             if self.config.is_multimodal and self.config.mtp_num_layers:
                 return torch.concat([hidden_states, decoder_input], dim=0)
             else:
                 return hidden_states
-        labels = labels if self.config.task_type == 'causal_lm' else None
+        if self.config.task_type != 'causal_lm':
+            # A classification / embedding head has no next-token target, so neither the main loss
+            # nor the MTP heads have anything to train against.
+            labels = None
+            mtp_labels = None
         in_inference_mode = inference_context is not None and not self.training
         if in_inference_mode:
             assert runtime_gather_output, 'Inference must always gather TP logits'
@@ -456,7 +489,13 @@ class GPTModel(McoreGPTModel):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
-        if self.mtp_process and labels is not None:
+        # The MTP heads take their targets from ``labels`` when the main loss is computed here
+        # (SFT), and from ``mtp_labels`` when it is not (RL). Reading only ``labels``, as this did
+        # before, meant an RL trainer -- which computes the policy loss from logits and so passes
+        # ``labels=None`` -- built, loaded, exported and weight-synced MTP layers that never
+        # received a single gradient, with no error and no mtp_loss in the logs to show it.
+        mtp_targets = labels if labels is not None else mtp_labels
+        if self.mtp_process and mtp_targets is not None and not in_inference_mode:
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -472,7 +511,7 @@ class GPTModel(McoreGPTModel):
                 decoder_input=decoder_input if self.config.is_multimodal else None,
                 **(extra_block_kwargs or {}),
             )
-            mtp_labels = labels.clone()
+            mtp_labels = mtp_targets.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_unroll_steps, dim=0)
             hidden_states = hidden_states_list[0]
             if loss_mask is None:

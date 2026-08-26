@@ -80,8 +80,12 @@ class MultimodalGPTModel(MegatronModule):
         labels: torch.Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        mtp_labels: torch.Tensor = None,
         **kwargs,
     ) -> torch.Tensor:
+        # ``mtp_labels`` is named explicitly rather than left to **kwargs: everything not named here
+        # ends up in ``extra_block_kwargs``, which is forwarded to the decoder blocks, so an MTP
+        # target passed positionally by name would be handed to attention instead of the MTP heads.
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
@@ -107,6 +111,7 @@ class MultimodalGPTModel(MegatronModule):
             attention_mask=attention_mask,
             decoder_input=decoder_input,
             labels=labels,
+            mtp_labels=mtp_labels,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             extra_block_kwargs=kwargs,

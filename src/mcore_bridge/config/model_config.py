@@ -225,6 +225,20 @@ class ModelConfig(TransformerConfig):
     # mtp
     mtp_decoder_input_detach: bool = False
     mtp_shared_weights: bool = False
+    #: Keep the MTP layers out of the optimizer. They are still built, loaded and exported, so the
+    #: saved checkpoint stays usable for speculative decoding -- only the gradient is dropped.
+    #: Megatron filters on ``requires_grad`` in both ``_get_param_groups`` and the DDP grad buffer,
+    #: so this also reclaims the Adam state. Without it, a model whose MTP loss is never computed
+    #: still has its MTP weights *decayed* every step: the DDP buffer zero-fills the missing grads
+    #: rather than leaving them None, and weight decay then applies to a zero gradient.
+    mtp_freeze: bool = False
+    #: Whether the MTP loss is expected to take part in training. This is intent, not mechanism:
+    #: the MTP branch actually runs when a forward passes ``labels`` (SFT) or ``mtp_labels`` (RL),
+    #: and only the caller knows whether a given pass is a training pass or a log-prob pass. RL
+    #: frameworks compute the policy loss outside the model and therefore pass ``labels=None``, so
+    #: without a declared intent there is nothing to distinguish "MTP should train" from "MTP is
+    #: dead weight" -- which is the state a bare ``mtp_num_layers`` leaves an RL run in.
+    enable_mtp_training: bool = False
 
     # visual
     language_model_only: bool = False
@@ -335,6 +349,15 @@ class ModelConfig(TransformerConfig):
             self.mtp_num_layers = 1
         else:
             self.mtp_unroll_steps = self.mtp_num_layers
+        if self.mtp_num_layers is None:
+            # Reject rather than ignore: both knobs read as "MTP is configured", and silently
+            # dropping them leaves a run that logs no MTP loss and exports no MTP layer while the
+            # command line says otherwise.
+            assert not self.mtp_freeze, 'mtp_freeze requires mtp_num_layers'
+            assert not self.enable_mtp_training, 'enable_mtp_training requires mtp_num_layers'
+        assert not (self.mtp_freeze and self.enable_mtp_training), \
+            'mtp_freeze and enable_mtp_training are contradictory: the first drops the MTP gradient, ' \
+            'the second asks for it. Pick one.'
         if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
             self.csa_compress_ratios += [0] * self.mtp_num_layers
         if self.multi_latent_attention:
