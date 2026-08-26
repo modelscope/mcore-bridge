@@ -39,7 +39,6 @@ class Qwen4ExpTextGroupedRMSNorm(nn.Module):
 
 class Qwen4ExpTextGatedResidual(nn.Module):
     def __init__(self, config, use_combine: bool = True):
-        # Mirrors transformers `Qwen4ExpTextGatedResidual.__init__` (config-driven).
         super().__init__()
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size

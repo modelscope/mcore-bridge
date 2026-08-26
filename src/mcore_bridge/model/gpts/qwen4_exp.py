@@ -133,6 +133,7 @@ class Qwen4ExpLayer(TransformerLayer):
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # return None means full attention
+        # TODO: support padding_free & cp
         indexer = getattr(self.self_attention, 'indexer', None)
         if indexer is None:
             return None
