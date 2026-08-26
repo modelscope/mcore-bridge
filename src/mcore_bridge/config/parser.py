@@ -261,7 +261,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         if use_mcore_gdn:
             res['experimental_attention_variant'] = 'gated_delta_net'
         res.setdefault('linear_attention_freq', 4)
-    elif hf_model_type in {'qwen4_exp'}:
+    elif hf_model_type == 'qwen4_exp':
         use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
         res['layernorm_zero_centered_gamma'] = True
         res['attention_output_gate'] = True
