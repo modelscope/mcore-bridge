@@ -9,8 +9,6 @@ and MTP can span several heterogeneous inner layers.
 import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -21,8 +19,20 @@ from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
-from ..hybrid_model import HybridModel
 from ..register import ModelLoader, ModelMeta, register_model
+
+try:
+    from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+
+    from ..hybrid_model import HybridModel
+
+    _HYBRID_MODEL_AVAILABLE = True
+except ImportError as error:
+    if not (error.name or '').startswith('megatron.core.models.hybrid'):
+        raise
+    HybridModel = HybridStack = HybridStackSubmodules = hybrid_stack_spec = None
+    _HYBRID_MODEL_AVAILABLE = False
 
 logger = get_logger()
 
@@ -410,9 +420,11 @@ class NemotronHLoader(ModelLoader):
         return model
 
 
-register_model(ModelMeta(
-    ModelType.nemotron_h,
-    ['nemotron_h'],
-    bridge_cls=NemotronHBridge,
-    loader=NemotronHLoader,
-))
+if _HYBRID_MODEL_AVAILABLE:
+    register_model(
+        ModelMeta(
+            ModelType.nemotron_h,
+            ['nemotron_h'],
+            bridge_cls=NemotronHBridge,
+            loader=NemotronHLoader,
+        ))
