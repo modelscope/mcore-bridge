@@ -52,7 +52,7 @@ config_mapping = {
     'linear_key_head_dim': ['linear_key_head_dim'],
     'linear_value_head_dim': ['linear_value_head_dim'],
     'linear_conv_kernel_dim': ['linear_conv_kernel_dim'],
-    # qwen3_8_flash_next
+    # qwen4_exp
     'hc_count': ['hc_count'],
     'hc_lowrank': ['hc_lowrank'],
     'ple_layer_ids': ['ple_layer_ids'],
@@ -261,8 +261,7 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         if use_mcore_gdn:
             res['experimental_attention_variant'] = 'gated_delta_net'
         res.setdefault('linear_attention_freq', 4)
-    # TODO: confirm model_type, remove one
-    elif hf_model_type in {'qwen3_8_flash_next', 'qwen4_exp'}:
+    elif hf_model_type in {'qwen4_exp'}:
         use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
         res['layernorm_zero_centered_gamma'] = True
         res['attention_output_gate'] = True
