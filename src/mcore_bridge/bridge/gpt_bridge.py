@@ -209,7 +209,22 @@ class GPTBridge:
 
     def _set_param(self, param, tensor, hf_scale_inv):
         tensor = tensor.reshape(*param.shape)
-        if self._is_fp8_param(param):
+        if self._is_nvfp4_param(param):
+            # An NVFP4 param never has an hf_scale_inv to pair with: HF stores no NVFP4 layout, so
+            # the incoming weight is always high precision and TE quantizes it on assignment.
+            assert hf_scale_inv is None, 'NVFP4 parameters cannot be loaded from a quantized HF weight'
+            param.data.copy_(tensor)
+            # ``fp8_model_init`` stashes a high-precision copy of the parameter (fp4_utils passes
+            # preserve_high_precision_init_val=torch.is_grad_enabled()), and the distributed
+            # optimizer builds its FP32 master weights from that stash rather than from the
+            # quantized data. Refreshing it is what makes the checkpoint actually take effect:
+            # leave it and the master weights start from the random init, so the loaded weights
+            # survive exactly until the first optimizer step and then vanish -- with no error.
+            # Guarded because the stash only exists when grad was enabled at build time, i.e. it is
+            # absent on an inference/export load, where there is no optimizer to mislead.
+            if hasattr(param, '_high_precision_init_val'):
+                param._high_precision_init_val.copy_(tensor)
+        elif self._is_fp8_param(param):
             if hf_scale_inv is None:
                 param.data.copy_(tensor)
                 param._high_precision_init_val.copy_(tensor)
@@ -255,6 +270,31 @@ class GPTBridge:
             return isinstance(param, Float8BlockwiseQTensor)
         except ImportError:
             return False
+
+    @staticmethod
+    def _is_nvfp4_param(param):
+        """Whether a parameter is stored as TE NVFP4 (i.e. the model was built with fp4_param=True).
+
+        Delegated to megatron rather than checking the TE class here: ``is_nvfp4tensor`` already
+        degrades to False when TE is absent or predates the NVFP4Tensor class (TE < 2.7.0.dev0), so
+        this import is safe on a build that has no FP4 support at all.
+        """
+        from megatron.core.fp4_utils import is_nvfp4tensor
+        return is_nvfp4tensor(param)
+
+    @staticmethod
+    def _dequantize_nvfp4(tensor):
+        """NVFP4 parameter -> a plain high-precision tensor.
+
+        Unlike blockwise FP8 -- which HF checkpoints store natively, so the bridge round-trips the
+        packed bytes plus ``weight_scale_inv`` -- NVFP4 has no counterpart on the HF side: the format
+        carries per-block scales, a per-tensor amax and an optional Hadamard rotation, and no HF
+        checkpoint layout expresses that. So the export contract is to dequantize, which also makes
+        the exported checkpoint loadable by anything (vLLM/sglang included) rather than only by a
+        Blackwell FP4 run.
+        """
+        from megatron.core.fp4_utils import dequantize_fp4_tensor
+        return dequantize_fp4_tensor(tensor)
 
     def _set_module(self, mg_module, hf_state_dict, hf_prefix: str, to_mcore: bool):
         if to_mcore:
@@ -403,6 +443,14 @@ class GPTBridge:
         if tensor is not None and not is_scalar:
             if not isinstance(tensor, (list, tuple)):
                 tensor = [tensor]
+            if self._is_nvfp4_param(tensor[0]):
+                # Dequantize per shard, before the TP all-gather below. NVFP4 storage is packed two
+                # values per byte with its own block scales, so gathering it as if it were a plain
+                # tensor would concatenate the wrong number of bytes and reinterpret the scales; and
+                # every consumer downstream (HF export, weight sync to the rollout engine) wants a
+                # real dtype anyway. Per-shard is correct because NVFP4 block scales are local to
+                # the shard's own blocks -- there is nothing to reduce across TP first.
+                tensor = [self._dequantize_nvfp4(t) for t in tensor]
             if self._is_fp8_param(tensor[0]):
                 mg_scale_inv = [
                     t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)]

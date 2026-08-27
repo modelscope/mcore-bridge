@@ -368,6 +368,7 @@ class ModelConfig(TransformerConfig):
         super().__post_init__()
 
         self._check_npu()
+        self._check_fp4()
         if self.mcore_model_type is None:
             self.mcore_model_type = get_mcore_model_type(self.hf_model_type)
         self.model_meta = get_model_meta(self.mcore_model_type)
@@ -396,6 +397,37 @@ class ModelConfig(TransformerConfig):
                 self.linear_attention_freq = [
                     0 if ((i + 1) % self.linear_attention_freq == 0) else 1 for i in range(self.num_layers)
                 ]
+
+    def _check_fp4(self):
+        """Surface the FP4 preconditions megatron reports late, or not at all.
+
+        megatron owns the config invariants (fp4 excludes fp8, fp4_param needs fp4) and
+        ``TransformerConfig.__post_init__`` has already enforced them by the time this runs. What it
+        does NOT do is check that the environment can actually execute FP4:
+
+        - The TE version is only checked inside ``get_fp4_recipe``, which first runs on the opening
+          microbatch -- after the dataset is built, the weights are loaded and the optimizer is
+          allocated. Raising here instead costs the user seconds rather than minutes.
+        - The GPU is never checked. NVFP4 GEMMs need Blackwell (compute capability 10.0+), and on an
+          older card the run fails somewhere inside TE/cuBLAS with a message that does not mention
+          fp4 at all. A warning rather than an error because the authority on which kernels a given
+          card supports is TE, not us -- refusing to launch would be us overruling it.
+        """
+        if not self.fp4:
+            return
+        from megatron.core.utils import is_te_min_version
+        # Same predicate megatron itself uses in fp4_utils, so the two cannot disagree about which
+        # TE versions carry NVFP4BlockScaling.
+        assert is_te_min_version('2.7.0.dev0'), (
+            'fp4 training requires transformer-engine >= 2.7.0.dev0 for the NVFP4BlockScaling recipe.')
+        import torch
+        if torch.cuda.is_available() and torch.cuda.get_device_capability() < (10, 0):
+            name = torch.cuda.get_device_name()
+            logger.warning(f'{">" * 20} WARNING {"<" * 20}\n'
+                           f'fp4={self.fp4!r} was requested, but {name} reports compute capability '
+                           f'{".".join(map(str, torch.cuda.get_device_capability()))}. NVFP4 GEMMs require '
+                           'Blackwell (10.0+); on an older architecture this run is expected to fail inside '
+                           'Transformer Engine.')
 
     def _check_npu(self):
         MAX_NPU_EXPERTS_PER_EP = 128
