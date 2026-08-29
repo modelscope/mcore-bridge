@@ -43,8 +43,7 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
             max_seqlen_q = int(packed_seq_params.max_seqlen_q)
             new_hidden_states = hidden_states.new_zeros(
                 (packed_seq_params.num_samples, max_seqlen_q, hidden_states.shape[-1]))
-            attention_mask = hidden_states.new_zeros(
-                (packed_seq_params.num_samples, max_seqlen_q), dtype=torch.bool)
+            attention_mask = hidden_states.new_zeros((packed_seq_params.num_samples, max_seqlen_q), dtype=torch.bool)
             cu_seqlens_q = packed_seq_params.cu_seqlens_q
             for i in range(packed_seq_params.num_samples):
                 start, end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
