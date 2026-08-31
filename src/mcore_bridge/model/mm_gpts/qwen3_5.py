@@ -1,13 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
 import torch.nn.functional as F
-from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
+import transformers
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from packaging import version
 
 from mcore_bridge.utils import get_env_args
 
@@ -20,6 +21,14 @@ try:
     from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeGatedDeltaNet as _Qwen3_5MoeGatedDeltaNet
 except ImportError:
     _Qwen3_5MoeGatedDeltaNet = object
+
+try:
+    from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
+except ImportError:
+    _fla_causal_conv1d = None
+
+_TRANSFORMERS_SUPPORTS_CU_SEQ_LENS_Q = version.parse(transformers.__version__) >= version.parse('5.9.0')
+_TRANSFORMERS_HAS_CONV1D_FN = version.parse(transformers.__version__) < version.parse('5.15.0')
 
 
 class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
@@ -36,7 +45,8 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
         self.config = config
         extra_kwargs = _get_extra_te_kwargs(config)
         self.to(dtype=extra_kwargs['params_dtype'], device=extra_kwargs['device'])
-        self.causal_conv1d_fn = self._fla_conv_fn
+        if _fla_causal_conv1d is not None and _TRANSFORMERS_HAS_CONV1D_FN:
+            self.causal_conv1d_fn = self._fla_conv_fn
         self._cur_cu_seqlens = None
 
     def _fla_conv_fn(self, x, weight, bias, activation, seq_idx=None):
@@ -57,6 +67,15 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
         packed_seq_params = kwargs.get('packed_seq_params')
         thd_format = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if thd_format:
+            if not _TRANSFORMERS_SUPPORTS_CU_SEQ_LENS_Q:
+                raise RuntimeError(
+                    'Packed (thd) varlen forward for Qwen3.5 requires transformers>=5.9.0, since cu_seq_lens_q was '
+                    'introduced in huggingface/transformers#45034. '
+                    f'Current transformers version is {transformers.__version__}.')
+            if _fla_causal_conv1d is None:
+                raise ImportError(
+                    'flash-linear-attention is required for packed (thd) varlen forward of Qwen3.5. '
+                    "Please install it via: `pip install -U 'flash-linear-attention' --no-build-isolation`")
             cu_seq_lens_q = packed_seq_params.cu_seqlens_q
             self._cur_cu_seqlens = cu_seq_lens_q
             attention_mask = None
@@ -66,8 +85,11 @@ class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
             attention_mask = resolve_gdn_attention_mask(kwargs)
         hidden_states = hidden_states.transpose(0, 1)
         with get_cuda_rng_tracker().fork('data-parallel-rng'):
-            res = super().forward(
-                hidden_states=hidden_states, attention_mask=attention_mask, cu_seq_lens_q=cu_seq_lens_q)
+            if cu_seq_lens_q is not None:
+                res = super().forward(
+                    hidden_states=hidden_states, attention_mask=attention_mask, cu_seq_lens_q=cu_seq_lens_q)
+            else:
+                res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
         res = res.transpose(0, 1).contiguous()
         if config.sequence_parallel and config.tensor_model_parallel_size > 1:
             res = scatter_to_sequence_parallel_region(res)
