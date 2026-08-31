@@ -1,11 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+import torch.nn.functional as F
+import transformers
 from megatron.core.extensions.transformer_engine import _get_extra_te_kwargs
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from packaging import version
 
 from mcore_bridge.utils import get_env_args
 
@@ -19,47 +22,75 @@ try:
 except ImportError:
     _Qwen3_5MoeGatedDeltaNet = object
 
+try:
+    from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
+except ImportError:
+    _fla_causal_conv1d = None
+
+_TRANSFORMERS_SUPPORTS_CU_SEQ_LENS_Q = version.parse(transformers.__version__) >= version.parse('5.9.0')
+_TRANSFORMERS_HAS_CONV1D_FN = version.parse(transformers.__version__) < version.parse('5.15.0')
+
 
 class Qwen3_5MoeGatedDeltaNet(_HuggingFaceModule, _Qwen3_5MoeGatedDeltaNet):
 
     def __init__(self, config: TransformerConfig, submodules: SelfAttentionSubmodules, layer_number: int, **kwargs):
         assert config.context_parallel_size == 1, 'Qwen3_5 currently does not support context parallel.'
         assert _Qwen3_5MoeGatedDeltaNet is not object, 'please update the `transformers` version.'
-        _Qwen3_5MoeGatedDeltaNet.__init__(self, config, layer_number)
+        if getattr(config, 'layer_types', None) is None:
+            freq = config.linear_attention_freq
+            if isinstance(freq, int):
+                freq = [0 if (i + 1) % freq == 0 else 1 for i in range(config.num_layers)]
+            config.layer_types = ['linear_attention' if f else 'full_attention' for f in freq]
+        _Qwen3_5MoeGatedDeltaNet.__init__(self, config, layer_number - 1)
         self.config = config
         extra_kwargs = _get_extra_te_kwargs(config)
         self.to(dtype=extra_kwargs['params_dtype'], device=extra_kwargs['device'])
+        if _fla_causal_conv1d is not None and _TRANSFORMERS_HAS_CONV1D_FN:
+            self.causal_conv1d_fn = self._fla_conv_fn
+        self._cur_cu_seqlens = None
+
+    def _fla_conv_fn(self, x, weight, bias, activation, seq_idx=None):
+        x_btd = x.transpose(1, 2)
+        if isinstance(activation, str):
+            act = activation
+        elif activation is F.silu or activation == 'silu':
+            act = 'silu'
+        else:
+            act = None
+        out, _ = _fla_causal_conv1d(x_btd, weight=weight, bias=bias, activation=act, cu_seqlens=self._cur_cu_seqlens)
+        return out.transpose(1, 2)
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         config = self.config
         if config.sequence_parallel and config.tensor_model_parallel_size > 1:
             hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
-        seq_len = hidden_states.shape[0]
         packed_seq_params = kwargs.get('packed_seq_params')
         thd_format = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-        # Note: for packed inputs, we do not perform padding_free unpadding.
-        # Doing so would allow different sequences to see each other; for efficiency we keep this implementation.
         if thd_format:
-            max_seqlen_q = int(packed_seq_params.max_seqlen_q)
-            new_hidden_states = hidden_states.new_zeros(
-                (packed_seq_params.num_samples, max_seqlen_q, hidden_states.shape[-1]))
-            attention_mask = hidden_states.new_zeros((packed_seq_params.num_samples, max_seqlen_q), dtype=torch.bool)
-            cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            for i in range(packed_seq_params.num_samples):
-                start, end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
-                attention_mask[i, :end - start] = True
-                new_hidden_states[i, :end - start] = hidden_states[start:end, 0]
-            hidden_states = new_hidden_states
+            if not _TRANSFORMERS_SUPPORTS_CU_SEQ_LENS_Q:
+                raise RuntimeError(
+                    'Packed (thd) varlen forward for Qwen3.5 requires transformers>=5.9.0, since cu_seq_lens_q was '
+                    'introduced in huggingface/transformers#45034. '
+                    f'Current transformers version is {transformers.__version__}.')
+            if _fla_causal_conv1d is None:
+                raise ImportError(
+                    'flash-linear-attention is required for packed (thd) varlen forward of Qwen3.5. '
+                    "Please install it via: `pip install -U 'flash-linear-attention' --no-build-isolation`")
+            cu_seq_lens_q = packed_seq_params.cu_seqlens_q
+            self._cur_cu_seqlens = cu_seq_lens_q
+            attention_mask = None
         else:
-            hidden_states = hidden_states.transpose(0, 1)
+            cu_seq_lens_q = None
+            self._cur_cu_seqlens = None
             attention_mask = resolve_gdn_attention_mask(kwargs)
+        hidden_states = hidden_states.transpose(0, 1)
         with get_cuda_rng_tracker().fork('data-parallel-rng'):
-            res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
-        if thd_format:
-            res = res[attention_mask][:, None]
-            res = torch.concat([res, res.new_zeros(seq_len - res.shape[0], 1, res.shape[2])])
-        else:
-            res = res.transpose(0, 1).contiguous()
+            if cu_seq_lens_q is not None:
+                res = super().forward(
+                    hidden_states=hidden_states, attention_mask=attention_mask, cu_seq_lens_q=cu_seq_lens_q)
+            else:
+                res = super().forward(hidden_states=hidden_states, attention_mask=attention_mask)
+        res = res.transpose(0, 1).contiguous()
         if config.sequence_parallel and config.tensor_model_parallel_size > 1:
             res = scatter_to_sequence_parallel_region(res)
         return res, None
