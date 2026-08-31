@@ -28,6 +28,8 @@ from typing import Optional, Tuple
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
 
+from .chunked_linear_ce import (chunked_linear_cross_entropy_loss,
+                                parse_chunked_linear_ce_chunk_size)
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
@@ -456,6 +458,26 @@ class GPTModel(McoreGPTModel):
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
 
+        chunk_size = parse_chunked_linear_ce_chunk_size(self.config)
+        use_chunked_linear_ce = (
+            chunk_size > 0
+            and labels is not None
+            and self.config.task_type == 'causal_lm'
+            and not in_inference_mode
+        )
+        if use_chunked_linear_ce:
+            if runtime_gather_output:
+                raise ValueError(
+                    'chunked_linear_ce_chunk_size requires vocab-parallel output; '
+                    'runtime_gather_output must be false.')
+            if getattr(self.config, 'use_mup', False):
+                raise ValueError('Chunked Linear CE does not support MuP output scaling.')
+            if (not getattr(self, '_chunked_linear_ce_logged', False)
+                    and os.environ.get('CHUNKED_LINEAR_CE_DEBUG', os.environ.get('LINEAR_CE_DEBUG', ''))
+                    .strip().lower() in {'1', 'true', 'yes', 'on'}):
+                logger.info('Using chunked linear cross entropy; chunk_size=%s.', chunk_size)
+                self._chunked_linear_ce_logged = True
+
         if self.mtp_process and labels is not None:
             hidden_states = self.mtp(
                 input_ids=input_ids,
@@ -482,12 +504,6 @@ class GPTModel(McoreGPTModel):
             # re-normalize MTP gradients against the main-loss token count.
             original_num_tokens = (loss_mask & (mtp_labels != -100)).sum()
             for mtp_layer_number in range(self.config.mtp_unroll_steps):
-                # output
-                mtp_logits = self._forward_output_layer(
-                    hidden_states_list[mtp_layer_number + 1],
-                    weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
-                )
                 # Calc loss for the current Multi-Token Prediction (MTP) layers.
                 mtp_labels, _ = roll_tensor(
                     mtp_labels,
@@ -503,9 +519,27 @@ class GPTModel(McoreGPTModel):
                     cp_group=self.cp_group,
                     packed_seq_params=packed_seq_params,
                 )
-                mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
-                loss_mask_ = (loss_mask & (mtp_labels != -100))
+                loss_mask_ = loss_mask.bool() & (mtp_labels != -100)
                 num_tokens = loss_mask_.sum()
+                if use_chunked_linear_ce:
+                    # Apply the MTP loss mask before selecting rows so padding
+                    # and invalid rolled positions do not consume LM-head GEMMs.
+                    mtp_ce_labels = mtp_labels.masked_fill(~loss_mask_, -100)
+                    mtp_loss = chunked_linear_cross_entropy_loss(
+                        self,
+                        hidden_states_list[mtp_layer_number + 1],
+                        output_weight,
+                        mtp_ce_labels,
+                        chunk_size,
+                    )
+                    mtp_logits = None
+                else:
+                    mtp_logits = self._forward_output_layer(
+                        hidden_states_list[mtp_layer_number + 1],
+                        weight=output_weight,
+                        runtime_gather_output=runtime_gather_output,
+                    )
+                    mtp_loss = self.compute_language_model_loss(mtp_labels, mtp_logits)
                 mtp_loss = loss_mask_ * mtp_loss
                 if self.training:
                     mtp_loss_for_log = (
@@ -513,9 +547,15 @@ class GPTModel(McoreGPTModel):
                     avg_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                     if hasattr(MTPLossLoggingHelper, 'save_metrics_to_tracker'):
                         # mcore >= 0.19 main branch: save_metrics_to_tracker with correct/total
-                        from megatron.core.transformer.multi_token_prediction import _compute_mtp_acceptance_counts
-                        correct, total = _compute_mtp_acceptance_counts(
-                            mtp_logits, mtp_labels, loss_mask_, output_layer=None, runtime_gather_output=True)
+                        if mtp_logits is None:
+                            # Chunked CE intentionally does not retain logits;
+                            # acceptance metrics are unavailable for this path.
+                            correct = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+                            total = torch.zeros((), device=mtp_loss.device, dtype=mtp_loss.dtype)
+                        else:
+                            from megatron.core.transformer.multi_token_prediction import _compute_mtp_acceptance_counts
+                            correct, total = _compute_mtp_acceptance_counts(
+                                mtp_logits, mtp_labels, loss_mask_, output_layer=None, runtime_gather_output=True)
                         MTPLossLoggingHelper.save_metrics_to_tracker(
                             mtp_loss_for_log,
                             correct,
@@ -556,6 +596,15 @@ class GPTModel(McoreGPTModel):
                 # state ([B, H]) → unsqueeze back to [1, B, H]
                 # (so that the output layer, which expects S×B×H, receives only the final token)
                 hidden_states = inference_context.last_token_logits(hidden_states.squeeze(1).unsqueeze(0)).unsqueeze(1)
+
+        if use_chunked_linear_ce:
+            return chunked_linear_cross_entropy_loss(
+                self,
+                hidden_states,
+                output_weight,
+                labels,
+                chunk_size,
+            )
 
         if self.config.task_type == 'embedding':
             logits = F.normalize(hidden_states, p=2, dim=-1)

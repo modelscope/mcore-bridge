@@ -269,6 +269,11 @@ class ModelConfig(TransformerConfig):
     num_labels: Optional[int] = None
     mlp_padding_free: bool = False
 
+    # Optional memory-bounded LM-head + cross-entropy path. A value of zero
+    # keeps the regular output-layer path; the corresponding environment
+    # variable is useful for launchers that cannot extend ModelConfig.
+    chunked_linear_ce_chunk_size: int = 0
+
     _mindspeed_defaults_cache = None
 
     def _augment_mindspeed_defaults(self):
