@@ -180,6 +180,57 @@ class GPTBridge:
             tensor = hf_weight
         return tensor
 
+    @staticmethod
+    def _is_dtensor(tensor) -> bool:
+        # Under Megatron-FSDP, model parameters are sharded as PyTorch DTensor(s).
+        try:
+            from torch.distributed.tensor import DTensor
+        except ImportError:
+            return False
+        return isinstance(tensor, DTensor)
+
+    def _fsdp_local_placements(self, dtensor, is_expert: bool):
+        # Placements that gather the Megatron-FSDP (data-parallel) shard while keeping
+        # the tensor-parallel shard intact, so the downstream tp/pp/ep logic is unchanged.
+        from torch.distributed.tensor import Replicate
+        placements = list(dtensor.placements)
+        tp_size = self.etp_size if is_expert else self.tp_size
+        if tp_size > 1:
+            # `make_fsdp_dtensor` always appends the tensor-parallel mesh dim last.
+            return [Replicate()] * (len(placements) - 1) + [placements[-1]]
+        return [Replicate()] * len(placements)
+
+    def _dtensor_to_local(self, dtensor, is_expert: bool = False):
+        # Convert a Megatron-FSDP DTensor param into the tp-local (fsdp-gathered) tensor,
+        # which matches the plain tensor the non-FSDP path would provide.
+        target = self._fsdp_local_placements(dtensor, is_expert)
+        if list(dtensor.placements) != target:
+            dtensor = dtensor.redistribute(placements=target)
+        return dtensor.to_local()
+
+    def _set_dtensor_param(self, param, tensor, is_expert: bool = False):
+        # Write a tp-local (fsdp-gathered) tensor back into a Megatron-FSDP DTensor param
+        # by scattering it along the data-parallel dimension.
+        from torch.distributed.tensor import DTensor, Shard
+        dtensor = param.data
+        tp_size = self.etp_size if is_expert else self.tp_size
+        global_shape = list(dtensor.shape)
+        if tp_size > 1:
+            tp_placement = dtensor.placements[-1]
+            if isinstance(tp_placement, Shard):
+                global_shape[tp_placement.dim] //= tp_size
+        local_full = tensor.reshape(global_shape).to(dtensor.dtype)
+        src = DTensor.from_local(
+            local_full,
+            device_mesh=dtensor.device_mesh,
+            placements=self._fsdp_local_placements(dtensor, is_expert),
+            run_check=False,
+            shape=dtensor.shape,
+            stride=dtensor.stride(),
+        )
+        src = src.redistribute(placements=list(dtensor.placements))
+        dtensor.to_local().copy_(src.to_local())
+
     def _set_weight(
         self,
         mg_param: Union[torch.Tensor, List[torch.Tensor]],
@@ -205,9 +256,14 @@ class GPTBridge:
             tensor = tensor + offset
         tensor_list = tensor.chunk(len(mg_param), dim=0)
         for i, param in enumerate(mg_param):
-            self._set_param(param, tensor_list[i], None if hf_scale_inv is None else hf_scale_inv[i])
+            self._set_param(param, tensor_list[i], None if hf_scale_inv is None else hf_scale_inv[i], is_expert)
 
-    def _set_param(self, param, tensor, hf_scale_inv):
+    def _set_param(self, param, tensor, hf_scale_inv, is_expert: bool = False):
+        if self._is_dtensor(param) or self._is_dtensor(param.data):
+            # Megatron-FSDP: the target param is a data-parallel sharded DTensor.
+            assert hf_scale_inv is None, 'megatron_fsdp (DTensor) does not support fp8 scale_inv.'
+            self._set_dtensor_param(param, tensor, is_expert)
+            return
         tensor = tensor.reshape(*param.shape)
         if self._is_fp8_param(param):
             if hf_scale_inv is None:
@@ -331,9 +387,13 @@ class GPTBridge:
             elif hf_state_dict is None:
                 return {}
             else:
-                if self._target_device is not None:
-                    for k, v in hf_state_dict.items():
-                        hf_state_dict[k] = v.to(self._target_device)
+                for k, v in hf_state_dict.items():
+                    # Megatron-FSDP: materialize DTensor params into local tensors.
+                    if self._is_dtensor(v):
+                        v = self._dtensor_to_local(v)
+                    if self._target_device is not None:
+                        v = v.to(self._target_device)
+                    hf_state_dict[k] = v
             return self._add_prefix(hf_state_dict, hf_prefix)
 
     def _all_gather_tp(self, tensor, tp_dim, is_expert):
@@ -403,6 +463,9 @@ class GPTBridge:
         if tensor is not None and not is_scalar:
             if not isinstance(tensor, (list, tuple)):
                 tensor = [tensor]
+            # Megatron-FSDP: gather the data-parallel shard of each DTensor param,
+            # keeping the tp shard so the tp/pp/ep logic below is unchanged.
+            tensor = [self._dtensor_to_local(t, is_expert) if self._is_dtensor(t) else t for t in tensor]
             if self._is_fp8_param(tensor[0]):
                 mg_scale_inv = [
                     t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)]
