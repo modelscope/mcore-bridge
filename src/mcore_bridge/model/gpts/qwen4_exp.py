@@ -58,7 +58,7 @@ class Qwen4ExpLayer(TransformerLayer):
                 config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
         is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
         if not is_linear_attention and getattr(config, 'indexer_n_heads', None) is not None:
-            self.self_attention.indexer = QSAIndexer(config)
+            self.self_attention.indexer = QSAIndexer(config, tp_group=self.tp_group)
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
