@@ -67,10 +67,11 @@ class QSAIndexer(nn.Module):
             hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
                 the same tensor the reference indexer consumes. ``s`` is the
                 local sequence length when sequence parallelism is enabled.
-            freqs: mcore rotary frequencies ``[s, 1, 1, rot_dim]``. mcore stores
-                angles rather than cos/sin, so they are materialized here the way
-                ``_patch_apply_rotary_pos_emb`` does (``cos(freqs) * mscale``),
-                keeping the indexer's RoPE identical to the attention's.
+            freqs: Full-sequence mcore rotary frequencies
+                ``[S, 1, 1, rot_dim]``. mcore stores angles rather than cos/sin,
+                so they are materialized here the way ``_patch_apply_rotary_pos_emb``
+                does (``cos(freqs) * mscale``), keeping the indexer's RoPE identical
+                to the attention's.
 
         Returns:
             ``[b, 1, s, s]`` bool mask where True marks a *masked-out* key (TE's
@@ -82,7 +83,12 @@ class QSAIndexer(nn.Module):
         for packed/THD or context-parallel inputs (see the guard in the layer).
         """
         local_s, b, _ = hidden_states.shape
-        tp_size = self.config.tensor_model_parallel_size if self.config.sequence_parallel else 1
+        if self.config.sequence_parallel:
+            if self.tp_group is None:
+                raise RuntimeError('QSA sequence parallelism requires a tensor-parallel process group.')
+            tp_size = self.tp_group.size()
+        else:
+            tp_size = 1
         s = local_s * tp_size
         R = self.compress_ratio
         max_blocks = s // R
@@ -102,7 +108,8 @@ class QSAIndexer(nn.Module):
         qk = self.index_qk_proj(hidden_states)
         if tp_size > 1:
             qk = gather_from_sequence_parallel_region(qk, tensor_parallel_output_grad=False, group=self.tp_group)
-        assert qk.shape[0] == s, f'QSA indexer expected sequence length {s}, got {qk.shape[0]}'
+        if qk.shape[0] != s:
+            raise RuntimeError(f'QSA indexer expected sequence length {s}, got {qk.shape[0]}.')
         q, token_k = torch.split(
             qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1)
         # -> [b, s, nh, d] / [b, s, d]
