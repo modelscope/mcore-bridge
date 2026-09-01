@@ -357,8 +357,6 @@ class Qwen4ExpTextPLELayer(nn.Module):
         if thd:
             # SP keeps one global cu_seqlens copy per rank; normalize padded/offset
             # forms against the gathered total so cu indexes the full sequence.
-            # copy.copy (not dataclasses.replace) preserves dynamically attached
-            # fields such as `num_samples` that the data pipeline relies on.
             cu = self._normalize_cu_seqlens(getattr(packed_seq_params, 'cu_seqlens_q', None), hidden_states.shape[0])
             psp = copy.copy(packed_seq_params)
             psp.cu_seqlens_q = cu
@@ -382,13 +380,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T]."""
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
         if thd:
-            num_samples = packed_seq_params.num_samples
-            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
-            # normalizes it to int, so `.item()` would raise AttributeError;
-            # tolerate a 0-d tensor from other callers.
-            max_seqlen_q = packed_seq_params.max_seqlen_q
-            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
             cu = packed_seq_params.cu_seqlens_q
+            num_samples = cu.numel() - 1
+            max_len = int(packed_seq_params.max_seqlen_q)
             total = hidden_states.shape[0]
             hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))
             toks = input_ids.new_full((num_samples, max_len), self.ple_embedding.eos_token_id)
