@@ -207,7 +207,6 @@ class ModelConfig(TransformerConfig):
     ngram_vocab_size_base: Optional[int] = None
     make_ngram_vocab_size_divisible_by: Optional[int] = None
     split_ngram_parts: Optional[int] = None
-    ple_seed: Optional[int] = None
     eos_token_id: Optional[int] = None
     indexer_n_heads: Optional[int] = None
     indexer_kv_heads: Optional[int] = None

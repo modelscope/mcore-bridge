@@ -276,8 +276,6 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['linear_attention_freq'] = f"[{','.join(linear_pattern)}]"
         if res.get('num_moe_experts'):
             res['moe_layer_freq'] = f"[{','.join(['1'] * num_layers)}]"
-        # seed is hardcoded in transformers, not in config
-        res['ple_seed'] = int(getattr(text_config, 'seed', 1234))
         eos_token_id = getattr(text_config, 'eos_token_id', None)
         if eos_token_id is not None:
             res['eos_token_id'] = eos_token_id
