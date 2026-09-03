@@ -22,9 +22,6 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
-# Mirrors Qwen4ExpTextConfig.seed's default (transformers still reads it off the
-# config; no released Qwen4-Exp checkpoint actually sets it).
-_PLE_SEED = 1234
 
 
 def use_ple_cpu_offload() -> bool:
@@ -118,6 +115,11 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # directly and has no split_ngram_parts: its table is replicated.)
         eos_token_id = config.eos_token_id
         split_ngram_parts = config.split_ngram_parts
+        ple_seed = getattr(config, 'ple_seed', None)
+        if ple_seed is None:
+            raise ValueError('ple_seed must be provided by the model config (the parser derives it from '
+                             "text_config.seed); a silently substituted default would desynchronize the "
+                             'n-gram hash multipliers from transformers.')
         if eos_token_id is None or split_ngram_parts is None:
             raise ValueError(f'eos_token_id/split_ngram_parts must be provided by the model '
                              f'config (got {eos_token_id!r}/{split_ngram_parts!r}).')
@@ -125,12 +127,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         self.split_ngram_parts = int(split_ngram_parts)
         self.head_dim = head_dim_per_ngram  # mcore-specific: the bridge weight conversion reads it off the module.
 
-        # Multipliers (splitmix64 derived, checkpoint-persistent). The seed matches
-        # Qwen4ExpTextConfig.seed's default; no released checkpoint sets it, and the
-        # multipliers must stay bit-identical to transformers or the n-gram lookups
-        # desynchronize.
+        # Multipliers (splitmix64 derived, checkpoint-persistent). The seed comes
+        # from the config (parser defaults it to Qwen4ExpTextConfig.seed's 1234);
+        # the multipliers must stay bit-identical to transformers or the n-gram
+        # lookups desynchronize.
         multipliers = _build_layer_multipliers(config.padded_vocab_size, self.ngram_size, self.ple_layer_index,
-                                               _PLE_SEED)
+                                               int(ple_seed))
         self.register_buffer('layer_multipliers', torch.tensor(multipliers, dtype=torch.long), persistent=True)
 
         # Per-head prime table sizes/offsets (checkpoint-persistent), named as
@@ -154,9 +156,8 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         if self.cpu_offload:
             # Warn rather than raise: whether this is safe depends on the train type,
             # which the model config does not carry (see use_ple_cpu_offload).
-            get_logger().warning_once(
-                'PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
-                'gradient, so it stays frozen.')
+            get_logger().warning_once('PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
+                                      'gradient, so it stays frozen.')
             self._init_host_table(config, padded_vocab_size, head_dim_per_ngram)
         else:
             # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
