@@ -96,8 +96,8 @@ def _qsa_bs_fwd_kernel(
     blk_base = tl.load(BLKBASE + offs_q, mask=q_mask, other=0)
     tok_base = tl.load(TOKBASE + offs_q, mask=q_mask, other=0)
 
-    m_i = tl.full((BQ,), float("-inf"), tl.float32)
-    l_i = tl.zeros((BQ,), tl.float32)
+    m_i = tl.full((BQ, ), float('-inf'), tl.float32)
+    l_i = tl.zeros((BQ, ), tl.float32)
     acc = tl.zeros((BQ, D), tl.float32)
 
     # Only the key tiles this query tile actually selected, so the kernel beats a dense
@@ -128,13 +128,13 @@ def _qsa_bs_fwd_kernel(
             other=0.0,
         )
         s = tl.dot(q, tl.trans(k_tile)) * scale
-        s = tl.where(ok, s, float("-inf"))
+        s = tl.where(ok, s, float('-inf'))
 
         m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        m_use = tl.where(m_new == float("-inf"), 0.0, m_new)
+        m_use = tl.where(m_new == float('-inf'), 0.0, m_new)
         p = tl.exp(s - m_use[:, None])
         p = tl.where(ok, p, 0.0)
-        alpha = tl.where(m_i == float("-inf"), 0.0, tl.exp(m_i - m_use))
+        alpha = tl.where(m_i == float('-inf'), 0.0, tl.exp(m_i - m_use))
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc = acc * alpha[:, None]
 
@@ -153,7 +153,7 @@ def _qsa_bs_fwd_kernel(
         out,
         mask=q_mask[:, None],
     )
-    lse = tl.where(m_i == float("-inf"), float("-inf"), m_i + tl.log(l_safe))
+    lse = tl.where(m_i == float('-inf'), float('-inf'), m_i + tl.log(l_safe))
     tl.store(LSE + pid_h * T + offs_q, lse, mask=q_mask)
 
 
@@ -203,12 +203,11 @@ def _qsa_bs_dq_kernel(
 
     q = tl.load(Q + offs_q[:, None] * stride_qt + pid_h * stride_qh + offs_d[None, :], mask=q_mask[:, None], other=0.0)
     do = tl.load(
-        DO + offs_q[:, None] * stride_ot + pid_h * stride_oh + offs_d[None, :], mask=q_mask[:, None], other=0.0
-    )
+        DO + offs_q[:, None] * stride_ot + pid_h * stride_oh + offs_d[None, :], mask=q_mask[:, None], other=0.0)
     lse = tl.load(LSE + pid_h * T + offs_q, mask=q_mask, other=0.0)
     delta = tl.load(DELTA + pid_h * T + offs_q, mask=q_mask, other=0.0)
-    lse_safe = tl.where(lse == float("-inf"), 0.0, lse)
-    alive = lse != float("-inf")
+    lse_safe = tl.where(lse == float('-inf'), 0.0, lse)
+    alive = lse != float('-inf')
 
     lo = tl.load(LO + offs_q, mask=q_mask, other=0)
     hi = tl.load(HI + offs_q, mask=q_mask, other=-1)
@@ -233,20 +232,16 @@ def _qsa_bs_dq_kernel(
             mask=q_mask[:, None] & k_in[None, :] & (blk >= 0) & (blk < NB),
             other=0,
         )
-        ok = (
-            (sel != 0)
-            & (offs_k[None, :] <= hi[:, None])
-            & (offs_k[None, :] >= lo[:, None])
-            & k_in[None, :]
-            & alive[:, None]
-        )
+        ok = ((sel != 0)
+              & (offs_k[None, :] <= hi[:, None])
+              & (offs_k[None, :] >= lo[:, None])
+              & k_in[None, :]
+              & alive[:, None])
 
         k_tile = tl.load(
-            K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0
-        )
+            K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0)
         v_tile = tl.load(
-            V + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], mask=k_in[:, None], other=0.0
-        )
+            V + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], mask=k_in[:, None], other=0.0)
 
         s = tl.dot(q, tl.trans(k_tile)) * scale
         p = tl.exp(s - lse_safe[:, None])
@@ -311,11 +306,9 @@ def _qsa_bs_dkdv_kernel(
     k_in = offs_k < T
 
     k_tile = tl.load(
-        K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0
-    )
+        K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0)
     v_tile = tl.load(
-        V + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], mask=k_in[:, None], other=0.0
-    )
+        V + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], mask=k_in[:, None], other=0.0)
     dk = tl.zeros((BK, D), tl.float32)
     dv = tl.zeros((BK, D), tl.float32)
 
@@ -335,13 +328,11 @@ def _qsa_bs_dkdv_kernel(
             mask=q_mask[:, None] & k_in[None, :] & (blk >= 0) & (blk < NB),
             other=0,
         )
-        ok = (
-            (sel != 0)
-            & (offs_k[None, :] <= hi[:, None])
-            & (offs_k[None, :] >= lo[:, None])
-            & k_in[None, :]
-            & q_mask[:, None]
-        )
+        ok = ((sel != 0)
+              & (offs_k[None, :] <= hi[:, None])
+              & (offs_k[None, :] >= lo[:, None])
+              & k_in[None, :]
+              & q_mask[:, None])
 
         for gh in range(0, GROUP):
             qh = kv_head * GROUP + gh
@@ -357,9 +348,9 @@ def _qsa_bs_dkdv_kernel(
             )
             lse = tl.load(LSE + qh * T + offs_q, mask=q_mask, other=0.0)
             delta = tl.load(DELTA + qh * T + offs_q, mask=q_mask, other=0.0)
-            okh = ok & (lse[:, None] != float("-inf"))
+            okh = ok & (lse[:, None] != float('-inf'))
 
-            lse_safe = tl.where(lse == float("-inf"), 0.0, lse)
+            lse_safe = tl.where(lse == float('-inf'), 0.0, lse)
             sc = tl.dot(q, tl.trans(k_tile)) * scale
             p = tl.exp(sc - lse_safe[:, None])
             p = tl.where(okh, p, 0.0)
@@ -441,6 +432,7 @@ def build_tile_index_pair(sel: Tensor, bq: int, bk: int, block_size: int):
 
 
 class _QSABlockSparseAttn(torch.autograd.Function):
+
     @staticmethod
     def forward(ctx, q, k, v, sel, lo, hi, blk_base, tok_base, scale, block_size):
         T, Hq, D = q.shape
@@ -602,9 +594,12 @@ def qsa_block_sparse_attention_triton(
     return _QSABlockSparseAttn.apply(q, k, v, sel_blocks, lo, hi, blk_base, tok_base, scale, block_size)
 
 
-def qsa_sparse_attention_from_indices(
-    q: Tensor, k: Tensor, v: Tensor, indices: Tensor, scale: float, block_size: int = 4
-) -> Tensor:
+def qsa_sparse_attention_from_indices(q: Tensor,
+                                      k: Tensor,
+                                      v: Tensor,
+                                      indices: Tensor,
+                                      scale: float,
+                                      block_size: int = 4) -> Tensor:
     """Drop-in for the gather kernel: derives the bitmap and range from ``indices``."""
     T = q.shape[0]
     sel = selection_to_block_bitmap(indices, T, block_size)

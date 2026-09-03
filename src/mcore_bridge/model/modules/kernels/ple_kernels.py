@@ -18,7 +18,6 @@ try:
 except Exception:  # pragma: no cover - triton absent
     HAVE_TRITON = False
 
-
 if HAVE_TRITON:
 
     @triton.jit
@@ -72,7 +71,7 @@ def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
         out = torch.empty(shape, dtype=torch.bfloat16, device=ids.device)
     flat = ids.reshape(-1)
     if flat.numel():
-        _gather_ple_rows_from_pinned[(flat.numel(),)](
+        _gather_ple_rows_from_pinned[(flat.numel(), )](
             host_table.data_ptr(),
             flat.contiguous(),
             out.view(-1, embedding_dim),
@@ -91,9 +90,12 @@ if HAVE_TRITON:
         key_ptr,  # [T, N*C] pre-norm key projection
         query_ptr,  # [T, N*C] hc state (the PLE query)
         value_ptr,  # [T, C]
-        wk_ptr, wq_ptr,  # zero-centered grouped-norm weights [N*C]
+        wk_ptr,
+        wq_ptr,  # zero-centered grouped-norm weights [N*C]
         gated_ptr,  # fp32 out [T, N*C]
-        gate_ptr, rstdk_ptr, rstdq_ptr,  # fp32 out [T, N]
+        gate_ptr,
+        rstdk_ptr,
+        rstdq_ptr,  # fp32 out [T, N]
         T,
         N: tl.constexpr,
         C: tl.constexpr,
@@ -136,11 +138,19 @@ if HAVE_TRITON:
     @triton.jit(do_not_specialize=['T'])
     def _ple_gate_bwd_kernel(
         dgated_ptr,  # fp32 in [T, N*C]
-        key_ptr, query_ptr, value_ptr, wk_ptr, wq_ptr,
-        gate_ptr, rstdk_ptr, rstdq_ptr,
-        dkey_ptr, dquery_ptr,  # out, input dtype [T, N*C]
+        key_ptr,
+        query_ptr,
+        value_ptr,
+        wk_ptr,
+        wq_ptr,
+        gate_ptr,
+        rstdk_ptr,
+        rstdq_ptr,
+        dkey_ptr,
+        dquery_ptr,  # out, input dtype [T, N*C]
         dvalue_ptr,  # fp32 out [T, N, C] (host sums over N)
-        dwk_partial_ptr, dwq_partial_ptr,  # fp32 out [T, N*C] (host sums over T)
+        dwk_partial_ptr,
+        dwq_partial_ptr,  # fp32 out [T, N*C] (host sums over T)
         T,
         N: tl.constexpr,
         C: tl.constexpr,
@@ -196,7 +206,10 @@ if HAVE_TRITON:
 
     @triton.jit(do_not_specialize=['T'])
     def _ple_norm_fwd_kernel(
-        x_ptr, w_ptr, out_ptr, rstd_ptr,
+        x_ptr,
+        w_ptr,
+        out_ptr,
+        rstd_ptr,
         T,
         N: tl.constexpr,
         C: tl.constexpr,
@@ -220,7 +233,11 @@ if HAVE_TRITON:
 
     @triton.jit(do_not_specialize=['T'])
     def _ple_norm_bwd_kernel(
-        x_ptr, w_ptr, rstd_ptr, dout_ptr, dx_ptr,
+        x_ptr,
+        w_ptr,
+        rstd_ptr,
+        dout_ptr,
+        dx_ptr,
         T,
         N: tl.constexpr,
         C: tl.constexpr,
@@ -359,15 +376,27 @@ if HAVE_TRITON:
             rstdk = torch.empty(T, n, dtype=torch.float32, device=dev)
             rstdq = torch.empty(T, n, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_gate_fwd_kernel[(T * n,)](
-                    key, hc_state, value, wk, wq, gated, gate, rstdk, rstdq,
-                    T, N=n, C=C, EPS=eps, SQRTC=_math.sqrt(C), BLOCK_C=block_c)
+                _ple_gate_fwd_kernel[(T * n, )](
+                    key,
+                    hc_state,
+                    value,
+                    wk,
+                    wq,
+                    gated,
+                    gate,
+                    rstdk,
+                    rstdq,
+                    T,
+                    N=n,
+                    C=C,
+                    EPS=eps,
+                    SQRTC=_math.sqrt(C),
+                    BLOCK_C=block_c)
 
             normed = torch.empty(T, W, dtype=torch.float32, device=dev)
             rstdc = torch.empty(T, n, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_norm_fwd_kernel[(T * n,)](
-                    gated, wc, normed, rstdc, T, N=n, C=C, EPS=eps, BLOCK_C=block_c)
+                _ple_norm_fwd_kernel[(T * n, )](gated, wc, normed, rstdc, T, N=n, C=C, EPS=eps, BLOCK_C=block_c)
 
             seg_lo, seg_hi = _uniform_seg_bounds(T, seq_len, dev)
             convw2d = conv_w.reshape(W, Kk).contiguous()
@@ -376,19 +405,17 @@ if HAVE_TRITON:
             BW = 256
             if T > 0:
                 _ple_conv_fwd_kernel[(T, triton.cdiv(W, BW))](
-                    normed, gated, convw2d, seg_lo, out, conv_pre,
-                    T, W, K=Kk, DIL=dilation, BLOCK_W=BW)
+                    normed, gated, convw2d, seg_lo, out, conv_pre, T, W, K=Kk, DIL=dilation, BLOCK_W=BW)
 
-            ctx.save_for_backward(
-                hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc,
-                seg_lo, seg_hi, conv_pre)
+            ctx.save_for_backward(hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc, seg_lo, seg_hi,
+                                  conv_pre)
             ctx.dims = (n, eps, dilation, Kk, conv_w.dtype)
             return out
 
         @staticmethod
         def backward(ctx, dout):
-            (hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc,
-             seg_lo, seg_hi, conv_pre) = ctx.saved_tensors
+            (hc_state, key, value, wk, wq, wc, convw2d, gate, rstdk, rstdq, rstdc, seg_lo, seg_hi,
+             conv_pre) = ctx.saved_tensors
             n, eps, dilation, Kk, conv_w_dtype = ctx.dims
             T, W = hc_state.shape
             C = W // n
@@ -403,14 +430,26 @@ if HAVE_TRITON:
             _rk = torch.empty(T, n, dtype=torch.float32, device=dev)
             _rq = torch.empty(T, n, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_gate_fwd_kernel[(T * n,)](
-                    key, hc_state, value, wk, wq, gated, _g, _rk, _rq,
-                    T, N=n, C=C, EPS=eps, SQRTC=_math.sqrt(C), BLOCK_C=block_c)
+                _ple_gate_fwd_kernel[(T * n, )](
+                    key,
+                    hc_state,
+                    value,
+                    wk,
+                    wq,
+                    gated,
+                    _g,
+                    _rk,
+                    _rq,
+                    T,
+                    N=n,
+                    C=C,
+                    EPS=eps,
+                    SQRTC=_math.sqrt(C),
+                    BLOCK_C=block_c)
             normed = torch.empty(T, W, dtype=torch.float32, device=dev)
             _rc = torch.empty(T, n, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_norm_fwd_kernel[(T * n,)](
-                    gated, wc, normed, _rc, T, N=n, C=C, EPS=eps, BLOCK_C=block_c)
+                _ple_norm_fwd_kernel[(T * n, )](gated, wc, normed, _rc, T, N=n, C=C, EPS=eps, BLOCK_C=block_c)
 
             dnormed = torch.empty(T, W, dtype=torch.float32, device=dev)
             dconvw = torch.zeros(W, Kk, dtype=torch.float32, device=dev)
@@ -418,16 +457,27 @@ if HAVE_TRITON:
             BW = 256
             if T > 0:
                 _ple_conv_bwd_kernel[(T, triton.cdiv(W, BW))](
-                    dout, conv_pre, normed, convw2d, seg_lo, seg_hi,
-                    dnormed, dconvw, dgated, T, W, K=Kk, DIL=dilation, BLOCK_W=BW)
+                    dout,
+                    conv_pre,
+                    normed,
+                    convw2d,
+                    seg_lo,
+                    seg_hi,
+                    dnormed,
+                    dconvw,
+                    dgated,
+                    T,
+                    W,
+                    K=Kk,
+                    DIL=dilation,
+                    BLOCK_W=BW)
 
             # norm_conv backward: dwc on host, dx via kernel (fp32).
             x_hat = (gated.view(T, n, C) * rstdc.unsqueeze(-1)).view(T, W)
             dwc = (dnormed * x_hat).sum(dim=0).to(wc.dtype)
             dgated_norm = torch.empty(T, W, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_norm_bwd_kernel[(T * n,)](
-                    gated, wc, rstdc, dnormed, dgated_norm, T, N=n, C=C, BLOCK_C=block_c)
+                _ple_norm_bwd_kernel[(T * n, )](gated, wc, rstdc, dnormed, dgated_norm, T, N=n, C=C, BLOCK_C=block_c)
             dgated += dgated_norm
 
             dkey = torch.empty_like(key)
@@ -436,10 +486,26 @@ if HAVE_TRITON:
             dwk_part = torch.empty(T, W, dtype=torch.float32, device=dev)
             dwq_part = torch.empty(T, W, dtype=torch.float32, device=dev)
             if T > 0:
-                _ple_gate_bwd_kernel[(T * n,)](
-                    dgated, key, hc_state, value, wk, wq, gate, rstdk, rstdq,
-                    dkey, dquery, dvalue_pern, dwk_part, dwq_part,
-                    T, N=n, C=C, SQRTC=_math.sqrt(C), BLOCK_C=block_c)
+                _ple_gate_bwd_kernel[(T * n, )](
+                    dgated,
+                    key,
+                    hc_state,
+                    value,
+                    wk,
+                    wq,
+                    gate,
+                    rstdk,
+                    rstdq,
+                    dkey,
+                    dquery,
+                    dvalue_pern,
+                    dwk_part,
+                    dwq_part,
+                    T,
+                    N=n,
+                    C=C,
+                    SQRTC=_math.sqrt(C),
+                    BLOCK_C=block_c)
             dvalue = dvalue_pern.sum(dim=1).to(value.dtype)
             dwk = dwk_part.sum(dim=0).to(wk.dtype)
             dwq = dwq_part.sum(dim=0).to(wq.dtype)
@@ -448,8 +514,8 @@ if HAVE_TRITON:
             return (dquery, dkey, dvalue, dwk, dwq, dwc, dconv_w, None, None, None, None)
 
 
-def ple_gate_conv_triton(hc_state, key, value, norm_key_w, norm_query_w, norm_conv_w, conv1d_weight,
-                         n, eps, dilation, seq_len):
+def ple_gate_conv_triton(hc_state, key, value, norm_key_w, norm_query_w, norm_conv_w, conv1d_weight, n, eps, dilation,
+                         seq_len):
     """Fused PLE increment (gate chain + norm_conv + causal dilated conv + SiLU +
     residual). fp32 accumulation, output dtype = ``hc_state.dtype``.
 
@@ -457,7 +523,5 @@ def ple_gate_conv_triton(hc_state, key, value, norm_key_w, norm_query_w, norm_co
     """
     if not HAVE_TRITON or not hc_state.is_cuda:
         return None
-    return _PLEGateConv.apply(
-        hc_state.contiguous(), key.contiguous(), value.contiguous(),
-        norm_key_w, norm_query_w, norm_conv_w, conv1d_weight,
-        n, eps, dilation, seq_len)
+    return _PLEGateConv.apply(hc_state.contiguous(), key.contiguous(), value.contiguous(), norm_key_w, norm_query_w,
+                              norm_conv_w, conv1d_weight, n, eps, dilation, seq_len)

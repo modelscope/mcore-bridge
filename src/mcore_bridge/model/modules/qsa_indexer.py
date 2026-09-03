@@ -372,4 +372,3 @@ class QSAIndexer(nn.Module):
         tail_idx = torch.where(tail_idx <= token_pos[:, None], tail_idx, tail_idx.new_full((), -1))
 
         return torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
-

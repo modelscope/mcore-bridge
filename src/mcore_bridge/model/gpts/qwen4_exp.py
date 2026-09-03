@@ -7,14 +7,13 @@ from contextlib import contextmanager
 from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.packed_seq_params import PackedSeqParams
-
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
@@ -163,42 +162,35 @@ class Qwen4ExpLayer(TransformerLayer):
         # silently degrading to dense attention (which would diverge from the sparse
         # rollout without telling anyone).
         if not sparse_ok:
-            raise RuntimeError(
-                f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
-                'but QSASparseCoreAttention was not installed -- triton is missing or '
-                f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
-                'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
+            raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
+                               'but QSASparseCoreAttention was not installed -- triton is missing or '
+                               f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
+                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'allgather':
-            raise RuntimeError(
-                f"QSA sparse selection with context_parallel_size={cp_size} requires "
-                f"cp_comm_type='allgather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
-                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
+            raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
+                               f"cp_comm_type='allgather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
+                               'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
-            raise RuntimeError(
-                'QSA sparse selection needs rotary_pos_emb (blocks rotate at their first '
-                'token position) but it was not passed to the layer.')
+            raise RuntimeError('QSA sparse selection needs rotary_pos_emb (blocks rotate at their first '
+                               'token position) but it was not passed to the layer.')
         if is_thd:
-            indices = self._qsa_select_indices_thd(
-                hidden_states, rotary_pos_emb, packed_seq_params, position_ids)
+            indices = self._qsa_select_indices_thd(hidden_states, rotary_pos_emb, packed_seq_params, position_ids)
         else:
             indices = self._qsa_select_indices_sbhd(hidden_states, rotary_pos_emb)
         return indices, True
 
     def _qsa_select_indices_sbhd(self, hidden_states, rotary_pos_emb):
         if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False)
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         if self.config.context_parallel_size > 1:
             hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0)
             rotary_pos_emb = reconstruct_tensor_cp(rotary_pos_emb, None, dim=0)
         return self.self_attention.indexer.selection_as_token_indices(hidden_states, rotary_pos_emb)
 
-    def _qsa_select_indices_thd(self, hidden_states, rotary_pos_emb, packed_seq_params,
-                                position_ids=None):
+    def _qsa_select_indices_thd(self, hidden_states, rotary_pos_emb, packed_seq_params, position_ids=None):
         if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False)
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         psp_for_cp = None
         if self.config.context_parallel_size > 1:
             # TE's packed CP partition (thd_get_partitioned_indices) requires
@@ -222,10 +214,9 @@ class Qwen4ExpLayer(TransformerLayer):
         if self.config.context_parallel_size > 1:
             if fused_table:
                 if position_ids is None:
-                    raise RuntimeError(
-                        'QSA thd selection under CP needs position_ids to index the fused rotary '
-                        'table (apply_rope_fusion=true hands over the raw table, not per-token '
-                        'freqs). Pass position_ids, or set --apply_rope_fusion false.')
+                    raise RuntimeError('QSA thd selection under CP needs position_ids to index the fused rotary '
+                                       'table (apply_rope_fusion=true hands over the raw table, not per-token '
+                                       'freqs). Pass position_ids, or set --apply_rope_fusion false.')
                 pos = reconstruct_tensor_cp(position_ids, psp_for_cp, dim=1)
                 freqs = freqs[pos.reshape(-1)]
             else:
@@ -236,19 +227,17 @@ class Qwen4ExpLayer(TransformerLayer):
             # row i as token i's angle. In a packed batch token i sits at in-document
             # position i - cu[doc], so those angles belong to the wrong positions --
             # silently degrading the selection instead of failing.
-            raise RuntimeError(
-                f'QSA thd selection got a fused rotary table ({freqs.shape[0]} rows for '
-                f'{hidden_states.shape[0]} tokens): apply_rope_fusion=true hands over the raw '
-                'table rather than per-token freqs. Set --apply_rope_fusion false.')
+            raise RuntimeError(f'QSA thd selection got a fused rotary table ({freqs.shape[0]} rows for '
+                               f'{hidden_states.shape[0]} tokens): apply_rope_fusion=true hands over the raw '
+                               'table rather than per-token freqs. Set --apply_rope_fusion false.')
         # the CP reconstruct (like TE's thd kernels) works in the padded pack
         # space, so align against the padded cu when present
         cu = packed_seq_params.cu_seqlens_q_padded
         if cu is None:
             cu = packed_seq_params.cu_seqlens_q
         if cu is None:
-            raise RuntimeError(
-                'QSA thd selection needs packed_seq_params.cu_seqlens_q to find document '
-                'boundaries, but it is missing.')
+            raise RuntimeError('QSA thd selection needs packed_seq_params.cu_seqlens_q to find document '
+                               'boundaries, but it is missing.')
         cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
         hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
         return self.self_attention.indexer.select_token_indices_thd(hidden_tok, freqs, cu)
@@ -265,12 +254,10 @@ class Qwen4ExpLayer(TransformerLayer):
             return None
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
-            raise RuntimeError(
-                'QSA bool-mask selection needs rotary_pos_emb (blocks rotate at their first '
-                'token position) but it was not passed to the layer.')
+            raise RuntimeError('QSA bool-mask selection needs rotary_pos_emb (blocks rotate at their first '
+                               'token position) but it was not passed to the layer.')
         if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
-            hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False)
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
         return indexer.selection_as_mask(hidden_states, rotary_pos_emb)
 
 
@@ -374,10 +361,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         # flag has to be reduced across pp before it can gate the loop below -- that
         # loop runs pp collectives (broadcast_object_list) and export_table_to_hf runs
         # tp ones, and stages disagreeing on whether to enter would deadlock.
-        ple_offloaded = self._reduce_tensor_pp_group(
-            ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
-        skip_ngram_state = not to_mcore and not self._is_saving and (
-            self._peft_format or ple_offloaded)
+        ple_offloaded = self._reduce_tensor_pp_group(ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
+        skip_ngram_state = not to_mcore and not self._is_saving and (self._peft_format or ple_offloaded)
         for buf in () if skip_ngram_state else self._PLE_NGRAM_BUFFERS:
             if to_mcore:
                 buffer = getattr(ple.ple_embedding, buf)

@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -155,7 +154,7 @@ def test_indexer_matches_reference():
                 print(f'    s={s:4d} ratio={ratio} budget={budget}: '
                       f"blocks={n_blocks} selected_keys={nsel} -> {'MATCH' if good else 'MISMATCH'}")
         ok &= good
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 def test_indexer_is_forward_only():
@@ -241,7 +240,7 @@ def test_gated_residual_equivalence():
             ok &= good
             print(f'    combine={use_combine!s:5s} s={s:4d}: fwd={fwd_d:.6g} grad={grad_d:.6g} '
                   f"inj={inj_d:.6g} finite={finite} -> {'OK' if good else 'FAIL'}")
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 # --------------------------------------------------------------------------
@@ -250,6 +249,7 @@ def test_gated_residual_equivalence():
 def test_host_lookup_reference():
     """Single-rank host lookup must equal a plain gather of the same rows."""
     from types import SimpleNamespace
+
     from mcore_bridge.model.modules.ple import Qwen4ExpTextNGramEmbedding
     print('\n[4] host-offload lookup vs plain gather (single rank)')
     torch.manual_seed(11)
@@ -262,12 +262,13 @@ def test_host_lookup_reference():
     d = (got.float() - ref.float()).abs().max().item()
     ok = d <= 1e-5
     print(f'    max diff = {d:.3e} -> {"OK" if ok else "FAIL"}')
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 def test_host_lookup_tp_partition():
     """Each TP rank gathers its own slice; the pieces reassemble the full gather."""
     from types import SimpleNamespace
+
     from mcore_bridge.model.modules.ple import Qwen4ExpTextNGramEmbedding
     print('\n[5] host-offload TP=2 partition reassembly')
     total, head_dim = 1024, 16
@@ -284,7 +285,7 @@ def test_host_lookup_tp_partition():
     d = (acc.float() - ref.float()).abs().max().item()
     ok = d <= 1e-4
     print(f'    max diff = {d:.3e} -> {"OK" if ok else "FAIL"}')
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 # --------------------------------------------------------------------------
@@ -375,7 +376,7 @@ def test_ple_fused_kernel():
         good = rel <= 1e-2
         ok &= good
         print(f'    grad[{names[id(p)]:6s}] relL1={rel:.3e} -> {"OK" if good else "FAIL"}')
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 def test_indexer_indices_match_reference():
@@ -420,7 +421,7 @@ def test_indexer_indices_match_reference():
             print(f'    s={s:4d} ratio={ratio}: allowed set == reference -> '
                   f"{'MATCH' if good else 'MISMATCH'}")
         ok &= good
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 def test_indexer_indices_packed():
@@ -470,7 +471,7 @@ def test_indexer_indices_packed():
         print(f'    doc L={L:3d}: in-doc={in_doc} allowed==per-doc -> '
               f"{'MATCH' if good else 'MISMATCH'}")
         off += L
-    assert ok, "numerical check failed; see printed relL1/diff above"
+    assert ok, 'numerical check failed; see printed relL1/diff above'
 
 
 def test_indexer_mrope_batch():

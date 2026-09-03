@@ -3,14 +3,13 @@ import copy
 import math
 import torch
 import torch.nn.functional as F
+from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
 from torch import nn
 from typing import List, Optional
-
-from megatron.core import parallel_state
 
 from ...utils import get_env_args, get_logger
 from ...utils.megatron_utils import reconstruct_tensor_cp, split_cp_inputs
@@ -118,7 +117,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         ple_seed = getattr(config, 'ple_seed', None)
         if ple_seed is None:
             raise ValueError('ple_seed must be provided by the model config (the parser derives it from '
-                             "text_config.seed); a silently substituted default would desynchronize the "
+                             'text_config.seed); a silently substituted default would desynchronize the '
                              'n-gram hash multipliers from transformers.')
         if eos_token_id is None or split_ngram_parts is None:
             raise ValueError(f'eos_token_id/split_ngram_parts must be provided by the model '

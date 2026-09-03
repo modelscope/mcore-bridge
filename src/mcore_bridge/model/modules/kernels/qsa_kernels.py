@@ -57,8 +57,7 @@ def _cp_query_global_positions(seq_len: int, cp_size: int, cp_rank: int, device)
     return torch.cat((front, back), dim=0)
 
 
-def _cp_query_global_positions_thd(cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int,
-                                   device) -> torch.Tensor:
+def _cp_query_global_positions_thd(cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, device) -> torch.Tensor:
     """Local packed-token positions per sample under zigzag thd CP sharding.
 
     Each sample is padded to a multiple of ``2 * cp_size`` by the data pipeline;
@@ -89,7 +88,6 @@ def _cp_gathered_to_logical_order(seq_len: int, cp_size: int, device) -> torch.T
     return torch.cat([torch.arange(c * chunk, (c + 1) * chunk, device=device) for c in order])
 
 
-
 def qsa_sparse_attention_thd(q, k, v, indices, scale, block_size):
     """``q`` [T, Hq, D], ``k``/``v`` [S, Hkv, D], ``indices`` [T, K] (-1 pad).
 
@@ -102,10 +100,9 @@ def qsa_sparse_attention_thd(q, k, v, indices, scale, block_size):
     note in qsa_block_sparse_attn.py.
     """
     if not HAVE_TRITON or not q.is_cuda:
-        raise RuntimeError(
-            'QSA sparse attention requires triton and CUDA tensors '
-            f'(HAVE_TRITON={HAVE_TRITON}, q.is_cuda={q.is_cuda}). This path is only '
-            'selected for packing (thd) or CP>1, where no dense fallback is correct.')
+        raise RuntimeError('QSA sparse attention requires triton and CUDA tensors '
+                           f'(HAVE_TRITON={HAVE_TRITON}, q.is_cuda={q.is_cuda}). This path is only '
+                           'selected for packing (thd) or CP>1, where no dense fallback is correct.')
     if q.shape[-1] & (q.shape[-1] - 1):
         raise RuntimeError(f'QSA sparse attention needs a power-of-two head dim, got {q.shape[-1]}.')
     if q.shape[0] != k.shape[0]:
@@ -113,8 +110,7 @@ def qsa_sparse_attention_thd(q, k, v, indices, scale, block_size):
         # then `offs_k < T`), so unequal lengths would silently drop every key past
         # len(q). Callers must equalise first -- _forward_cp does this by scattering
         # the local query shard into a full-length buffer.
-        raise ValueError(
-            f'QSA sparse attention needs len(q) == len(k), got {q.shape[0]} vs {k.shape[0]}.')
+        raise ValueError(f'QSA sparse attention needs len(q) == len(k), got {q.shape[0]} vs {k.shape[0]}.')
     return qsa_sparse_attention_from_indices(q, k, v, indices.contiguous(), scale, block_size)
 
 
@@ -141,10 +137,9 @@ def qsa_sparse_attention(q, k, v, indices, scale, block_size):
     # The offset is a whole multiple of sk, so block alignment survives it only
     # when sk % block_size == 0; guard rather than corrupt the selection.
     if sk % block_size:
-        raise ValueError(
-            f'sbhd QSA needs the kv sequence length ({sk}) to be a multiple of '
-            f'block_size ({block_size}); otherwise flattening to token space shifts '
-            'each sample off the block grid the kernel indexes by.')
+        raise ValueError(f'sbhd QSA needs the kv sequence length ({sk}) to be a multiple of '
+                         f'block_size ({block_size}); otherwise flattening to token space shifts '
+                         'each sample off the block grid the kernel indexes by.')
     q_f = q.permute(1, 0, 2, 3).reshape(b * s, hq, d)
     k_f = k.permute(1, 0, 2, 3).reshape(b * sk, *k.shape[2:])
     v_f = v.permute(1, 0, 2, 3).reshape(b * sk, *v.shape[2:])
@@ -184,12 +179,18 @@ class QSASparseCoreAttention(torch.nn.Module):
         # its top-k blocks with -- see the contract in qsa_block_sparse_attn.py.
         self.block_size = config.indexer_compress_ratio
         if not self.block_size:
-            raise ValueError(
-                'QSASparseCoreAttention needs config.indexer_compress_ratio to size the '
-                f'kernel block grid, got {self.block_size!r}.')
+            raise ValueError('QSASparseCoreAttention needs config.indexer_compress_ratio to size the '
+                             f'kernel block grid, got {self.block_size!r}.')
 
-    def forward(self, query, key, value, attention_mask, attn_mask_type=None,
-                attention_bias=None, packed_seq_params=None, **kwargs):
+    def forward(self,
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=None,
+                attention_bias=None,
+                packed_seq_params=None,
+                **kwargs):
         if attention_mask is not None and attention_mask.dtype in (torch.int32, torch.int64):
             scale = self.softmax_scale if self.softmax_scale is not None else query.shape[-1]**-0.5
             cp_size = self.config.context_parallel_size
@@ -204,8 +205,14 @@ class QSASparseCoreAttention(torch.nn.Module):
                 out = out.reshape(out.shape[0], out.shape[1], -1)
             return out
         return self.core_attention(
-            query, key, value, attention_mask, attn_mask_type=attn_mask_type,
-            attention_bias=attention_bias, packed_seq_params=packed_seq_params, **kwargs)
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            **kwargs)
 
     def _forward_cp(self, query, key, value, indices, scale, packed_seq_params):
         from megatron.core import mpu
@@ -217,13 +224,13 @@ class QSASparseCoreAttention(torch.nn.Module):
         if thd:
             # the gathered k/v live in the padded pack space, so the query
             # positions must come from the padded cu as well
-            cu_q = (packed_seq_params.cu_seqlens_q_padded
-                    if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q)
+            cu_q = (
+                packed_seq_params.cu_seqlens_q_padded
+                if packed_seq_params.cu_seqlens_q_padded is not None else packed_seq_params.cu_seqlens_q)
             q_pos = _cp_query_global_positions_thd(cu_q, cp_size, cp_rank, device)
             # rank-major gathered positions -> permutation back to global packed
             # order (same construction as mcore DSA's packed kv reorder)
-            gathered_pos = torch.cat([
-                _cp_query_global_positions_thd(cu_q, cp_size, r, device) for r in range(cp_size)])
+            gathered_pos = torch.cat([_cp_query_global_positions_thd(cu_q, cp_size, r, device) for r in range(cp_size)])
             kv_reorder = torch.argsort(gathered_pos)
         else:
             sq, b = query.shape[0], query.shape[1]
@@ -237,8 +244,7 @@ class QSASparseCoreAttention(torch.nn.Module):
         kv_reorder_t = kv_reorder
 
         def _gather_full(t):
-            g = gather_from_sequence_parallel_region(
-                t, tensor_parallel_output_grad=True, group=cp_group)
+            g = gather_from_sequence_parallel_region(t, tensor_parallel_output_grad=True, group=cp_group)
             return g.index_select(0, kv_reorder_t)
 
         key_full = _gather_full(key)
@@ -251,9 +257,8 @@ class QSASparseCoreAttention(torch.nn.Module):
         # skips, so they cost tile launches but produce nothing.
         if thd:
             local_idx = indices[q_pos]
-            out_full = qsa_sparse_attention(
-                *self._scatter_q_to_full(query, key_full, value_full, local_idx, q_pos),
-                scale, self.block_size)
+            out_full = qsa_sparse_attention(*self._scatter_q_to_full(query, key_full, value_full, local_idx, q_pos),
+                                            scale, self.block_size)
             return out_full.index_select(0, q_pos)
         # sbhd: token-space kernel on the batch-major flattening (t = r*sk + p)
         local_idx = indices[:, q_pos]
@@ -265,8 +270,7 @@ class QSASparseCoreAttention(torch.nn.Module):
         q_f = query.permute(1, 0, 2, 3).reshape(sq * b, query.shape[2], query.shape[3])
         # batch-major token ids of this rank's rows: sample r contributes q_pos + r*sk
         rows = (q_pos[None, :] + torch.arange(b, device=device).view(b, 1) * sk).reshape(-1)
-        out_f = qsa_sparse_attention(
-            *self._scatter_q_to_full(q_f, k_f, v_f, idx_f, rows), scale, self.block_size)
+        out_f = qsa_sparse_attention(*self._scatter_q_to_full(q_f, k_f, v_f, idx_f, rows), scale, self.block_size)
         out_f = out_f.index_select(0, rows)
         return out_f.view(b, sq, query.shape[2], query.shape[3]).permute(1, 0, 2, 3)
 
@@ -283,4 +287,3 @@ class QSASparseCoreAttention(torch.nn.Module):
         idx_full = indices.new_full((n, indices.shape[1]), -1)
         idx_full = idx_full.index_copy(0, rows, indices)
         return q_full, k, v, idx_full
-
