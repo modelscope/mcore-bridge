@@ -3,20 +3,33 @@ import copy
 import math
 import torch
 import torch.nn.functional as F
+from megatron.core import parallel_state
+from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
 from torch import nn
 from typing import List, Optional
 
+from ...utils import get_env_args, get_logger
 from ...utils.megatron_utils import reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
+from .kernels import gather_ple_rows, ple_gate_conv_triton
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
+
+
+def use_ple_cpu_offload() -> bool:
+    return get_env_args('PLE_CPU_OFFLOAD', bool, False)
+
+
+def use_ple_fused_kernel() -> bool:
+    # On by default; PLE_FUSED_KERNEL=0 forces the eager chain.
+    return get_env_args('PLE_FUSED_KERNEL', bool, True)
 
 
 def _splitmix64(value: int) -> int:
@@ -99,17 +112,24 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         # validates them for qwen4_exp); a silently substituted default would
         # corrupt the weight conversion. (transformers reads eos_token_id
         # directly and has no split_ngram_parts: its table is replicated.)
-        eos_token_id = getattr(config, 'eos_token_id', None)
+        eos_token_id = config.eos_token_id
+        split_ngram_parts = config.split_ngram_parts
         ple_seed = getattr(config, 'ple_seed', None)
-        split_ngram_parts = getattr(config, 'split_ngram_parts', None)
-        if eos_token_id is None or ple_seed is None or split_ngram_parts is None:
-            raise ValueError(f'eos_token_id/ple_seed/split_ngram_parts must be provided by the model '
-                             f'config (got {eos_token_id!r}/{ple_seed!r}/{split_ngram_parts!r}).')
+        if ple_seed is None:
+            raise ValueError('ple_seed must be provided by the model config (the parser derives it from '
+                             'text_config.seed); a silently substituted default would desynchronize the '
+                             'n-gram hash multipliers from transformers.')
+        if eos_token_id is None or split_ngram_parts is None:
+            raise ValueError(f'eos_token_id/split_ngram_parts must be provided by the model '
+                             f'config (got {eos_token_id!r}/{split_ngram_parts!r}).')
         self.eos_token_id = int(eos_token_id)
         self.split_ngram_parts = int(split_ngram_parts)
         self.head_dim = head_dim_per_ngram  # mcore-specific: the bridge weight conversion reads it off the module.
 
-        # Multipliers (splitmix64 derived, checkpoint-persistent).
+        # Multipliers (splitmix64 derived, checkpoint-persistent). The seed comes
+        # from the config (parser defaults it to Qwen4ExpTextConfig.seed's 1234);
+        # the multipliers must stay bit-identical to transformers or the n-gram
+        # lookups desynchronize.
         multipliers = _build_layer_multipliers(config.padded_vocab_size, self.ngram_size, self.ple_layer_index,
                                                int(ple_seed))
         self.register_buffer('layer_multipliers', torch.tensor(multipliers, dtype=torch.long), persistent=True)
@@ -130,13 +150,81 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         self.register_buffer('ngram_heads_offsets', torch.tensor(self.head_offsets, dtype=torch.long), persistent=True)
         ngram_vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / ngram_vocab_divisor) * ngram_vocab_divisor
-        # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
-        self.ngram_embedding = VocabParallelEmbedding(
-            padded_vocab_size,
-            head_dim_per_ngram,
-            init_method=torch.nn.init.normal_,
-            config=config,
-        )
+        self.padded_vocab_size = padded_vocab_size
+        self.cpu_offload = use_ple_cpu_offload()
+        if self.cpu_offload:
+            # Warn rather than raise: whether this is safe depends on the train type,
+            # which the model config does not carry (see use_ple_cpu_offload).
+            get_logger().warning_once('PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
+                                      'gradient, so it stays frozen.')
+            self._init_host_table(config, padded_vocab_size, head_dim_per_ngram)
+        else:
+            # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
+            self.ngram_embedding = VocabParallelEmbedding(
+                padded_vocab_size,
+                head_dim_per_ngram,
+                init_method=torch.nn.init.normal_,
+                config=config,
+            )
+
+    def fill_table_from_hf(self, hf_state_dict):
+        """Populate the (local TP partition of the) n-gram table from the HF
+        checkpoint shards at load time.
+        """
+        total = self.padded_vocab_size
+        parts = self.split_ngram_parts
+        shard_size = (total + parts - 1) // parts
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        if self.cpu_offload:
+            tp_start, tp_end = self.vocab_start, self.vocab_end
+            dtype = self.host_table.dtype
+        else:
+            emb = self.ngram_embedding
+            per_partition = emb.num_embeddings_per_partition
+            tp_start = tp_rank * per_partition
+            tp_end = min((tp_rank + 1) * per_partition, total)
+            dtype = emb.weight.dtype
+        for i in range(parts):
+            key = f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'
+            if key not in hf_state_dict:
+                continue
+            cs, ce = i * shard_size, min((i + 1) * shard_size, total)
+            s, e = max(cs, tp_start), min(ce, tp_end)
+            if s >= e:
+                continue
+            weight = hf_state_dict[key].load()
+            if self.cpu_offload:
+                self.host_table[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(
+                    dtype=dtype, device=self.host_table.device)
+            else:
+                emb.weight.data[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(dtype)
+
+    @torch.no_grad()
+    def export_table_to_hf(self, hf_state_dict, prefix=''):
+        """Reverse of ``fill_table_from_hf``: write the offloaded table back as HF
+        shards so a full-parameter checkpoint is self-contained.
+        """
+        if not self.cpu_offload:
+            return
+        total = self.padded_vocab_size
+        parts = self.split_ngram_parts
+        shard_size = (total + parts - 1) // parts
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        for i in range(parts):
+            cs, ce = i * shard_size, min((i + 1) * shard_size, total)
+            # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
+            # CPU. Each rank scatters its owned rows into a full shard, sums across
+            # TP (rows are disjoint, so sum == gather), then rank 0 keeps the CPU copy.
+            device = torch.cuda.current_device()
+            local = torch.zeros(ce - cs, self.host_table.shape[-1], dtype=self.host_table.dtype, device=device)
+            s, e = max(cs, self.vocab_start), min(ce, self.vocab_end)
+            if s < e:
+                local[s - cs:e - cs] = self.host_table[s - self.vocab_start:e - self.vocab_start].to(device)
+            if self._tp_size > 1:
+                torch.distributed.all_reduce(local, group=tp_group)
+            if tp_rank == 0:
+                hf_state_dict[f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = local.cpu()
 
     def _shift_right_ignore_eos(self, token_ids: torch.Tensor, shift: int) -> torch.Tensor:
         # Mirrors transformers `_shift_right_ignore_eos`: segment-aware shift,
@@ -189,7 +277,41 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             blocks.append(ngram_ids + head_offsets.view(1, 1, -1))
 
         ngram_ids = torch.cat(blocks, dim=-1)[:, -input_ids.shape[1]:]
+        if self.cpu_offload:
+            return self._host_lookup(ngram_ids)
         return self.ngram_embedding(ngram_ids).flatten(-2)
+
+    def _init_host_table(self, config, padded_vocab_size, head_dim):
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        per_partition = (padded_vocab_size + tp_size - 1) // tp_size
+        self.vocab_start = tp_rank * per_partition
+        self.vocab_end = min(padded_vocab_size, self.vocab_start + per_partition)
+        n_local = max(0, self.vocab_end - self.vocab_start)
+        self.host_table = torch.empty(n_local, head_dim, dtype=config.params_dtype, pin_memory=True)
+        self._tp_size = tp_size
+        self._tp_group = parallel_state.get_tensor_model_parallel_group()
+
+    def _host_lookup(self, ngram_ids):
+        # ngram_ids: [rows, L, nH] global ids in [0, padded_vocab_size).
+        # Triton fast path reads rows straight out of the pinned host table;
+        # otherwise fall back to a torch gather. Either way, all-reduce across
+        # TP (partitions are disjoint, so the sum is the full embedding).
+        rows = gather_ple_rows(self.host_table, ngram_ids.reshape(-1), self.vocab_start, self.vocab_end)
+        if rows is not None:
+            rows = rows.view(*ngram_ids.shape, self.host_table.shape[-1])
+            if self._tp_size > 1:
+                torch.distributed.all_reduce(rows, group=self._tp_group)
+            return rows.flatten(-2)
+        ids_cpu = ngram_ids.detach().to('cpu')
+        local_mask = (ids_cpu >= self.vocab_start) & (ids_cpu < self.vocab_end)
+        local_ids = (ids_cpu - self.vocab_start).clamp(0, max(self.host_table.shape[0] - 1, 0))
+        rows = self.host_table[local_ids]  # [rows, L, nH, head_dim]
+        rows = rows * local_mask.unsqueeze(-1).to(rows.dtype)
+        rows = rows.to(ngram_ids.device, non_blocking=True)
+        if self._tp_size > 1:
+            torch.distributed.all_reduce(rows, group=self._tp_group)
+        return rows.flatten(-2)
 
 
 class Qwen4ExpTextPLELayer(nn.Module):
@@ -223,8 +345,26 @@ class Qwen4ExpTextPLELayer(nn.Module):
         conv_dilation = int(config.ngram_size)
         self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation
         # Replicated projections in params_dtype.
-        self.key_proj = nn.Linear(ple_embed_dim, hc_hidden_size, bias=False, dtype=config.params_dtype)
-        self.value_proj = nn.Linear(ple_embed_dim, self.hidden_size, bias=False, dtype=config.params_dtype)
+        self.key_proj = TELinear(
+            input_size=ple_embed_dim,
+            output_size=hc_hidden_size,
+            parallel_mode='duplicated',
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=True,
+            skip_weight_param_allocation=False,
+        )
+        self.value_proj = TELinear(
+            input_size=ple_embed_dim,
+            output_size=self.hidden_size,
+            parallel_mode='duplicated',
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=True,
+            skip_weight_param_allocation=False,
+        )
         # mcore's config field layernorm_epsilon corresponds to HF's rms_norm_eps;
         # the grouped norm is the mcore subclass adding dtype/SP-flag construction.
         self.norm_key = Qwen4ExpTextGroupedRMSNorm(
@@ -276,8 +416,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """Mirrors transformers ``Qwen4ExpTextPLELayer.forward`` (training
         variant); hidden_states/input_ids: [rows, L, nH]/[rows, L]."""
         embeddings = self.ple_embedding(input_ids)  # mcore-specific: no past_key_values cache arg
-        key_normed = self.norm_key(self.key_proj(embeddings)).unflatten(-1, (self.hc_count, self.hidden_size))
-        value = self.value_proj(embeddings)
+        if use_ple_fused_kernel() and embeddings.device.type != 'cpu':
+            fused = self._compute_fused(hidden_states, embeddings)
+            if fused is not None:
+                return fused
+        key_normed = self.norm_key(self.key_proj(embeddings)[0]).unflatten(-1, (self.hc_count, self.hidden_size))
+        value = self.value_proj(embeddings)[0]
         query_normed = self.norm_query(hidden_states).unflatten(-1, (self.hc_count, self.hidden_size))
         gate = (key_normed * query_normed).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
@@ -288,6 +432,31 @@ class Qwen4ExpTextPLELayer(nn.Module):
         # loss mask instead.)
         output = gated_value + self._short_conv(gated_value_normed)
         return output
+
+    def _compute_fused(self, hidden_states: torch.Tensor, embeddings: torch.Tensor):
+        """Fused triton chain (gate + norm_conv + causal conv + SiLU + residual);
+        fp32 accumulation, output dtype = params_dtype. Returns None when the
+        kernel path is unavailable so the caller falls back to torch."""
+        rows, seq_len = embeddings.shape[:2]
+        key = self.key_proj(embeddings)[0].reshape(rows * seq_len, -1)
+        value = self.value_proj(embeddings)[0].reshape(rows * seq_len, -1)
+        query = hidden_states.reshape(rows * seq_len, -1)
+        out = ple_gate_conv_triton(
+            query,
+            key,
+            value,
+            self.norm_key.weight,
+            self.norm_query.weight,
+            self.norm_conv.weight,
+            self.conv1d.weight,
+            self.hc_count,
+            self.config.layernorm_epsilon,
+            int(self.config.ngram_size),
+            seq_len,
+        )
+        if out is None:
+            return None
+        return out.view(rows, seq_len, -1)
 
     @staticmethod
     def _normalize_cu_seqlens(cu: Optional[torch.Tensor], total: int) -> Optional[torch.Tensor]:
@@ -327,9 +496,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
         sequence, and the additive output is scattered back.
         """
         sp_on = (
-            self.pg_collection is not None and getattr(self.config, 'sequence_parallel', False)
-            and getattr(self.config, 'tensor_model_parallel_size', 1) > 1)
-        cp_on = getattr(self.config, 'context_parallel_size', 1) > 1
+            self.pg_collection is not None and self.config.sequence_parallel
+            and self.config.tensor_model_parallel_size > 1)
+        cp_on = self.config.context_parallel_size > 1
         if not (sp_on or cp_on):
             return self._forward_impl(hidden_states, input_ids, packed_seq_params)
 
@@ -383,11 +552,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
         if thd:
             num_samples = packed_seq_params.num_samples
-            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
-            # normalizes it to int, so `.item()` would raise AttributeError;
-            # tolerate a 0-d tensor from other callers.
-            max_seqlen_q = packed_seq_params.max_seqlen_q
-            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
+            max_len = int(packed_seq_params.max_seqlen_q)
             cu = packed_seq_params.cu_seqlens_q
             total = hidden_states.shape[0]
             hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))

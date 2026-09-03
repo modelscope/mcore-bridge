@@ -5,10 +5,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from copy import deepcopy
-from megatron.core import mpu
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -16,10 +17,11 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
-from mcore_bridge.utils import get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
-from ..modules import (GatedDeltaNet, QSAIndexer, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
-                       TransformerLayer)
+from ..modules import (GatedDeltaNet, QSAIndexer, QSASparseCoreAttention, Qwen4ExpTextGatedResidual,
+                       Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer, qsa_sparse_supported)
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -42,7 +44,7 @@ class Qwen4ExpGDN(GatedDeltaNet):
         x = x.reshape(-1, x.shape[-1])
         y = self.out_norm(x)
         gate = gate.reshape(-1, gate.shape[-1])
-        output_gate_type = getattr(self.config, 'output_gate_type', None)
+        output_gate_type = self.config.output_gate_type
         gate_act = torch.sigmoid if output_gate_type == 'sigmoid' else F.silu
         y = y * gate_act(gate.float())
         return y.to(x_dtype)
@@ -57,14 +59,18 @@ class Qwen4ExpLayer(TransformerLayer):
             self.ple = Qwen4ExpTextPLELayer(
                 config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
         is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
-        if not is_linear_attention and getattr(config, 'indexer_n_heads', None) is not None:
+        if not is_linear_attention and config.indexer_n_heads is not None:
             self.self_attention.indexer = QSAIndexer(config)
+            if qsa_sparse_supported(config.kv_channels or 0):
+                attn = self.self_attention
+                attn.core_attention = QSASparseCoreAttention(
+                    attn.core_attention, config, softmax_scale=getattr(config, 'softmax_scale', None))
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         attention_mask = kwargs.get('attention_mask')
-        packed_seq_params = kwargs.get('packed_seq_params')
+        packed_seq_params: PackedSeqParams = kwargs.get('packed_seq_params')
         attn_kwargs = dict(
             attention_mask=attention_mask,
             inference_context=kwargs.get('inference_context'),
@@ -82,11 +88,14 @@ class Qwen4ExpLayer(TransformerLayer):
 
         # attention sub-block (mirrors transformers Qwen4ExpTextDecoderLayer.forward)
         hidden_states, hyper_input, injection_weights = self.attn_hyper_connection(hidden_states)
-        qsa_mask = self._qsa_select_mask(hidden_states, attn_kwargs)
-        if qsa_mask is not None:
-            # failed to full atention
-            attn_kwargs = dict(attn_kwargs, attention_mask=qsa_mask)
-        with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(qsa_mask is not None):
+        qsa_selection, sparse = self._qsa_select(hidden_states, attn_kwargs, kwargs.get('position_ids'))
+        if qsa_selection is not None:
+            # sparse: int64 indices consumed by QSASparseCoreAttention; mask
+            # fallback: bool mask consumed by TE under attn_mask_type=arbitrary.
+            attn_kwargs = dict(attn_kwargs, attention_mask=qsa_selection)
+        # `arbitrary` mask type is only needed for the bool-mask (TE) path; the
+        # sparse kernel reads the indices and ignores attn_mask_type.
+        with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(qsa_selection is not None and not sparse):
             hidden_states, _ = self.self_attention(hidden_states=hidden_states, **attn_kwargs)
         injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
         hidden_states = hyper_input + injection.flatten(-2)
@@ -126,35 +135,130 @@ class Qwen4ExpLayer(TransformerLayer):
             for t, old in saved:
                 t.attn_mask_type = old
 
-    def _warn_qsa_fallback_once(self, reason: str) -> None:
-        # warning_once dedupes on the message, so every QSA layer can call this and
-        # the user still sees it exactly once per distinct reason.
-        get_logger().warning_once(f'QSA sparse selection disabled: {reason}')
+    def _qsa_select(self, hidden_states, attn_kwargs, position_ids=None):
+        """Choose the QSA selection representation for this forward.
+
+        Returns ``(selection, is_sparse)``. ``is_sparse`` means ``selection`` is the
+        int64 index tensor consumed by ``QSASparseCoreAttention`` (sbhd and thd,
+        with or without SP/CP); otherwise it is the bool TE mask from the legacy
+        path, or ``None`` for full attention. CP needs the allgather comm type
+        (the selection has to see every key before attention runs; ring/p2p
+        cannot provide that), mirroring mcore DSA's restriction.
+        """
+        indexer = getattr(self.self_attention, 'indexer', None)
+        sparse_ok = isinstance(getattr(self.self_attention, 'core_attention', None), QSASparseCoreAttention)
+        if indexer is None:
+            return None, False
+        packed_seq_params: PackedSeqParams = attn_kwargs.get('packed_seq_params')
+        is_thd = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+        cp_size = self.config.context_parallel_size
+        needs_kernel = is_thd or cp_size > 1
+
+        # sbhd with CP==1
+        if not needs_kernel:
+            return self._qsa_select_mask(hidden_states, attn_kwargs), False
+
+        # From here the mask path is not an option, so every failure raises instead of
+        # silently degrading to dense attention (which would diverge from the sparse
+        # rollout without telling anyone).
+        if not sparse_ok:
+            raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
+                               'but QSASparseCoreAttention was not installed -- triton is missing or '
+                               f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
+                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
+        if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'allgather':
+            raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
+                               f"cp_comm_type='allgather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
+                               'selection has to see every key before attention runs, which ring/p2p cannot provide.')
+        rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
+        if rotary_pos_emb is None:
+            raise RuntimeError('QSA sparse selection needs rotary_pos_emb (blocks rotate at their first '
+                               'token position) but it was not passed to the layer.')
+        if is_thd:
+            indices = self._qsa_select_indices_thd(hidden_states, rotary_pos_emb, packed_seq_params, position_ids)
+        else:
+            indices = self._qsa_select_indices_sbhd(hidden_states, rotary_pos_emb)
+        return indices, True
+
+    def _qsa_select_indices_sbhd(self, hidden_states, rotary_pos_emb):
+        if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
+        if self.config.context_parallel_size > 1:
+            hidden_states = reconstruct_tensor_cp(hidden_states, None, dim=0)
+            rotary_pos_emb = reconstruct_tensor_cp(rotary_pos_emb, None, dim=0)
+        return self.self_attention.indexer.selection_as_token_indices(hidden_states, rotary_pos_emb)
+
+    def _qsa_select_indices_thd(self, hidden_states, rotary_pos_emb, packed_seq_params, position_ids=None):
+        if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
+        psp_for_cp = None
+        if self.config.context_parallel_size > 1:
+            # TE's packed CP partition (thd_get_partitioned_indices) requires
+            # int32 cu; the training pipeline produces int32, but normalize callers
+            # that hand us int64.
+            if packed_seq_params.cu_seqlens_q is not None \
+                    and packed_seq_params.cu_seqlens_q.dtype != torch.int32:
+                psp_for_cp = copy.copy(packed_seq_params)
+                psp_for_cp.cu_seqlens_q = packed_seq_params.cu_seqlens_q.to(torch.int32)
+                if packed_seq_params.cu_seqlens_q_padded is not None:
+                    psp_for_cp.cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded.to(torch.int32)
+            else:
+                psp_for_cp = packed_seq_params
+            hidden_states = reconstruct_tensor_cp(hidden_states, psp_for_cp, dim=0)
+        # Per-token rotary angles. Without rope fusion gpt_model already indexes
+        # the freq table by position_ids, so what arrives is per-token (zigzag-
+        # sharded under CP -- undo it like hidden). With fusion the raw table
+        # arrives and must be indexed by the (CP-reconstructed) per-doc ids.
+        freqs = rotary_pos_emb
+        fused_table = freqs.shape[0] != hidden_states.shape[0]
+        if self.config.context_parallel_size > 1:
+            if fused_table:
+                if position_ids is None:
+                    raise RuntimeError('QSA thd selection under CP needs position_ids to index the fused rotary '
+                                       'table (apply_rope_fusion=true hands over the raw table, not per-token '
+                                       'freqs). Pass position_ids, or set --apply_rope_fusion false.')
+                pos = reconstruct_tensor_cp(position_ids, psp_for_cp, dim=1)
+                freqs = freqs[pos.reshape(-1)]
+            else:
+                freqs = reconstruct_tensor_cp(freqs, psp_for_cp, dim=0)
+        elif fused_table:
+            # Same problem without CP, and here there is no reconstruct step to hide
+            # behind: the indexer would slice the raw table's first T rows, treating
+            # row i as token i's angle. In a packed batch token i sits at in-document
+            # position i - cu[doc], so those angles belong to the wrong positions --
+            # silently degrading the selection instead of failing.
+            raise RuntimeError(f'QSA thd selection got a fused rotary table ({freqs.shape[0]} rows for '
+                               f'{hidden_states.shape[0]} tokens): apply_rope_fusion=true hands over the raw '
+                               'table rather than per-token freqs. Set --apply_rope_fusion false.')
+        # the CP reconstruct (like TE's thd kernels) works in the padded pack
+        # space, so align against the padded cu when present
+        cu = packed_seq_params.cu_seqlens_q_padded
+        if cu is None:
+            cu = packed_seq_params.cu_seqlens_q
+        if cu is None:
+            raise RuntimeError('QSA thd selection needs packed_seq_params.cu_seqlens_q to find document '
+                               'boundaries, but it is missing.')
+        cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
+        hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
+        return self.self_attention.indexer.select_token_indices_thd(hidden_tok, freqs, cu)
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
-        # return None means full attention
-        # TODO: support padding_free & cp
+        # Bool-mask QSA on TE's `arbitrary` mask. Only reached for sbhd with CP==1 --
+        # _qsa_selection() routes thd and CP>1 to the kernel, because TE rejects an
+        # arbitrary mask under thd and this path never gathers keys across CP ranks.
+        # Returning None means full attention, which here only happens when the
+        # sequence is short enough that selection is a no-op anyway (selection_as_mask
+        # short-circuits at max_blocks <= block_topk).
         indexer = getattr(self.self_attention, 'indexer', None)
         if indexer is None:
             return None
-        if attn_kwargs.get('packed_seq_params') is not None:
-            self._warn_qsa_fallback_once(
-                'packing/padding_free is enabled (qkv_format=thd), which TE cannot combine with a '
-                'custom attention mask. QSA layers fall back to full attention -- training will '
-                'differ from sparse inference beyond the indexer budget. Pass `--padding_free false` '
-                'to enable QSA sparse selection.')
-            return None
-        if self.config.context_parallel_size > 1:
-            self._warn_qsa_fallback_once(
-                f'context_parallel_size={self.config.context_parallel_size} > 1 is not supported by '
-                'the QSA indexer yet (block pooling needs keys from other CP ranks). QSA layers fall '
-                'back to full attention -- training will differ from sparse inference beyond the '
-                'indexer budget.')
-            return None
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
-            return None
-        return indexer.select_mask(hidden_states, rotary_pos_emb)
+            raise RuntimeError('QSA bool-mask selection needs rotary_pos_emb (blocks rotate at their first '
+                               'token position) but it was not passed to the layer.')
+        if self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1:
+            hidden_states = gather_from_sequence_parallel_region(hidden_states, tensor_parallel_output_grad=False)
+        return indexer.selection_as_mask(hidden_states, rotary_pos_emb)
 
 
 class Qwen4ExpTransformerBlock(TransformerBlock):
@@ -162,8 +266,9 @@ class Qwen4ExpTransformerBlock(TransformerBlock):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         config = self.config
-        hc_count = getattr(config, 'hc_count', 0) or 0
-        if hc_count > 1 and self.has_final_layernorm_in_this_stage():
+        if config.hc_count is None:
+            raise ValueError('Qwen4Exp requires config.hc_count (checkpoint has hc_count=4).')
+        if config.hc_count > 1 and self.has_final_layernorm_in_this_stage():
             # Final contraction (use_combine=False matches the checkpoint:
             # hyper_connection_mixer has no block_inject_weight).
             self.hyper_connection_mixer = Qwen4ExpTextGatedResidual(config, use_combine=False)
@@ -221,14 +326,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                 self._set_state_dict(hyper_connection, weight_key, hf_state_dict, f'{key}.{weight_key}', to_mcore)
 
     # --- PLE -----------------------------------------------------------------
-    # (mcore attribute name, hf checkpoint suffix). Both sides now use the
-    # transformers buffer names; the table is kept so these buffers stay on
-    # the dedicated PLE conversion path (pp broadcast, no TP split).
-    _PLE_NGRAM_BUFFERS = (
-        ('layer_multipliers', 'layer_multipliers'),
-        ('ngram_heads_offsets', 'ngram_heads_offsets'),
-        ('ngram_heads_vocab_sizes', 'ngram_heads_vocab_sizes'),
-    )
+    _PLE_NGRAM_BUFFERS = ('layer_multipliers', 'ngram_heads_offsets', 'ngram_heads_vocab_sizes')
 
     def _get_tp_split_dim(self, mg_key):
         # PLE weights are replicated across TP; in particular `conv1d.weight`
@@ -243,65 +341,6 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if self.pp_size > 1:
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())
-
-    def _set_ple_ngram_embedding(self, ple, hf_state_dict, to_mcore: bool, pp_src_rank: int):
-        # The checkpoint shards the (padded) table into `parts` uniform row
-        # blocks, so shard boundaries must be derived from the padded size.
-        total = parts = dim = None
-        if ple is not None:
-            total = ple.ple_embedding.ngram_embedding.num_embeddings
-            parts = ple.ple_embedding.split_ngram_parts
-            dim = ple.ple_embedding.head_dim
-        if not to_mcore and self.pp_size > 1:
-            obj = [(total, parts, dim)]
-            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
-            total, parts, dim = obj[0]
-        if to_mcore and ple is None:
-            return
-        shard_size = (total + parts - 1) // parts
-        tp_size = mpu.get_tensor_model_parallel_world_size()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
-        tp_ranks = dist.get_process_group_ranks(self.tp_group)
-        emb = ple.ple_embedding.ngram_embedding if ple is not None else None
-        dtype = emb.weight.dtype if emb is not None else self.config.params_dtype
-        device = emb.weight.device if emb is not None else torch.cuda.current_device()
-        per_partition = (emb.num_embeddings_per_partition if emb is not None else (total + tp_size - 1) // tp_size)
-        tp_start = tp_rank * per_partition if emb is not None else 0
-        tp_end = min((tp_rank + 1) * per_partition, total) if emb is not None else 0
-        if to_mcore:
-            for i in range(parts):
-                key = f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'
-                if key not in hf_state_dict:
-                    continue
-                cs, ce = i * shard_size, min((i + 1) * shard_size, total)
-                s, e = max(cs, tp_start), min(ce, tp_end)
-                if s < e:
-                    weight = hf_state_dict[key].load()
-                    emb.weight.data[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(emb.weight.dtype)
-        else:
-            for i in range(parts):
-                cs, ce = i * shard_size, min((i + 1) * shard_size, total)
-                pieces = []
-                for r in range(tp_size):
-                    r_start = r * per_partition
-                    r_end = min((r + 1) * per_partition, total)
-                    s, e = max(cs, r_start), min(ce, r_end)
-                    if s >= e:
-                        continue
-                    if emb is not None and r == tp_rank:
-                        piece = emb.weight.data[s - tp_start:e - tp_start].clone()
-                    else:
-                        piece = torch.empty(e - s, dim, dtype=dtype, device=device)
-                    dist.broadcast(piece, src=tp_ranks[r], group=self.tp_group)
-                    pieces.append(piece)
-                shard = torch.cat(pieces, dim=0)
-                if self.pp_size > 1:
-                    dist.broadcast(shard, src=pp_src_rank, group=self.pp_group)
-                # Written directly into the state dict (bypasses _get_weight,
-                # which normally applies _target_device).
-                if self._target_device is not None:
-                    shard = shard.to(self._target_device)
-                hf_state_dict[f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = shard
 
     def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
@@ -318,12 +357,18 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             has_ple = self._reduce_tensor_pp_group(ple is not None, to_mcore)
             if not has_ple:
                 return
-        for mg_buf, hf_buf in self._PLE_NGRAM_BUFFERS:
+        # `ple` is only non-None on the pp stage owning the PLE layer, so the offload
+        # flag has to be reduced across pp before it can gate the loop below -- that
+        # loop runs pp collectives (broadcast_object_list) and export_table_to_hf runs
+        # tp ones, and stages disagreeing on whether to enter would deadlock.
+        ple_offloaded = self._reduce_tensor_pp_group(ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
+        skip_ngram_state = not to_mcore and not self._is_saving and (self._peft_format or ple_offloaded)
+        for buf in () if skip_ngram_state else self._PLE_NGRAM_BUFFERS:
             if to_mcore:
-                buffer = getattr(ple.ple_embedding, mg_buf)
-                buffer.copy_(hf_state_dict[f'ple.ple_embedding.{hf_buf}'].load().to(buffer.device))
+                buffer = getattr(ple.ple_embedding, buf)
+                buffer.copy_(hf_state_dict[f'ple.ple_embedding.{buf}'].load().to(buffer.device))
             else:
-                tensor = getattr(ple.ple_embedding, mg_buf).data.clone() if ple is not None else None
+                tensor = getattr(ple.ple_embedding, buf).data.clone() if ple is not None else None
                 if self.pp_size > 1:
                     obj = [tensor]
                     dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
@@ -332,8 +377,12 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                 # which normally applies _target_device).
                 if tensor is not None and self._target_device is not None:
                     tensor = tensor.to(self._target_device)
-                hf_state_dict[f'ple.ple_embedding.{hf_buf}'] = tensor
-        self._set_ple_ngram_embedding(ple, hf_state_dict, to_mcore, pp_src_rank)
+                hf_state_dict[f'ple.ple_embedding.{buf}'] = tensor
+        if not skip_ngram_state and to_mcore:
+            # The table's only ingestion path: fill from the HF checkpoint shards.
+            ple.ple_embedding.fill_table_from_hf(hf_state_dict)
+        elif not skip_ngram_state and ple is not None:
+            ple.ple_embedding.export_table_to_hf(hf_state_dict)
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),
@@ -371,8 +420,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
 
     def _convert_post_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore):
         res = super()._convert_post_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
-        lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
-        hc_count = getattr(self.config, 'hc_count', 0) or 0
+        lm_model = mg_model.language_model if self.is_multimodal else mg_model
+        hc_count = self.config.hc_count
         if hc_count > 1:
             # The mixer only exists on the stage holding the final layernorm.
             mixer_keys = ['hc_norm.weight', 'input_mix_weight_down.weight', 'input_mix_weight_up.weight']
