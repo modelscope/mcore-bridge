@@ -151,6 +151,16 @@ class Qwen4ExpLayer(TransformerLayer):
                 'back to full attention -- training will differ from sparse inference beyond the '
                 'indexer budget.')
             return None
+        if getattr(self.config, 'sequence_parallel', False) and self.config.tensor_model_parallel_size > 1:
+            # Under SP the indexer would see SP-sharded hidden states (s/tp) while TE core
+            # attention runs on the all-gathered full sequence, so the [b, 1, s, s] selection
+            # mask would not match the q/k length (logical_or shape error in the unfused path).
+            self._warn_qsa_fallback_once(
+                'sequence_parallel is enabled: the QSA indexer consumes SP-sharded hidden states '
+                'while core attention runs on the full sequence. QSA layers fall back to full '
+                'attention -- training will differ from sparse inference beyond the indexer '
+                'budget.')
+            return None
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
         if rotary_pos_emb is None:
             return None
