@@ -244,6 +244,11 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())
 
+    # The PLE ngram embedding table is stored in the checkpoint as F8_E4M3
+    # shards plus a single scalar `weight_scale` (unlike experts, which use
+    # blockwise `weight_scale_inv`). The true values are `weight * scale`.
+    _PLE_NGRAM_SCALE_KEY = 'ple.ple_embedding.ngram_embedding.weight_scale'
+
     def _set_ple_ngram_embedding(self, ple, hf_state_dict, to_mcore: bool, pp_src_rank: int):
         # The checkpoint shards the (padded) table into `parts` uniform row
         # blocks, so shard boundaries must be derived from the padded size.
@@ -269,6 +274,19 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         tp_start = tp_rank * per_partition if emb is not None else 0
         tp_end = min((tp_rank + 1) * per_partition, total) if emb is not None else 0
         if to_mcore:
+            # The fp8 shards must be multiplied by the scalar `weight_scale`
+            # before being written into the bf16 embedding. Checkpoints that
+            # store the table in bf16 directly have no such key; keep the raw
+            # values then (with a warning).
+            scale = None
+            if self._PLE_NGRAM_SCALE_KEY in hf_state_dict:
+                scale = hf_state_dict[self._PLE_NGRAM_SCALE_KEY].load().to(torch.float32)
+                self._ple_ngram_weight_scale = scale
+            else:
+                self._ple_ngram_weight_scale = None
+                logger.warning(
+                    f'`{self._PLE_NGRAM_SCALE_KEY}` not found in the checkpoint; assuming the PLE ngram '
+                    'embedding is already dequantized and loading it as-is.')
             for i in range(parts):
                 key = f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'
                 if key not in hf_state_dict:
@@ -277,8 +295,20 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                 s, e = max(cs, tp_start), min(ce, tp_end)
                 if s < e:
                     weight = hf_state_dict[key].load()
+                    if scale is not None:
+                        weight = weight.to(torch.float32) * scale
                     emb.weight.data[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(emb.weight.dtype)
         else:
+            # Inverse of the to_mcore path: the checkpoint format is fp8
+            # shards + scalar `weight_scale`, so divide by the scale (stashed
+            # during loading) and cast back to fp8. Without a known scale the
+            # values cannot be represented as fp8 + scale; keep them in the
+            # current dtype and warn.
+            scale = getattr(self, '_ple_ngram_weight_scale', None)
+            if scale is None:
+                logger.warning(
+                    f'`{self._PLE_NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
+                    'embedding without re-quantizing to fp8.')
             for i in range(parts):
                 cs, ce = i * shard_size, min((i + 1) * shard_size, total)
                 pieces = []
@@ -297,11 +327,15 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                 shard = torch.cat(pieces, dim=0)
                 if self.pp_size > 1:
                     dist.broadcast(shard, src=pp_src_rank, group=self.pp_group)
+                if scale is not None:
+                    shard = (shard.to(torch.float32) / scale.to(shard.device)).to(torch.float8_e4m3fn)
                 # Written directly into the state dict (bypasses _get_weight,
                 # which normally applies _target_device).
                 if self._target_device is not None:
                     shard = shard.to(self._target_device)
                 hf_state_dict[f'ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = shard
+            if scale is not None and self._PLE_NGRAM_SCALE_KEY not in hf_state_dict:
+                hf_state_dict[self._PLE_NGRAM_SCALE_KEY] = scale.reshape(())
 
     def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
