@@ -51,8 +51,8 @@ if HAVE_TRITON:
 def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
     """Gather n-gram rows from the CPU-pinned table with a triton kernel.
 
-    Returns ``None`` when the fast path is not usable (no triton/CUDA, or the table
-    is not bf16), so the caller can fall back to the torch path.
+    Returns ``None`` when the fast path is not usable (no triton, CPU-resident
+    ids, or the table is not bf16), so the caller can fall back to the torch path.
 
     Args:
         host_table: ``[n_local, embedding_dim]`` bf16 CPU-pinned table partition.
@@ -60,9 +60,14 @@ def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
         row_start / row_end: this rank's global row range.
         out: optional preallocated ``[*ids.shape, embedding_dim]`` bf16 device tensor.
     """
-    if not HAVE_TRITON or not torch.cuda.is_available():
+    # Gate on "triton exists + ids live on an accelerator", not on is_cuda:
+    # triton ships per-vendor backends (ROCm in-tree; NPU/XPU via vendor forks
+    # such as triton-ascend), so a platform that cannot run this kernel fails
+    # at launch instead of being silently excluded here. The device-side read
+    # of the pinned host table is only verified on CUDA so far.
+    if not HAVE_TRITON or ids.device.type == 'cpu':
         return None
-    if host_table.dtype != torch.bfloat16 or ids.device.type != 'cuda':
+    if host_table.dtype != torch.bfloat16:
         return None
     embedding_dim = host_table.shape[-1]
 
@@ -521,7 +526,7 @@ def ple_gate_conv_triton(hc_state, key, value, norm_key_w, norm_query_w, norm_co
 
     Returns ``None`` when the fast path is unavailable so callers fall back.
     """
-    if not HAVE_TRITON or not hc_state.is_cuda:
+    if not HAVE_TRITON or hc_state.device.type == 'cpu':
         return None
     return _PLEGateConv.apply(hc_state.contiguous(), key.contiguous(), value.contiguous(), norm_key_w, norm_query_w,
                               norm_conv_w, conv1d_weight, n, eps, dilation, seq_len)

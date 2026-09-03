@@ -416,7 +416,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """Mirrors transformers ``Qwen4ExpTextPLELayer.forward`` (training
         variant); hidden_states/input_ids: [rows, L, nH]/[rows, L]."""
         embeddings = self.ple_embedding(input_ids)  # mcore-specific: no past_key_values cache arg
-        if use_ple_fused_kernel() and embeddings.is_cuda:
+        if use_ple_fused_kernel() and embeddings.device.type != 'cpu':
             fused = self._compute_fused(hidden_states, embeddings)
             if fused is not None:
                 return fused

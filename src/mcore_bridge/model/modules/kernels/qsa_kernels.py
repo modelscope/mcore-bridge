@@ -99,9 +99,9 @@ def qsa_sparse_attention_thd(q, k, v, indices, scale, block_size):
     different value silently changes which keys are attended -- see the contract
     note in qsa_block_sparse_attn.py.
     """
-    if not HAVE_TRITON or not q.is_cuda:
-        raise RuntimeError('QSA sparse attention requires triton and CUDA tensors '
-                           f'(HAVE_TRITON={HAVE_TRITON}, q.is_cuda={q.is_cuda}). This path is only '
+    if not HAVE_TRITON or q.device.type == 'cpu':
+        raise RuntimeError('QSA sparse attention requires triton and accelerator tensors '
+                           f'(HAVE_TRITON={HAVE_TRITON}, device={q.device.type}). This path is only '
                            'selected for packing (thd) or CP>1, where no dense fallback is correct.')
     if q.shape[-1] & (q.shape[-1] - 1):
         raise RuntimeError(f'QSA sparse attention needs a power-of-two head dim, got {q.shape[-1]}.')
