@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import torch
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from torch import nn
 
 
@@ -28,9 +29,10 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 class QSAIndexer(nn.Module):
     # refer: transformers Qwen4ExpTextQSAIndexer
-    def __init__(self, config):
+    def __init__(self, config, tp_group=None):
         super().__init__()
         self.config = config
+        self.tp_group = tp_group
         self.index_n_heads = config.indexer_n_heads
         self.index_kv_heads = config.indexer_kv_heads
         self.index_head_dim = config.indexer_head_dim
@@ -63,7 +65,8 @@ class QSAIndexer(nn.Module):
 
         Args:
             hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
-                the same tensor the reference indexer consumes.
+                the same tensor the reference indexer consumes. ``s`` is the
+                local sequence length when sequence parallelism is enabled.
             freqs: mcore rotary frequencies ``[s, 1, 1, rot_dim]``. mcore stores
                 angles rather than cos/sin, so they are materialized here the way
                 ``_patch_apply_rotary_pos_emb`` does (``cos(freqs) * mscale``),
@@ -78,7 +81,9 @@ class QSAIndexer(nn.Module):
         Only the causal, unpacked layout is handled; callers must not invoke this
         for packed/THD or context-parallel inputs (see the guard in the layer).
         """
-        s, b, _ = hidden_states.shape
+        local_s, b, _ = hidden_states.shape
+        tp_size = self.config.tensor_model_parallel_size if self.config.sequence_parallel else 1
+        s = local_s * tp_size
         R = self.compress_ratio
         max_blocks = s // R
         # Selection is a no-op while the causal prefix never exceeds the budget:
@@ -90,8 +95,14 @@ class QSAIndexer(nn.Module):
 
         device = hidden_states.device
         # ---- project to indexer q/k ----
-        # [s, b, h] -> [s, b, (nh + nkv) * d]
+        # Project the local SP shard first, then gather only the compact indexer
+        # activations. For Qwen3.8-Flash-Next this communicates 640 values/token
+        # instead of gathering all 2560 hidden values/token.
+        # [local_s, b, h] -> [local_s, b, (nh + nkv) * d]
         qk = self.index_qk_proj(hidden_states)
+        if tp_size > 1:
+            qk = gather_from_sequence_parallel_region(qk, tensor_parallel_output_grad=False, group=self.tp_group)
+        assert qk.shape[0] == s, f'QSA indexer expected sequence length {s}, got {qk.shape[0]}'
         q, token_k = torch.split(
             qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1)
         # -> [b, s, nh, d] / [b, s, d]
