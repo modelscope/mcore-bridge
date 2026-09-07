@@ -5,6 +5,7 @@ import peft
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import transformer_engine
 import warnings
 from contextlib import contextmanager, nullcontext
 from importlib import metadata
@@ -279,6 +280,18 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora.ub_overlap_ag_fprop = False
                 lora.ub_overlap_rs_dgrad = False
 
+        # With sequence parallelism the replicated (non-sharded) LoRA factor only sees this TP
+        # rank's sequence shard: for RowParallel targets lora_A reduce-scatters its output before
+        # lora_B, and for ColumnParallel targets lora_A consumes the sequence-sharded input. Its
+        # gradient must therefore be summed over the TP group. Megatron does this in
+        # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
+        # weights); without the flag each TP rank trains a different copy and export_weights
+        # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
+        if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
+                and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
+            replicated = lora_b if self.is_parallel_a else lora_a
+            for p in replicated.parameters():
+                p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
@@ -431,12 +444,20 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                                                                     NpuGroupedLoraLinear)) else lora_A.weight.dtype
                 x = x.to(dtype)
 
-                lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(
-                    lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_A(dropout(x))
-                if isinstance(lora_result, tuple):
-                    lora_result = lora_result[0]
-                lora_result = lora_B(lora_result, *args, **kwargs) if isinstance(
-                    lora_B, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_B(lora_result)
+                # LoRA A/B weights are rank-sized (e.g. [4, 2560]), which
+                # violates TE's FP8 GEMM divisibility rules; never run them
+                # under fp8 autocast (mirrors the in_proj_ba guard in
+                # gpts/qwen4_exp.py's GDN path).
+                fp8_context = (
+                    transformer_engine.pytorch.fp8_autocast(
+                        enabled=False) if getattr(self.config, 'fp8_param', False) else nullcontext())
+                with fp8_context:
+                    lora_result = lora_A(dropout(x), *args, **kwargs) if isinstance(
+                        lora_A, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_A(dropout(x))
+                    if isinstance(lora_result, tuple):
+                        lora_result = lora_result[0]
+                    lora_result = lora_B(lora_result, *args, **kwargs) if isinstance(
+                        lora_B, (TEGroupedLinear, NpuGroupedLoraLinear)) else lora_B(lora_result)
                 if isinstance(lora_result, tuple):
                     lora_result = lora_result[0]
                 lora_result = lora_result * scaling

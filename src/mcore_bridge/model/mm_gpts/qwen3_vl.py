@@ -80,7 +80,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 deepstack_visual_embeds = visual_res.deepstack_features
             else:
                 image_embeds, deepstack_visual_embeds = visual_res
-            deepstack_visual_embeds = torch.stack(deepstack_visual_embeds, dim=0)
+            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0) if deepstack_visual_embeds else None)
             inputs_embeds = inputs_embeds + image_embeds.mean().to(device=inputs_embeds.device) * 0.
             visual_pos_masks = None
         else:
@@ -125,7 +125,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
             image_mask, video_mask = image_mask[..., 0], video_mask[..., 0]
             visual_pos_masks = image_mask | video_mask
-            if image_embeds is not None and video_embeds is not None:
+            if image_embeds is not None and video_embeds is not None and deepstack_visual_embeds:
                 deepstack_image_embeds = [tensor[:image_tokens] for tensor in deepstack_visual_embeds]
                 deepstack_video_embeds = [tensor[image_tokens:] for tensor in deepstack_visual_embeds]
                 deepstack_visual_embeds = []
@@ -137,7 +137,7 @@ class Qwen3VL_Vit(HuggingFaceVit):
                     embed_joint[video_mask_joint, :] = vid_embed
                     deepstack_visual_embeds.append(embed_joint)
 
-            deepstack_visual_embeds = torch.stack(deepstack_visual_embeds, dim=0)
+            deepstack_visual_embeds = (torch.stack(deepstack_visual_embeds, dim=0) if deepstack_visual_embeds else None)
             visual_pos_masks = visual_pos_masks.transpose(0, 1)
             # compat cp
             if self.config.context_parallel_size > 1:
@@ -147,7 +147,8 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 cu_seqlens = getattr(packed_seq_params, 'cu_seqlens_q', None)
                 cp_mask = split_cp_inputs(cp_mask, cu_seqlens, 0)
                 visual_pos_masks = split_cp_inputs(visual_pos_masks, cu_seqlens, 0)
-                deepstack_visual_embeds = deepstack_visual_embeds[:, cp_mask[(cp_mask != -1)]]
+                if deepstack_visual_embeds is not None:
+                    deepstack_visual_embeds = deepstack_visual_embeds[:, cp_mask[(cp_mask != -1)]]
             # compat sp
             tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
             tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -157,7 +158,8 @@ class Qwen3VL_Vit(HuggingFaceVit):
                 visual_start = 0 if tp_rank == 0 else sum(mask_tokens[:tp_rank])
                 visual_end = visual_start + mask_tokens[tp_rank]
                 visual_pos_masks = visual_pos_masks[tp_rank]
-                deepstack_visual_embeds = deepstack_visual_embeds[:, visual_start:visual_end]
+                if deepstack_visual_embeds is not None:
+                    deepstack_visual_embeds = deepstack_visual_embeds[:, visual_start:visual_end]
         return {
             'inputs_embeds': inputs_embeds,
             'visual_pos_masks': visual_pos_masks,

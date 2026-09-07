@@ -300,7 +300,7 @@ class GPTModel(McoreGPTModel):
             full_attention_mask = full_attention_mask['full_attention']
         if mcore_016 and full_attention_mask is not None:
             assert packed_seq_params is None
-            padding_mask = ~((~full_attention_mask).sum(dim=(1, 2)) > 0)
+            padding_mask = full_attention_mask.all(dim=(1, 2))
             if self.config.context_parallel_size > 1:
                 padding_mask = split_cp_inputs(padding_mask, None, 1)
             tp_size = self.config.tensor_model_parallel_size
@@ -309,7 +309,7 @@ class GPTModel(McoreGPTModel):
                 padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
             extra_block_kwargs['padding_mask'] = padding_mask.contiguous()
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None):
             extra_block_kwargs['input_ids'] = input_ids
 
         # Run decoder.

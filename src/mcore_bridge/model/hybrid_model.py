@@ -65,7 +65,7 @@ class HybridModel(McoreHybridModel):
             attention_mask = attention_mask['full_attention']
         if attention_mask is None:
             return None
-        padding_mask = ~((~attention_mask).sum(dim=(1, 2)) > 0)
+        padding_mask = attention_mask.all(dim=(1, 2))
         if self.config.context_parallel_size > 1:
             padding_mask = split_cp_inputs(padding_mask, None, 1)
         tp_size = self.config.tensor_model_parallel_size

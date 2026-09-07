@@ -3,4 +3,4 @@ modelscope
 peft>=0.11,<0.21
 safetensors
 tqdm
-transformers>=4.33,<5.15.0
+transformers>=4.33,<5.17.0

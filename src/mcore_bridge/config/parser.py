@@ -52,6 +52,23 @@ config_mapping = {
     'linear_key_head_dim': ['linear_key_head_dim'],
     'linear_value_head_dim': ['linear_value_head_dim'],
     'linear_conv_kernel_dim': ['linear_conv_kernel_dim'],
+    # qwen4_exp
+    'hc_count': ['hc_count'],
+    'hc_lowrank': ['hc_lowrank'],
+    'ple_layer_ids': ['ple_layer_ids'],
+    'ple_embed_dim': ['ple_embed_dim'],
+    'ple_conv_kernel_size': ['ple_conv_kernel_size'],
+    'ngram_size': ['ngram_size'],
+    'heads_per_ngram': ['heads_per_ngram'],
+    'ngram_vocab_size_base': ['ngram_vocab_size_base'],
+    'make_ngram_vocab_size_divisible_by': ['make_ngram_vocab_size_divisible_by'],
+    'split_ngram_parts': ['split_ngram_parts'],
+    'indexer_n_heads': ['indexer_n_heads'],
+    'indexer_kv_heads': ['indexer_kv_heads'],
+    'indexer_head_dim': ['indexer_head_dim'],
+    'indexer_budget': ['indexer_budget'],
+    'indexer_compress_ratio': ['indexer_compress_ratio'],
+    'output_gate_type': ['output_gate_type'],
     # dsa
     'dsa_indexer_n_heads': ['index_n_heads'],
     'dsa_indexer_head_dim': ['index_head_dim'],
@@ -244,6 +261,39 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         if use_mcore_gdn:
             res['experimental_attention_variant'] = 'gated_delta_net'
         res.setdefault('linear_attention_freq', 4)
+    elif hf_model_type == 'qwen4_exp':
+        use_mcore_gdn = get_env_args('USE_MCORE_GDN', bool, True)
+        res['layernorm_zero_centered_gamma'] = True
+        res['attention_output_gate'] = True
+        res['qk_layernorm'] = True
+        res['linear_decoupled_in_proj'] = True
+        res['moe_shared_expert_gate'] = True
+        if use_mcore_gdn:
+            res['experimental_attention_variant'] = 'gated_delta_net'
+        text_config = getattr(hf_config, 'text_config', hf_config)
+        num_layers = res['num_layers']
+        linear_pattern = ['1' if t == 'linear_attention' else '0' for t in layer_types]
+        res['linear_attention_freq'] = f"[{','.join(linear_pattern)}]"
+        if res.get('num_moe_experts'):
+            res['moe_layer_freq'] = f"[{','.join(['1'] * num_layers)}]"
+        # seed is hardcoded in transformers, not in config
+        res['ple_seed'] = int(getattr(text_config, 'seed', 1234))
+        eos_token_id = getattr(text_config, 'eos_token_id', None)
+        if eos_token_id is not None:
+            res['eos_token_id'] = eos_token_id
+        # These fields must come from the model config: ModelConfig carries no
+        # defaults for them, and a silently substituted value would corrupt the
+        # n-gram hash-table sharding/math at checkpoint conversion.
+        _required = [
+            'hc_count', 'hc_lowrank', 'ple_layer_ids', 'ple_embed_dim', 'ple_conv_kernel_size', 'ngram_size',
+            'heads_per_ngram', 'ngram_vocab_size_base', 'make_ngram_vocab_size_divisible_by', 'split_ngram_parts',
+            'eos_token_id', 'indexer_n_heads', 'indexer_kv_heads', 'indexer_head_dim', 'indexer_budget',
+            'indexer_compress_ratio'
+        ]
+        _missing = [k for k in _required if res.get(k) is None]
+        if _missing:
+            raise ValueError(f'qwen4_exp config is missing required fields: {_missing}. '
+                             'They must be provided by the model config.json.')
     elif llm_model_type == 'minimax_m2':
         res['add_qkv_bias'] = False
     elif llm_model_type == 'olmoe':
