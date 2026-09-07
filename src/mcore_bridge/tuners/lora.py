@@ -279,6 +279,18 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora.ub_overlap_ag_fprop = False
                 lora.ub_overlap_rs_dgrad = False
 
+        # With sequence parallelism the replicated (non-sharded) LoRA factor only sees this TP
+        # rank's sequence shard: for RowParallel targets lora_A reduce-scatters its output before
+        # lora_B, and for ColumnParallel targets lora_A consumes the sequence-sharded input. Its
+        # gradient must therefore be summed over the TP group. Megatron does this in
+        # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
+        # weights); without the flag each TP rank trains a different copy and export_weights
+        # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
+        if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
+                and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
+            replicated = lora_b if self.is_parallel_a else lora_a
+            for p in replicated.parameters():
+                p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
