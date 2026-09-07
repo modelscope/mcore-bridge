@@ -20,7 +20,7 @@ from typing import Optional, Tuple, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, get_num_samples
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
@@ -470,12 +470,12 @@ class Qwen3NextGatedDeltaNet(_HuggingFaceModule, _Qwen3NextGatedDeltaNet):
         # Note: for packed inputs, we do not perform padding_free unpadding.
         # Doing so would allow different sequences to see each other; for efficiency we keep this implementation.
         if thd_format:
+            num_samples = get_num_samples(packed_seq_params)
             max_seqlen_q = int(packed_seq_params.max_seqlen_q)
-            new_hidden_states = hidden_states.new_zeros(
-                (packed_seq_params.num_samples, max_seqlen_q, hidden_states.shape[-1]))
-            attention_mask = hidden_states.new_zeros((packed_seq_params.num_samples, max_seqlen_q), dtype=torch.bool)
+            new_hidden_states = hidden_states.new_zeros((num_samples, max_seqlen_q, hidden_states.shape[-1]))
+            attention_mask = hidden_states.new_zeros((num_samples, max_seqlen_q), dtype=torch.bool)
             cu_seqlens_q = packed_seq_params.cu_seqlens_q
-            for i in range(packed_seq_params.num_samples):
+            for i in range(num_samples):
                 start, end = cu_seqlens_q[i], cu_seqlens_q[i + 1]
                 attention_mask[i, :end - start] = True
                 new_hidden_states[i, :end - start] = hidden_states[start:end, 0]

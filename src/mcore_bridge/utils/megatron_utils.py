@@ -83,6 +83,30 @@ def split_cp_inputs(inputs: torch.Tensor,
     return torch.cat(new_inputs, dim=dim)
 
 
+def get_num_samples(packed_seq_params) -> int:
+    """Number of real (unpadded) samples packed into a THD micro-batch.
+
+    ``cu_seqlens_q.numel() - 1`` is *not* this number: the data pipeline pads the packed
+    sequence (see swift ``get_padding_to``) and the padding tokens carry ``position_ids == 0``,
+    so the padded tail opens extra segments (one per token when cp_size == 1, one per
+    ``2 * cp_size`` tokens otherwise). Using the segment count would inflate the
+    ``[num_samples, max_seqlen_q, h]`` buffers built by the GDN/PLE THD paths by up to
+    ``padding_to - 1`` extra rows.
+
+    ``num_samples``/``seq_lens`` are attached to ``PackedSeqParams`` by the data pipeline;
+    they are not mcore dataclass fields. Fall back to the segment count only when neither is
+    available, i.e. for callers that build ``PackedSeqParams`` directly (the convert-precision
+    check and the README example), which run tiny batches.
+    """
+    num_samples = getattr(packed_seq_params, 'num_samples', None)
+    if num_samples is not None:
+        return int(num_samples)
+    seq_lens = getattr(packed_seq_params, 'seq_lens', None)
+    if seq_lens is not None:
+        return int(seq_lens.shape[0])
+    return int(packed_seq_params.cu_seqlens_q.numel()) - 1
+
+
 def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int) -> torch.Tensor:
     """In CP mode, all-gather and undo the load-balanced (zigzag) chunking
     produced by ``split_cp_inputs``, restoring the full sequence in original

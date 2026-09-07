@@ -9,7 +9,7 @@ from megatron.core.tensor_parallel.mappings import (gather_from_sequence_paralle
 from torch import nn
 from typing import List, Optional
 
-from ...utils.megatron_utils import reconstruct_tensor_cp, split_cp_inputs
+from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 
 _MASK64 = (1 << 64) - 1
@@ -382,7 +382,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T]."""
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
         if thd:
-            num_samples = packed_seq_params.num_samples
+            num_samples = get_num_samples(packed_seq_params)
             # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
             # normalizes it to int, so `.item()` would raise AttributeError;
             # tolerate a 0-d tensor from other callers.

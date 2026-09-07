@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import torch
+from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from torch import nn
 
 
@@ -26,11 +27,22 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _materialize_rope(freqs: torch.Tensor, seq_len: int, dtype: torch.dtype, mscale: float):
+    """Materialize batch-aware RoPE cos/sin tensors in QSA layout."""
+    # [s, freq_b, 1, d] -> [freq_b, s, d]. Keeping freq_b separate is
+    # required for MRoPE, whose positions can differ between samples.
+    f = freqs[:seq_len].squeeze(2).permute(1, 0, 2)
+    cos = (torch.cos(f) * mscale).to(dtype)
+    sin = (torch.sin(f) * mscale).to(dtype)
+    return cos, sin
+
+
 class QSAIndexer(nn.Module):
     # refer: transformers Qwen4ExpTextQSAIndexer
-    def __init__(self, config):
+    def __init__(self, config, tp_group=None):
         super().__init__()
         self.config = config
+        self.tp_group = tp_group
         self.index_n_heads = config.indexer_n_heads
         self.index_kv_heads = config.indexer_kv_heads
         self.index_head_dim = config.indexer_head_dim
@@ -63,11 +75,14 @@ class QSAIndexer(nn.Module):
 
         Args:
             hidden_states: ``[s, b, h]`` (mcore layout), pre-attention input --
-                the same tensor the reference indexer consumes.
-            freqs: mcore rotary frequencies ``[s, 1, 1, rot_dim]``. mcore stores
-                angles rather than cos/sin, so they are materialized here the way
-                ``_patch_apply_rotary_pos_emb`` does (``cos(freqs) * mscale``),
-                keeping the indexer's RoPE identical to the attention's.
+                the same tensor the reference indexer consumes. ``s`` is the
+                local sequence length when sequence parallelism is enabled.
+            freqs: mcore rotary frequencies ``[s, freq_b, 1, rot_dim]``, where
+                ``freq_b`` is 1 for ordinary RoPE or ``b`` for batch-dependent
+                MRoPE. mcore stores angles rather than cos/sin, so they are
+                materialized here the way ``_patch_apply_rotary_pos_emb`` does
+                (``cos(freqs) * mscale``), keeping the indexer's RoPE identical
+                to the attention's.
 
         Returns:
             ``[b, 1, s, s]`` bool mask where True marks a *masked-out* key (TE's
@@ -78,7 +93,9 @@ class QSAIndexer(nn.Module):
         Only the causal, unpacked layout is handled; callers must not invoke this
         for packed/THD or context-parallel inputs (see the guard in the layer).
         """
-        s, b, _ = hidden_states.shape
+        local_s, b, _ = hidden_states.shape
+        tp_size = self.config.tensor_model_parallel_size if self.config.sequence_parallel else 1
+        s = local_s * tp_size
         R = self.compress_ratio
         max_blocks = s // R
         # Selection is a no-op while the causal prefix never exceeds the budget:
@@ -90,8 +107,14 @@ class QSAIndexer(nn.Module):
 
         device = hidden_states.device
         # ---- project to indexer q/k ----
-        # [s, b, h] -> [s, b, (nh + nkv) * d]
+        # Project the local SP shard first, then gather only the compact indexer
+        # activations. For Qwen3.8-Flash-Next this communicates 640 values/token
+        # instead of gathering all 2560 hidden values/token.
+        # [local_s, b, h] -> [local_s, b, (nh + nkv) * d]
         qk = self.index_qk_proj(hidden_states)
+        if tp_size > 1:
+            qk = gather_from_sequence_parallel_region(qk, tensor_parallel_output_grad=False, group=self.tp_group)
+        assert qk.shape[0] == s, f'QSA indexer expected sequence length {s}, got {qk.shape[0]}'
         q, token_k = torch.split(
             qk, [self.index_n_heads * self.index_head_dim, self.index_kv_heads * self.index_head_dim], dim=-1)
         # -> [b, s, nh, d] / [b, s, d]
@@ -100,11 +123,10 @@ class QSAIndexer(nn.Module):
         q = self.q_layernorm(q)
 
         # ---- materialize cos/sin from mcore freqs ----
-        # freqs: [s, 1, 1, rot_dim] -> [s, rot_dim]; mscale mirrors the attention path.
+        # freqs: [s, freq_b, 1, rot_dim] -> [freq_b, s, rot_dim].
+        # mscale mirrors the attention path.
         mscale = getattr(self.config, 'attention_scaling', 1.0) or 1.0
-        f = freqs.reshape(freqs.shape[0], -1)[:s]
-        cos = (torch.cos(f) * mscale).to(q.dtype)
-        sin = (torch.sin(f) * mscale).to(q.dtype)
+        cos, sin = _materialize_rope(freqs, s, q.dtype, mscale)
         rot = cos.shape[-1]
 
         def apply_rope(t, cos_, sin_):
@@ -112,8 +134,8 @@ class QSAIndexer(nn.Module):
             t_rope = (t_rope * cos_) + (_rotate_half(t_rope) * sin_)
             return torch.cat((t_rope, t_pass), dim=-1)
 
-        # queries rotate at their own position: cos [s, rot] -> [1, s, 1, rot]
-        q = apply_rope(q, cos[None, :, None, :], sin[None, :, None, :])
+        # queries rotate at their own positions; freq_b broadcasts when it is 1.
+        q = apply_rope(q, cos[:, :, None, :], sin[:, :, None, :])
 
         # ---- pool every block once (shared across queries) ----
         usable = max_blocks * R
@@ -122,7 +144,7 @@ class QSAIndexer(nn.Module):
         pooled = self.k_layernorm(pooled)
         # blocks rotate at their first token's position
         starts = torch.arange(max_blocks, device=device) * R
-        block_keys = apply_rope(pooled, cos[starts][None], sin[starts][None])  # [b, nb, d]
+        block_keys = apply_rope(pooled, cos[:, starts, :], sin[:, starts, :])  # [b, nb, d]
 
         # ---- score all (query, block) pairs ----
         scores = torch.einsum('bqhd,bkd->bqhk', q.float(), block_keys.float())
