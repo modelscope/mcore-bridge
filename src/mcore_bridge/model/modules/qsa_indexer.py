@@ -267,8 +267,11 @@ class QSAIndexer(nn.Module):
         return torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
 
     @torch.no_grad()
-    def select_token_indices_thd(self, hidden_tok: torch.Tensor, freqs: torch.Tensor,
-                                 cu_seqlens: torch.Tensor) -> torch.Tensor:
+    def select_token_indices_thd(self,
+                                 hidden_tok: torch.Tensor,
+                                 freqs: torch.Tensor,
+                                 cu_seqlens: torch.Tensor,
+                                 force_materialize: bool = False) -> torch.Tensor:
         """QSA selection for packed (thd) inputs, indices in pack space.
 
         A standalone implementation: it does *not* call
@@ -288,7 +291,13 @@ class QSAIndexer(nn.Module):
             ``[T, K]`` int64 pack-space indices (``K = block_topk*R + R``), ``-1``
             unused; every index stays inside its query's document and causal
             prefix. ``None`` when selection is a no-op for every document, in which
-            case TE's packed causal kernel reproduces the selection exactly.
+            case TE's packed causal kernel reproduces the selection exactly --
+            unless ``force_materialize`` is set, which builds the (select-all)
+            indices anyway. Callers pass that when the TE packed fallback is not
+            usable, i.e. thd under context parallelism: TE restricts thd+all_gather
+            to FusedAttention/FlashAttention-v3, and on sm100 neither is available
+            (FA3 is sm90-only), so the no-op must stay on the CP-aware sparse
+            kernel instead of degrading to a TE dense path that has no backend.
         """
         T, _ = hidden_tok.shape
         R = self.compress_ratio
@@ -296,8 +305,7 @@ class QSAIndexer(nn.Module):
         doc_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).long()  # [D]
         D = doc_lens.numel()
         full_blocks = doc_lens // R  # complete R-blocks per document
-        # No-op when no document's causal prefix can exceed the budget.
-        if int(full_blocks.max().item()) <= self.block_topk:
+        if not force_materialize and int(full_blocks.max().item()) <= self.block_topk:
             return None
 
         # ---- per-token document id / in-doc position ----

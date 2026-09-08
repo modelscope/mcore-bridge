@@ -204,14 +204,17 @@ class Qwen4ExpLayer(TransformerLayer):
                     psp_for_cp.cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded.to(torch.int32)
             else:
                 psp_for_cp = packed_seq_params
+            local_len = hidden_states.shape[0]
             hidden_states = reconstruct_tensor_cp(hidden_states, psp_for_cp, dim=0)
         # Per-token rotary angles. Without rope fusion gpt_model already indexes
         # the freq table by position_ids, so what arrives is per-token (zigzag-
         # sharded under CP -- undo it like hidden). With fusion the raw table
         # arrives and must be indexed by the (CP-reconstructed) per-doc ids.
         freqs = rotary_pos_emb
-        fused_table = freqs.shape[0] != hidden_states.shape[0]
         if self.config.context_parallel_size > 1:
+            fused_table = (
+                self.config.position_embedding_type != 'mrope'
+                and (self.config.apply_rope_fusion or freqs.shape[0] != local_len))
             if fused_table:
                 if position_ids is None:
                     raise RuntimeError('QSA thd selection under CP needs position_ids to index the fused rotary '
@@ -221,15 +224,12 @@ class Qwen4ExpLayer(TransformerLayer):
                 freqs = freqs[pos.reshape(-1)]
             else:
                 freqs = reconstruct_tensor_cp(freqs, psp_for_cp, dim=0)
-        elif fused_table:
-            # Same problem without CP, and here there is no reconstruct step to hide
-            # behind: the indexer would slice the raw table's first T rows, treating
-            # row i as token i's angle. In a packed batch token i sits at in-document
-            # position i - cu[doc], so those angles belong to the wrong positions --
-            # silently degrading the selection instead of failing.
-            raise RuntimeError(f'QSA thd selection got a fused rotary table ({freqs.shape[0]} rows for '
-                               f'{hidden_states.shape[0]} tokens): apply_rope_fusion=true hands over the raw '
-                               'table rather than per-token freqs. Set --apply_rope_fusion false.')
+        else:
+            fused_table = freqs.shape[0] != hidden_states.shape[0]
+            if fused_table:
+                raise RuntimeError(f'QSA thd selection got a fused rotary table ({freqs.shape[0]} rows for '
+                                   f'{hidden_states.shape[0]} tokens): apply_rope_fusion=true hands over the raw '
+                                   'table rather than per-token freqs. Set --apply_rope_fusion false.')
         # the CP reconstruct (like TE's thd kernels) works in the padded pack
         # space, so align against the padded cu when present
         cu = packed_seq_params.cu_seqlens_q_padded
@@ -240,7 +240,8 @@ class Qwen4ExpLayer(TransformerLayer):
                                'boundaries, but it is missing.')
         cu = Qwen4ExpTextPLELayer._normalize_cu_seqlens(cu, hidden_states.shape[0])
         hidden_tok = hidden_states.reshape(hidden_states.shape[0], -1)
-        return self.self_attention.indexer.select_token_indices_thd(hidden_tok, freqs, cu)
+        return self.self_attention.indexer.select_token_indices_thd(
+            hidden_tok, freqs, cu, force_materialize=self.config.context_parallel_size > 1)
 
     def _qsa_select_mask(self, hidden_states, attn_kwargs):
         # Bool-mask QSA on TE's `arbitrary` mask. Only reached for sbhd with CP==1 --

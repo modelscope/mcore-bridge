@@ -311,6 +311,8 @@ class GPTModel(McoreGPTModel):
 
         if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None):
             extra_block_kwargs['input_ids'] = input_ids
+        if getattr(self.config, 'indexer_n_heads', None) is not None:
+            extra_block_kwargs['position_ids'] = position_ids
 
         # Run decoder.
         decoder_output = self.decoder(
@@ -334,6 +336,9 @@ class GPTModel(McoreGPTModel):
 
         # MTP: https://github.com/NVIDIA/Megatron-LM/issues/1661
         extra_block_kwargs.pop('input_ids', None)
+        # self.mtp below takes position_ids explicitly; leaving it here would
+        # collide with the explicit kwarg.
+        extra_block_kwargs.pop('position_ids', None)
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
