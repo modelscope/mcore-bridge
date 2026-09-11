@@ -13,7 +13,7 @@ from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.utils import deep_getattr
 
 from ..constant import ModelType
-from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DeepseekV4GPTModel
+from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4GPTModel, DeepseekV4Loader
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
@@ -66,10 +66,12 @@ class DeepseekV4VisionVit(HuggingFaceVit):
             self.aligner = Aligner(args)
 
         _orig_gcs = vision_mod.get_vision_cos_sin
+
         def _gcs(n_h, n_w, dim, theta):
             cos, sin = _orig_gcs(n_h, n_w, dim, theta)
             device = next(self.vision.parameters()).device
             return cos.to(device), sin.to(device)
+
         vision_mod.get_vision_cos_sin = _gcs
 
         dim = hf_config.hidden_size
@@ -110,9 +112,13 @@ class DeepseekV4VisionVit(HuggingFaceVit):
 
         # Special-token embedding lookup: index by sentinel type id.
         params = torch.stack([
-            self.image_start, self.image_pad, self.image_pad,
-            self.image_newline, self.image_end,
-        ]).to(device=device, dtype=dtype)
+            self.image_start,
+            self.image_pad,
+            self.image_pad,
+            self.image_newline,
+            self.image_end,
+        ]).to(
+            device=device, dtype=dtype)
 
         bsz = input_ids.shape[0] if input_ids.ndim > 1 else 1
 
@@ -189,8 +195,7 @@ class DeepseekV4VisionBridge(DeepseekV4Bridge, MultimodalGPTBridge):
         if self.is_multimodal and not self.config.language_model_only:
             for prefix, mg_prefix in self.module_mapping.items():
                 mg_module = deep_getattr(mg_model, f'visual.{mg_prefix}')
-                hf_state_dict.update(
-                    self._set_module(mg_module, hf_state_dict, f'{hf_prefix}{prefix}.', to_mcore))
+                hf_state_dict.update(self._set_module(mg_module, hf_state_dict, f'{hf_prefix}{prefix}.', to_mcore))
             # Load the four image special-token embeddings onto the visual module.
             visual = mg_model.visual
             for key in ['image_start', 'image_end', 'image_pad', 'image_newline']:
@@ -203,10 +208,11 @@ class DeepseekV4VisionBridge(DeepseekV4Bridge, MultimodalGPTBridge):
         return hf_state_dict
 
 
-register_model(ModelMeta(
-    ModelType.deepseek_v4_flash_vision,
-    ['deepseek_v4_flash_vision'],
-    bridge_cls=DeepseekV4VisionBridge,
-    visual_cls=DeepseekV4VisionVit,
-    loader=DeepseekV4VisionLoader,
-))
+register_model(
+    ModelMeta(
+        ModelType.deepseek_v4_flash_vision,
+        ['deepseek_v4_flash_vision'],
+        bridge_cls=DeepseekV4VisionBridge,
+        visual_cls=DeepseekV4VisionVit,
+        loader=DeepseekV4VisionLoader,
+    ))
