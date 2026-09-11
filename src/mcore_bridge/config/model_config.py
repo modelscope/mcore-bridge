@@ -269,47 +269,8 @@ class ModelConfig(TransformerConfig):
     num_labels: Optional[int] = None
     mlp_padding_free: bool = False
 
-    _mindspeed_defaults_cache = None
-
-    def _augment_mindspeed_defaults(self):
-        if not is_torch_npu_available():
-            return
-
-        if ModelConfig._mindspeed_defaults_cache is None:
-            defaults = {}
-            try:
-                import mindspeed.features_manager as mfm
-                import sys
-                from argparse import ArgumentParser
-                from mindspeed.arguments import process_args
-
-                original_features = list(mfm.FEATURES_LIST)
-                full_features = mfm.create_features_list()
-                mfm.FEATURES_LIST.clear()
-                mfm.FEATURES_LIST.extend(full_features)
-                try:
-                    parser = ArgumentParser()
-                    process_args(parser)
-                    # Parse args from sys.argv
-                    args, _ = parser.parse_known_args([])
-                    defaults = vars(args)
-                finally:
-                    mfm.FEATURES_LIST.clear()
-                    mfm.FEATURES_LIST.extend(original_features)
-            except Exception as e:
-                logger.warning(f'Failed to get MindSpeed defaults, which may cause issues on NPU: {e}')
-                defaults = {}
-            ModelConfig._mindspeed_defaults_cache = defaults
-
-        for name, value in ModelConfig._mindspeed_defaults_cache.items():
-            if not hasattr(self, name):
-                setattr(self, name, value)
-            elif hasattr(self, name) and getattr(self, name) is None and value is not None:
-                setattr(self, name, value)
-
     def __post_init__(self):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
-        self._augment_mindspeed_defaults()
         self._format_config()
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
@@ -402,7 +363,7 @@ class ModelConfig(TransformerConfig):
             required_ep = (num_experts + MAX_NPU_EXPERTS_PER_EP - 1) // MAX_NPU_EXPERTS_PER_EP
             if expert_model_parallel_size < required_ep:
                 logger.warning(f'{">" * 20} WARNING {"<" * 20}\n'
-                               f'MindSpeed on NPU supports up to {MAX_NPU_EXPERTS_PER_EP} experts per EP group. '
+                               f'NPU grouped matmul supports up to {MAX_NPU_EXPERTS_PER_EP} experts per EP group. '
                                f'num_experts={num_experts}, '
                                f'expert_model_parallel_size={expert_model_parallel_size}. '
                                f'Please set expert_model_parallel_size (EP) to {required_ep} '
