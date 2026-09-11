@@ -20,8 +20,9 @@ from typing import List, Optional
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
-from ..modules import (GatedDeltaNet, QSAIndexer, QSASparseCoreAttention, Qwen4ExpTextGatedResidual,
-                       Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer, qsa_sparse_supported)
+from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
+                       Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
+                       qsa_sparse_supported, use_qsa_sparse_kernel)
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -158,14 +159,20 @@ class Qwen4ExpLayer(TransformerLayer):
         if not needs_kernel:
             return self._qsa_select_mask(hidden_states, attn_kwargs), False
 
-        # From here the mask path is not an option, so every failure raises instead of
-        # silently degrading to dense attention (which would diverge from the sparse
-        # rollout without telling anyone).
+        # From here the mask path is not an option, so by default a failure raises instead
+        # of silently degrading to dense attention (which would diverge from the sparse
+        # rollout without telling anyone). An explicit opt-out via the env var is the one
+        # sanctioned fallback: full attention, warned about once.
         if not sparse_ok:
+            if not use_qsa_sparse_kernel():
+                logger.warning_once(f'QSA sparse kernel is disabled via {QSA_SPARSE_KERNEL_ENV}=0; '
+                                    f'falling back to full attention ({"packing/thd" if is_thd else f"CP={cp_size}"}).')
+                return None, False
             raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
                                'but QSASparseCoreAttention was not installed -- triton is missing or '
                                f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
-                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
+                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
+                               f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
             raise RuntimeError(f'QSA sparse selection with context_parallel_size={cp_size} requires '
                                f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "

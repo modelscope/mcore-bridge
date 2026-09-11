@@ -13,7 +13,8 @@ WHY A KERNEL AT ALL (the decision this file encodes)
     Context parallelism is blocked for a different reason -- block pooling needs
     keys from other CP ranks, which the mask path never gathers.
 
-    So the layer picks by data shape, with no user-facing switch:
+    So the layer picks by data shape, unless disabled via the ``QSA_SPARSE_KERNEL``
+    env var (then: full attention under thd/CP>1, bool mask otherwise):
 
         thd (padding_free) or CP>1  ->  this kernel
         sbhd and CP==1              ->  the indexer's bool mask on TE
@@ -25,7 +26,13 @@ WHY A KERNEL AT ALL (the decision this file encodes)
 """
 import torch
 
+from mcore_bridge.utils import get_env_args, get_logger
+
 from .qsa_block_sparse_attn import qsa_sparse_attention_from_indices
+
+logger = get_logger()
+
+QSA_SPARSE_KERNEL_ENV = 'QSA_SPARSE_KERNEL'
 
 try:
     import triton  # noqa: F401  (import guard for the vendored kernel)
@@ -34,13 +41,27 @@ except Exception:  # pragma: no cover - triton absent
     HAVE_TRITON = False
 
 
+def use_qsa_sparse_kernel() -> bool:
+    return get_env_args(QSA_SPARSE_KERNEL_ENV, bool, True)
+
+
 def qsa_sparse_supported(head_dim: int) -> bool:
     """Whether the sparse kernel can run for this head dim.
 
-    Triton must be importable and ``head_dim`` must be a power of two (the
-    kernel tiles the head with ``tl.arange`` blocks).
+    Triton must be importable, ``head_dim`` must be a power of two (the kernel tiles
+    the head with ``tl.arange`` blocks), and the kernel must not be disabled via
+    ``QSA_SPARSE_KERNEL=0``.
     """
-    return HAVE_TRITON and head_dim > 0 and not (head_dim & (head_dim - 1))
+    if not use_qsa_sparse_kernel():
+        return False
+    if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
+        return False
+    if not torch.cuda.is_available():
+        logger.warning_once('The QSA sparse kernel is only tested on CUDA GPUs and may fail to compile on '
+                            'this device. If you hit triton compile errors, set '
+                            f'{QSA_SPARSE_KERNEL_ENV}=0 to disable it (QSA then falls back to full '
+                            'attention under packing/CP, and to the bool-mask path otherwise).')
+    return True
 
 
 def _cp_query_global_positions(seq_len: int, cp_size: int, cp_rank: int, device) -> torch.Tensor:
