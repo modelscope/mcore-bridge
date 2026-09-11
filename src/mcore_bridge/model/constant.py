@@ -2,7 +2,6 @@
 class LLMModelType:
     gpt = 'gpt'
     gpt_oss = 'gpt_oss'
-
     qwen3_next = 'qwen3_next'
     olmoe = 'olmoe'
     glm4 = 'glm4'
@@ -13,7 +12,6 @@ class LLMModelType:
     deepseek_v4 = 'deepseek_v4'
     glm_moe_dsa = 'glm_moe_dsa'
     nemotron_h = 'nemotron_h'
-
     qwen3_emb = 'qwen3_emb'
 
 
@@ -27,7 +25,6 @@ class MLLMModelType:
     qwen3_5 = 'qwen3_5'
     qwen4_exp = 'qwen4_exp'
     ovis2_5 = 'ovis2_5'
-
     internvl_chat = 'internvl_chat'
     internvl = 'internvl'
     glm4v = 'glm4v'
@@ -36,14 +33,11 @@ class MLLMModelType:
     llama4 = 'llama4'
     gemma4 = 'gemma4'
     gemma4_unified = 'gemma4_unified'
-
     kimi_k25 = 'kimi_k25'
-
     llava_onevision1_5 = 'llava_onevision1_5'
-
     minicpmv4_6 = 'minicpmv4_6'
-
     muse_glimmer = 'muse_glimmer'
+    deepseek_v4_flash_vision = 'deepseek_v4_flash_vision'
 
 
 class ModelType(LLMModelType, MLLMModelType):

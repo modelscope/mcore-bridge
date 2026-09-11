@@ -174,7 +174,7 @@ class Qwen4ExpLayer(TransformerLayer):
                                'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
                                f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
-            raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
+            raise RuntimeError(f'QSA sparse selection with context_parallel_size={cp_size} requires '
                                f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
                                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')

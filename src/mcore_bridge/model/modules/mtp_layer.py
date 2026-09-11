@@ -451,3 +451,95 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
         return input_ids, position_ids, decoder_input, hidden_states
+
+
+class DSparkMultiTokenPredictionLayer(MultiTokenPredictionLayer):
+
+    def __init__(self, config: ModelConfig, submodules, *args, **kwargs):
+        orig_mhc = config.enable_hyper_connections
+        config.enable_hyper_connections = False
+
+        linear_cls = getattr(submodules, 'eh_proj', None)
+        if linear_cls is None or linear_cls is IdentityOp:
+            linear_cls = getattr(submodules, 'e_proj', None)
+        if linear_cls is None or linear_cls is IdentityOp:
+            raise ValueError('DSparkMultiTokenPredictionLayer requires a column-parallel linear '
+                             'class in submodules.eh_proj or submodules.e_proj')
+
+        orig_eh_proj = getattr(submodules, 'eh_proj', None)
+        submodules.eh_proj = IdentityOp
+        try:
+            super().__init__(config, submodules, *args, **kwargs)
+        finally:
+            config.enable_hyper_connections = orig_mhc
+            if orig_eh_proj is not None:
+                submodules.eh_proj = orig_eh_proj
+
+        n_target_layers = len(config.dspark_target_layer_ids) if config.dspark_target_layer_ids else 1
+        main_proj_in_size = config.hidden_size * n_target_layers
+
+        norm_impl = getattr(submodules, 'enorm', None) or getattr(submodules, 'layer_norm', None)
+        if norm_impl is None:
+            raise ValueError('DSparkMultiTokenPredictionLayer requires a norm class in '
+                             'submodules.enorm or submodules.layer_norm')
+        self.main_norm = norm_impl(
+            config=config,
+            hidden_size=config.hidden_size,
+            eps=config.layernorm_epsilon,
+        )
+
+        if config.fp8_param:
+            fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
+        else:
+            fp8_context = nullcontext()
+        with fp8_context:
+            self.main_proj = build_module(
+                linear_cls,
+                main_proj_in_size,
+                config.hidden_size,
+                config=config,
+                init_method=config.init_method,
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                tp_comm_buffer_name='mtp_main_proj',
+                tp_group=self.tp_group,
+            )
+
+        self.e_proj = None
+        self.h_proj = None
+        self.enorm = None
+        self.hnorm = None
+        self.eh_proj = None
+        self._dspark_target_hs = None
+
+    def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
+        target_hs = self._dspark_target_hs
+        if target_hs is not None:
+            hidden_states = target_hs
+            self._dspark_target_hs = None
+        else:
+            n_target = len(self.config.dspark_target_layer_ids) if self.config.dspark_target_layer_ids else 1
+            if n_target > 1:
+                hidden_states = hidden_states.unsqueeze(-1).repeat(1, 1, n_target).flatten(-2)
+
+        if self.config.fp8_param:
+            fp8_context = transformer_engine.pytorch.fp8_autocast(enabled=False)
+        else:
+            fp8_context = nullcontext()
+        with fp8_context:
+            hidden_states, _ = self.main_proj(hidden_states)
+
+        hidden_states = gather_from_tensor_model_parallel_region(hidden_states, group=self.tp_group)
+
+        if apply_module is None:
+            hidden_states = self.main_norm(hidden_states)
+        else:
+            hidden_states = apply_module(self.main_norm)(hidden_states)
+
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        if self.sequence_parallel:
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
+        return hidden_states

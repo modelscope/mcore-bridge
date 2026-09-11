@@ -246,6 +246,13 @@ class ModelConfig(TransformerConfig):
     mtp_decoder_input_detach: bool = False
     mtp_shared_weights: bool = False
 
+    # DSpark MTP
+    dspark_enabled: bool = False
+    dspark_block_size: int = 0
+    dspark_noise_token_id: int = 0
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_markov_rank: int = 256
+
     # visual
     language_model_only: bool = False
     hf_config: Optional[PretrainedConfig] = None

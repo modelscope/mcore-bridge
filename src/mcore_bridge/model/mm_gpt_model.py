@@ -42,7 +42,7 @@ class MultimodalGPTModel(MegatronModule):
         def forward(_self, input_):
             reduce_scatter_embeddings = _self.reduce_scatter_embeddings
             _self.reduce_scatter_embeddings = False
-            input_ = torch.masked_fill(input_, input_ < 0, 0)
+            input_ = torch.masked_fill(input_, (input_ < 0) | (input_ >= self.config.padded_vocab_size), 0)
             res = origin_forward(_self, input_)
             _self.reduce_scatter_embeddings = reduce_scatter_embeddings
             packed_seq_params = kwargs.get('packed_seq_params')
@@ -101,6 +101,8 @@ class MultimodalGPTModel(MegatronModule):
         kwargs.update(extra_kwargs)
         if needs_split:
             input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1)
+        if self.visual is not None and not self.config.language_model_only and input_ids is not None:
+            input_ids = self.visual.mask_input_ids(input_ids)
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
