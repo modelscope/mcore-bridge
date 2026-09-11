@@ -9,11 +9,12 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
-from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8
+from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8, get_logger
 
 from ..constant import ModelType
 from ..gpt_model import GPTModel
 from ..modules.compressor import Compressor, CSAIndexer
+from ..modules.mtp_layer import DSparkMultiTokenPredictionLayer
 from ..register import ModelLoader, ModelMeta, register_model
 from ..rope import get_rope_inv_freq
 
@@ -134,7 +135,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         """
         # s = sequence length, b = batch size, h = hidden size, n = num attention heads
         # Attention heads [s, b, n*h]
-        assert (hidden_states.ndim == 3), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+        assert (hidden_states.ndim == 3), f'hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D'
         if packed_seq_params is not None:
             assert (packed_seq_params.local_cp_size
                     is None), 'dynamic_context_parallel is not supported with MLA yet and is planned for future. \
@@ -470,6 +471,70 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
 class DeepseekV4GPTModel(GPTModel):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._setup_dspark_hooks()
+
+    def _setup_dspark_hooks(self):
+        if not (getattr(self.config, 'dspark_enabled', False) and self.config.dspark_target_layer_ids):
+            self._dspark_hooks = None
+            return
+
+        self._dspark_target_hidden_states = []
+        self._dspark_hooks = []
+
+        def _pre_hook(module, args):
+            self._dspark_target_hidden_states.clear()
+
+        self._dspark_hooks.append(self.decoder.register_forward_pre_hook(_pre_hook))
+
+        for layer_id in self.config.dspark_target_layer_ids:
+            if layer_id >= len(self.decoder.layers):
+                get_logger().warning(f'DSpark target layer {layer_id} is not on this pipeline '
+                                     f'stage (only {len(self.decoder.layers)} layers locally). '
+                                     'Falling back to repeat approximation for MTP main_proj.')
+                for h in self._dspark_hooks:
+                    h.remove()
+                self._dspark_hooks = None
+                return
+
+            layer = self.decoder.layers[layer_id]
+
+            def _layer_hook(module, args, output):
+                hs = output[0] if isinstance(output, tuple) else output
+                self._dspark_target_hidden_states.append(hs)
+
+            self._dspark_hooks.append(layer.register_forward_hook(_layer_hook))
+
+        def _post_hook(module, args, output):
+            self._prepare_dspark_target_states()
+
+        self._dspark_hooks.append(self.decoder.register_forward_hook(_post_hook))
+
+    def _prepare_dspark_target_states(self):
+        if not self._dspark_target_hidden_states:
+            return
+        if self.config.enable_hyper_connections:
+            from megatron.core.transformer.hyper_connection import learned_output_contract
+            contracted = []
+            for hs in self._dspark_target_hidden_states:
+                c = learned_output_contract(
+                    hs,
+                    self.decoder.hc_head_fn,
+                    self.decoder.hc_head_base,
+                    self.decoder.hc_head_scale,
+                    self.config.num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+                contracted.append(c)
+        else:
+            contracted = list(self._dspark_target_hidden_states)
+        target_hs = torch.cat(contracted, dim=-1)
+        if getattr(self, 'mtp', None) is not None:
+            for layer in self.mtp.layers:
+                layer._dspark_target_hs = target_hs
+        self._dspark_target_hidden_states.clear()
+
     def _init_mla_softmax_scale(self, config):
         pass
 
@@ -514,6 +579,13 @@ class DeepseekV4Loader(ModelLoader):
                 core_attention_submodules.indexer.module = CSAIndexer
                 core_attention_submodules.indexer.submodules.compressor.module = Compressor
         return transformer_layer_spec
+
+    def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        mtp_block_spec = super().get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)
+        if mtp_block_spec is not None and getattr(self.config, 'dspark_enabled', False):
+            for layer_spec in mtp_block_spec.layer_specs:
+                layer_spec.module = DSparkMultiTokenPredictionLayer
+        return mtp_block_spec
 
 
 class DeepseekV4Bridge(GPTBridge):
@@ -660,11 +732,22 @@ class DeepseekV4Bridge(GPTBridge):
         super()._set_router(mg_mlp, hf_state_dict, to_mcore, **kwargs)
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
-        for key in ['enorm.weight', 'hnorm.weight', 'e_proj.weight', 'h_proj.weight']:
-            self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
-        self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'norm.weight', to_mcore)
-        for key in ['hc_head_base', 'hc_head_fn', 'hc_head_scale']:
-            self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+        if getattr(self.config, 'dspark_enabled', False):
+            # DSpark MTP
+            for key in ['main_proj.weight', 'main_norm.weight']:
+                self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+            if 'norm.weight' in hf_state_dict:
+                self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'norm.weight', to_mcore)
+            for key in ['hc_head_base', 'hc_head_fn', 'hc_head_scale']:
+                if key in hf_state_dict:
+                    self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+        else:
+            # Standard MHC MTP
+            for key in ['enorm.weight', 'hnorm.weight', 'e_proj.weight', 'h_proj.weight']:
+                self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+            self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'norm.weight', to_mcore)
+            for key in ['hc_head_base', 'hc_head_fn', 'hc_head_scale']:
+                self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
 
     def _convert_mtp_embeds(self, lm_model, hf_state_dict, to_mcore):
         if not to_mcore:

@@ -128,6 +128,10 @@ def test_muse_glimmer():
     _test_model('meta-models/Muse-Glimmer-30B')
 
 
+def test_deepseek_v4_flash_vision():
+    _test_model('deepseek-ai/DeepSeek-V4-Flash-Vision-Exp')
+
+
 if __name__ == '__main__':
     # test_qwen2_5_vl()
     # test_qwen2_vl()
@@ -151,4 +155,5 @@ if __name__ == '__main__':
     # test_qwen3_asr()
     # test_gemma4()
     # test_minicpmv4_6()
-    test_muse_glimmer()
+    # test_muse_glimmer()
+    test_deepseek_v4_flash_vision()

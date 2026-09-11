@@ -6,7 +6,7 @@ from .gated_delta_net import GatedDeltaNet
 from .gated_self_attention import GatedSelfAttention
 from .hyper_connection_gated import Qwen4ExpTextGatedResidual, Qwen4ExpTextGroupedRMSNorm
 from .kernels import QSASparseCoreAttention, qsa_sparse_supported
-from .mtp_layer import MultiTokenPredictionLayer
+from .mtp_layer import DSparkMultiTokenPredictionLayer, MultiTokenPredictionLayer
 from .multi_latent_attention import MLASelfAttention
 from .ple import Qwen4ExpTextNGramEmbedding, Qwen4ExpTextPLELayer
 from .qsa_indexer import QSAIndexer

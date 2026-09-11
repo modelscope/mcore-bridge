@@ -31,7 +31,7 @@ class AbsorbedMLASelfAttention(McoreAbsorbedMLASelfAttention):
         """
         # s = sequence length, b = batch size, h = hidden size
         from megatron.core.utils import get_pg_size
-        assert (hidden_states.ndim == 3), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
+        assert (hidden_states.ndim == 3), f'hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D'
         if packed_seq_params is not None:
             assert (packed_seq_params.local_cp_size
                     is None), 'dynamic context parallel is not supported with MLA yet and is planned for future. \
@@ -326,9 +326,9 @@ class AbsorbedMLASelfAttention(McoreAbsorbedMLASelfAttention):
 
         assert core_attn_out.ndim == hidden_states.ndim
         assert core_attn_out.shape[0] == (hidden_states.shape[0] * self.config.tensor_model_parallel_size), (
-            f"{core_attn_out.shape[0]} != "
-            f"{hidden_states.shape[0]} * "
-            f"{self.config.tensor_model_parallel_size}")
+            f'{core_attn_out.shape[0]} != '
+            f'{hidden_states.shape[0]} * '
+            f'{self.config.tensor_model_parallel_size}')
         assert core_attn_out.shape[1:-1] == hidden_states.shape[1:-1]
         assert core_attn_out.size(-1) == (self.config.v_head_dim * self.num_attention_heads_per_partition)
 

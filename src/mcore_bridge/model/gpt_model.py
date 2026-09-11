@@ -177,6 +177,8 @@ class GPTModel(McoreGPTModel):
         if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:
             input_tensor = self.get_input_tensor()
             input_tensor, mtp_decoder_input = input_tensor.chunk(2, dim=0)
+            if self.config.enable_hyper_connections:
+                mtp_decoder_input = mtp_decoder_input[..., :self.config.hidden_size]
             self.set_input_tensor(input_tensor)
 
         rotary_pos_emb, rotary_pos_cos, rotary_pos_sin = self._get_rotary_pos_emb(
@@ -448,6 +450,10 @@ class GPTModel(McoreGPTModel):
         """
         if not self.post_process:
             if self.config.is_multimodal and self.config.mtp_num_layers:
+                if self.config.enable_hyper_connections:
+                    n = self.config.num_residual_streams
+                    s, b, c = decoder_input.shape
+                    decoder_input = decoder_input.unsqueeze(2).expand(s, b, n, c).reshape(s, b, n * c)
                 return torch.concat([hidden_states, decoder_input], dim=0)
             else:
                 return hidden_states
