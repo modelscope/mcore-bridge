@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.router import TopKRouter
 from peft import LoraModel
@@ -27,7 +28,8 @@ def dispatch_megatron(
     else:
         target_base_layer = target
 
-    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter)
+    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, ColumnParallelLinear, RowParallelLinear,
+                  TopKRouter)
     if isinstance(target_base_layer, linear_cls):
         new_module = LoraParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
 

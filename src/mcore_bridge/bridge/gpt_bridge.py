@@ -51,6 +51,10 @@ class GPTBridge:
     additional_dim1_keys = set()
     _support_hf_grouped_lora = True
 
+    @property
+    def use_transformer_engine(self):
+        return self.config.transformer_impl == 'transformer_engine'
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self._disable_tqdm = False
@@ -1638,8 +1642,9 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_attn_state(mg_attn, hf_state_dict, f'{self.hf_attn_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'self_attention.linear_qkv.layer_norm_weight', hf_state_dict,
-                                 self.hf_input_layernorm_key, to_mcore)
+            mg_key = ('self_attention.linear_qkv.layer_norm_weight'
+                      if self.use_transformer_engine else 'input_layernorm.weight')
+            self._set_state_dict(mg_layer, mg_key, hf_state_dict, self.hf_input_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
@@ -1658,8 +1663,8 @@ class GPTBridge:
         else:
             hf_state_dict.update(
                 self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-            self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
-                                 self.hf_post_attention_layernorm_key, to_mcore)
+            mg_key = 'mlp.linear_fc1.layer_norm_weight' if self.use_transformer_engine else 'pre_mlp_layernorm.weight'
+            self._set_state_dict(mg_layer, mg_key, hf_state_dict, self.hf_post_attention_layernorm_key, to_mcore)
         return hf_state_dict
 
     def _set_hyper_connection(self, mg_layer, hf_state_dict, layer_idx, to_mcore):
