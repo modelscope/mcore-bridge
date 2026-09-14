@@ -849,9 +849,7 @@ class GPTBridge:
         if (self._is_saving and not is_mtp and not self.config.fp8_param and not self._peft_format
                 and self.model_type == 'qwen3_5_moe'):
             return True, True
-        if self.model_type in {
-                'glm4v_moe', 'glm5_next', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'
-        } or self.llm_model_type in {
+        if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'} or self.llm_model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
                 'glm4_moe_lite', 'minimax_m2', 'olmoe', 'qwen3_next', 'glm_moe_dsa', 'deepseek_v32', 'deepseek_v4'
         }:
