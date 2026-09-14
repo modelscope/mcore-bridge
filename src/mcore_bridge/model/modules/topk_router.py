@@ -12,7 +12,8 @@ class TopKRouter(McoreTopKRouter):
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
-        if self.enable_expert_bias and torch.is_grad_enabled():
+        # Older Megatron versions update bias from these counts without checking frozen_expert_bias.
+        if self.enable_expert_bias and not getattr(self, 'frozen_expert_bias', False) and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
                     if padding_mask.ndim == 1:
