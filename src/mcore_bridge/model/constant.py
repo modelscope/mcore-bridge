@@ -32,6 +32,7 @@ class MLLMModelType:
     internvl = 'internvl'
     glm4v = 'glm4v'
     glm4v_moe = 'glm4v_moe'
+    glm5_next = 'glm5_next'
     kimi_vl = 'kimi_vl'
     llama4 = 'llama4'
     gemma4 = 'gemma4'
