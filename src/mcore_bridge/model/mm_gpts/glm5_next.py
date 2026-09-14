@@ -6,6 +6,7 @@ from transformers import PretrainedConfig
 from typing import Optional
 
 from mcore_bridge.bridge import MultimodalGPTBridge
+from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
@@ -268,6 +269,37 @@ class Glm5NextBridge(MultimodalGPTBridge):
     }
     additional_dim1_keys = {'o_proj', 'linear_proj'}
 
+    def _set_kda_qkv_lora(self, mg_attn, hf_state_dict, to_mcore: bool):
+        """Map fused KDA adapters with shared A and rank-local [Q, K, V] rows in B."""
+        proj = None if mg_attn is None else mg_attn.in_proj
+        is_lora = self._reduce_tensor_pp_group(isinstance(proj, LoraParallelLinear), to_mcore)
+        if not is_lora:
+            return
+        names = ('q_proj', 'k_proj', 'v_proj')
+        a_key = f'in_proj.lora_A.{self._adapter_name}.weight'
+        if to_mcore:
+            lora_a = [hf_state_dict[f'{name}.lora_A.weight'].load() for name in names]
+            if not all(torch.equal(lora_a[0], part) for part in lora_a[1:]):
+                raise ValueError('Fused KDA QKV requires identical q_proj/k_proj/v_proj LoRA A weights')
+            # Each TP shard stores local Q, then local K, then local V.
+            parts = [
+                self._split_tp(hf_state_dict[f'{name}.lora_B.weight'].load(), 0, False, is_embedding=False)
+                for name in names
+            ]
+            self._set_weight(proj.lora_A[self._adapter_name].weight, lora_a[0], a_key)
+            self._set_weight(proj.lora_B[self._adapter_name].weight, torch.cat(parts, dim=0), None)
+        else:
+            a = None if proj is None else proj.lora_A[self._adapter_name].weight.data
+            a, _ = self._get_weight(a, a_key)
+            # Split before gathering: gathering fused B would interleave ranks with Q/K/V.
+            parts = (None, ) * 3 if proj is None else proj.lora_B[self._adapter_name].weight.data.chunk(3, dim=0)
+            for name, part in zip(names, parts):
+                b, _ = self._get_weight(part, f'{name}.lora_B.{self._adapter_name}.weight')
+                if a is not None:
+                    self._peft_target_modules.add(name)
+                    hf_state_dict[f'{name}.lora_A.weight'] = a.clone()
+                    hf_state_dict[f'{name}.lora_B.weight'] = b.clone()
+
     def _set_kda_state(self, mg_attn, hf_state_dict, to_mcore):
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, 'self_attn.')
@@ -279,6 +311,10 @@ class Glm5NextBridge(MultimodalGPTBridge):
                                             'A_log', 'dt_bias')]
         for mg_key, hf_key in mappings:
             self._set_state_dict(mg_attn, mg_key, hf_state_dict, hf_key, to_mcore)
+        if self._peft_format:
+            self._set_kda_qkv_lora(mg_attn, hf_state_dict, to_mcore)
+            # Frozen QKV/conv weights are absent from an unmerged adapter checkpoint.
+            return {} if to_mcore else self._add_prefix(hf_state_dict, 'self_attn.')
         for mg_name, hf_names in (
             ('in_proj', ('q_proj.weight', 'k_proj.weight', 'v_proj.weight')),
             ('conv1d', ('q_conv1d.weight', 'k_conv1d.weight', 'v_conv1d.weight')),
@@ -353,11 +389,11 @@ class Glm5NextBridge(MultimodalGPTBridge):
         self._set_state_dict(hc, 'bias', hf_state_dict, f'hc_{branch}_base', to_mcore)
         if not to_mcore and f'hc_{branch}_fn' in hf_state_dict:
             hf_state_dict[f'hc_{branch}_fn'] = hf_state_dict[f'hc_{branch}_fn'].to(self.config.params_dtype)
-        if to_mcore and hc is not None:
+        if not self._peft_format and to_mcore and hc is not None:
             alpha = hf_state_dict[f'hc_{branch}_scale'].load()
             for idx, name in enumerate(('alpha_pre', 'alpha_post', 'alpha_res')):
                 self._set_weight(getattr(hc, name), alpha[idx:idx + 1], None)
-        elif not to_mcore:
+        elif not self._peft_format and not to_mcore:
             alpha = None if hc is None else torch.cat([hc.alpha_pre, hc.alpha_post, hc.alpha_res])
             alpha = self._get_weight(alpha, None)[0]
             if alpha is not None:
