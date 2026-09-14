@@ -2,8 +2,9 @@
 
 The real DeepSeek-V4-Flash-0731 is far too large to test with, so this builds a
 4-layer model from its config and fills every tensor with random values. The
-`mtp.*` weights follow the standard MTP layout of the real checkpoint,
-including the stage-specific extras that Megatron has no module for.
+`mtp.*` (DSpark) weights follow the 3-stage layout of the real checkpoint,
+including the stage-specific extras (`main_proj`, `confidence_head`,
+`markov_head`) that Megatron has no module for.
 
 Two properties are checked:
   * with the flag on, the unsupported `mtp.*` weights survive the round-trip;
@@ -46,6 +47,8 @@ O_GROUPS = 2
 HEAD_DIM = 32
 NUM_HEADS = 4
 QK_ROPE_HEAD_DIM = 16
+MARKOV_RANK = 32
+DSPARK_TARGET_LAYERS = [1, 2, 3]
 
 # Shapes derived the same way the real checkpoint does (verified against 0731).
 QK_HEAD_DIM = HEAD_DIM  # wq_b rows are NUM_HEADS * head_dim
@@ -109,6 +112,10 @@ def _config() -> dict:
         'vocab_size': VOCAB,
         'compress_rope_theta': 160000,
         'compress_ratios': COMPRESS_RATIOS,
+        'dspark_block_size': 5,
+        'dspark_noise_token_id': VOCAB - 1,
+        'dspark_target_layer_ids': DSPARK_TARGET_LAYERS,
+        'dspark_markov_rank': MARKOV_RANK,
     }
 
 
@@ -117,7 +124,7 @@ def _rand(*shape) -> torch.Tensor:
 
 
 def _attn_and_ffn_weights(prefix: str) -> dict:
-    """Weights shared by every transformer block, main trunk and MTP alike."""
+    """Weights shared by every transformer block, main trunk and DSpark alike."""
     sd = {
         f'{prefix}attn_norm.weight': _rand(HIDDEN),
         f'{prefix}ffn_norm.weight': _rand(HIDDEN),
@@ -156,19 +163,20 @@ def _hc_head_weights(prefix: str) -> dict:
 
 
 def _mtp_weights() -> dict:
-    """The 3 standard MTP stages, mirroring the real key layout."""
+    """The 3 asymmetric DSpark stages, mirroring the real key layout."""
     sd = {}
     for stage in range(NUM_MTP_STAGES):
         sd.update(_attn_and_ffn_weights(f'mtp.{stage}.'))
         if stage == 0:
-            # Stage 0: standard MTP projection weights.
-            sd['mtp.0.enorm.weight'] = _rand(HIDDEN)
-            sd['mtp.0.hnorm.weight'] = _rand(HIDDEN)
-            sd['mtp.0.e_proj.weight'] = _rand(HIDDEN, HIDDEN)
-            sd['mtp.0.h_proj.weight'] = _rand(HIDDEN, HIDDEN)
+            # Stage 0 consumes the concatenated hidden states of the target layers.
+            sd['mtp.0.main_norm.weight'] = _rand(HIDDEN)
+            sd['mtp.0.main_proj.weight'] = _rand(HIDDEN, HIDDEN * len(DSPARK_TARGET_LAYERS))
         if stage == NUM_MTP_STAGES - 1:
             # The last stage owns the output-side heads.
             sd['mtp.2.norm.weight'] = _rand(HIDDEN)
+            sd['mtp.2.confidence_head.proj.weight'] = _rand(1, HIDDEN + QK_ROPE_HEAD_DIM)
+            sd['mtp.2.markov_head.markov_w1.weight'] = _rand(VOCAB, MARKOV_RANK)
+            sd['mtp.2.markov_head.markov_w2.weight'] = _rand(VOCAB, MARKOV_RANK)
             sd.update(_hc_head_weights('mtp.2.'))
     return sd
 
@@ -268,7 +276,7 @@ def test_dsv4_mtp_weights_dropped_by_default():
 
 
 def test_dsv4_no_duplicate_mtp_when_megatron_exports_it():
-    """Guard against storing the same MTP parameters under two naming schemes.
+    """Guard against storing the same DSpark parameters under two naming schemes.
 
     When Megatron does materialize MTP layers it writes them as `model.mtp.*`,
     while the source checkpoint names them `mtp.*`. Both sets would then land in
@@ -280,15 +288,16 @@ def test_dsv4_no_duplicate_mtp_when_megatron_exports_it():
             output_dir = _export(
                 model_dir, os.path.join(tmp_dir, 'mtp'), save_missing_weights=True, mtp_num_layers=NUM_MTP_STAGES)
         except Exception as e:  # noqa: BLE001
-            # Expected today: Megatron cannot build the MTP stages yet.
-            print(f'SKIP: Megatron cannot load MTP layers yet ({type(e).__name__}: {e})')
+            # Expected today: `_convert_mtp_extra` looks for the pre-0731 `enorm.weight`
+            # layout, so Megatron cannot build the DSpark stages at all.
+            print(f'SKIP: Megatron cannot load DSpark MTP layers yet ({type(e).__name__}: {e})')
             return
         exported = _load_exported(output_dir)
 
         megatron_mtp = {k for k in exported if k.startswith('model.mtp.')}
         restored_mtp = {k for k in exported if k.startswith('mtp.')}
         assert not (megatron_mtp
-                    and restored_mtp), (f'MTP weights stored twice: {len(megatron_mtp)} keys as `model.mtp.*` and '
+                    and restored_mtp), (f'DSpark weights stored twice: {len(megatron_mtp)} keys as `model.mtp.*` and '
                                         f'{len(restored_mtp)} keys as `mtp.*`')
 
 

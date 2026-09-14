@@ -93,6 +93,11 @@ config_mapping = {
     'hybrid_layer_pattern': ['hybrid_override_pattern'],
     'fp32_residual_connection': ['residual_in_fp32'],
     'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
+    # dspark
+    'dspark_block_size': ['dspark_block_size'],
+    'dspark_noise_token_id': ['dspark_noise_token_id'],
+    'dspark_target_layer_ids': ['dspark_target_layer_ids'],
+    'dspark_markov_rank': ['dspark_markov_rank'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
     'partial_rotary_factor': ['partial_rotary_factor'],
@@ -204,6 +209,8 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             csa_compress_ratios = res.pop('csa_compress_ratios', None)
             res['csa_compress_ratios'] = [csa_compress_ratios.get(layer_type, 0) for layer_type in layer_types]
             res['moe_n_hash_layers'] = len([layer for layer in moe_n_hash_layers if layer == 'hash_moe'])
+            if res.get('dspark_target_layer_ids'):
+                res['dspark_enabled'] = True
     elif llm_model_type == 'hunyuan':
         # Since HunYuan’s attention applies RoPE before using q/k_layernorm,
         # which is incompatible with megatron-core, support is not provided here.

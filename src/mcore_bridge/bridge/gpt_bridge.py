@@ -2049,7 +2049,7 @@ class GPTBridge:
         """Copy tensors present in the source checkpoint but absent from the exported ones.
 
         Megatron only materializes the modules it knows about, so weights of unsupported
-        submodules (for instance the extra stages under `mtp.*`) would silently vanish
+        submodules (for instance the DSpark stages under `mtp.*`) would silently vanish
         from the exported checkpoint. Restoring them verbatim keeps the saved model
         functionally complete.
         """

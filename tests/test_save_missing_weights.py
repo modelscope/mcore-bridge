@@ -1,7 +1,7 @@
 """Verify that `save_weights(save_missing_weights=True)` restores tensors that
 Megatron never materializes.
 
-The scenario mirrors DeepSeek-V4-Flash-0731, whose `mtp.*` weights are
+The scenario mirrors DeepSeek-V4-Flash-0731, whose `mtp.*` (DSpark) weights are
 not supported by Megatron: without the restore step they silently disappear from
 the exported checkpoint.
 """

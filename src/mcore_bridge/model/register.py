@@ -20,8 +20,8 @@ from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
 
-from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, MultiTokenPredictionLayer, TopKRouter,
-                      TransformerBlock, TransformerLayer)
+from .modules import (AbsorbedMLASelfAttention, DSAIndexer, DSparkMultiTokenPredictionLayer, MLASelfAttention,
+                      MultiTokenPredictionLayer, TopKRouter, TransformerBlock, TransformerLayer)
 
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
