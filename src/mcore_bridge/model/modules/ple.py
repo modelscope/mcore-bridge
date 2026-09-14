@@ -8,6 +8,8 @@ from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
+from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint,
+                                             sharded_state_dict_default)
 from torch import nn
 from typing import List, Optional
 
@@ -167,6 +169,19 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
                 config=config,
             )
 
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        # Hash buffers are replicated; the embedding supplies its own TP metadata.
+        state_dict = {}
+        self._save_to_state_dict(state_dict, '', keep_vars=True)
+        state_dict = make_sharded_tensors_for_checkpoint(
+            state_dict, prefix, sharded_offsets=sharded_offsets, tp_group=tp_group, dp_cp_group=metadata['dp_cp_group'])
+        for name, module in self.named_children():
+            state_dict.update(
+                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group))
+        return state_dict
+
     # The PLE ngram embedding table is stored in the checkpoint as F8_E4M3 shards
     # plus a single scalar `weight_scale` (unlike experts, which use blockwise
     # `weight_scale_inv`). The true values are `weight * scale`.
@@ -219,16 +234,24 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
 
     @torch.no_grad()
     def export_table_to_hf(self, hf_state_dict, prefix=''):
-        """Reverse of ``fill_table_from_hf``: write the offloaded table back as HF
+        """Reverse of ``fill_table_from_hf``: write the current table back as HF
         shards so a full-parameter checkpoint is self-contained.
         """
-        if not self.cpu_offload:
-            return
         total = self.padded_vocab_size
         parts = self.split_ngram_parts
         shard_size = (total + parts - 1) // parts
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         tp_group = parallel_state.get_tensor_model_parallel_group()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        if self.cpu_offload:
+            table = self.host_table
+            tp_start, tp_end = self.vocab_start, self.vocab_end
+            device = torch.cuda.current_device()
+        else:
+            table = self.ngram_embedding.weight
+            tp_start = tp_rank * self.ngram_embedding.num_embeddings_per_partition
+            tp_end = min(tp_start + table.shape[0], total)
+            device = table.device
         # Inverse of fill_table_from_hf: the checkpoint format is fp8 shards +
         # scalar `weight_scale`, so divide by the scale stashed during loading and
         # cast back to fp8. Without a known scale the values cannot be represented
@@ -242,12 +265,11 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
             # CPU. Each rank scatters its owned rows into a full shard, sums across
             # TP (rows are disjoint, so sum == gather), then rank 0 keeps the CPU copy.
-            device = torch.cuda.current_device()
-            local = torch.zeros(ce - cs, self.host_table.shape[-1], dtype=self.host_table.dtype, device=device)
-            s, e = max(cs, self.vocab_start), min(ce, self.vocab_end)
+            local = torch.zeros(ce - cs, table.shape[-1], dtype=table.dtype, device=device)
+            s, e = max(cs, tp_start), min(ce, tp_end)
             if s < e:
-                local[s - cs:e - cs] = self.host_table[s - self.vocab_start:e - self.vocab_start].to(device)
-            if self._tp_size > 1:
+                local[s - cs:e - cs] = table[s - tp_start:e - tp_start].to(device)
+            if tp_size > 1:
                 torch.distributed.all_reduce(local, group=tp_group)
             if tp_rank == 0:
                 # Re-quantize after the all_reduce: fp8 is not a valid accumulation
@@ -365,6 +387,15 @@ class Qwen4ExpTextPLELayer(nn.Module):
         norm_key.weight / norm_query.weight / norm_conv.weight
         conv1d.weight
     """
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        # Visit the embedding's sharded_state_dict instead of flattening its weights.
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        state_dict = {}
+        for name, module in self.named_children():
+            state_dict.update(
+                sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata, tp_group=tp_group))
+        return state_dict
 
     def __init__(self, config, ple_layer_index: int, pg_collection=None):
         super().__init__()
