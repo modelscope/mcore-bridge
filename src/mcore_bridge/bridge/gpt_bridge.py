@@ -28,6 +28,9 @@ EP_PP_RANK = None
 
 class GPTBridge:
     fp8_block_size = 128
+    # Bound the per-collective GPU buffer when a full gathered tensor is
+    # streamed to CPU (checkpoint save / CPU-offloaded weight sync).
+    export_chunk_bytes = 256 << 20
     hf_layers_prefix = 'model.layers'
     hf_mtp_prefix = 'model.layers'
     hf_embed_key = 'model.embed_tokens.weight'
@@ -336,11 +339,57 @@ class GPTBridge:
                         hf_state_dict[k] = v.to(self._target_device)
             return self._add_prefix(hf_state_dict, hf_prefix)
 
+    def _stream_to_cpu(self) -> bool:
+        """Whether large gathers/broadcasts should be chunked straight into host
+        memory. Enabled when the exported tensor is requested on CPU (checkpoint
+        save / CPU-offloaded weight sync): materializing the full gathered tensor
+        on GPU can OOM while the training state is still resident. The decision
+        only depends on properties identical across the group, so the collective
+        sequence stays in sync on every rank. Every participating rank still
+        assembles the full CPU result (matching the pre-chunking semantics); only
+        the GPU-resident full-size buffer is avoided."""
+        return self._target_device == 'cpu'
+
+    def _chunk_rows(self, shape, elem_size: int) -> int:
+        """Rows (along dim0) per broadcast/gather chunk, ~export_chunk_bytes."""
+        inner = 1
+        for s in shape[1:]:
+            inner *= s
+        rows = max(1, self.export_chunk_bytes // max(1, inner * elem_size))
+        return min(rows, shape[0])
+
+    def _chunked_all_gather_tp(self, tensor, tp_dim: int, tp_group, tp_size: int):
+        """All-gather `tensor` along tp_dim and assemble the result in host memory
+        chunk by chunk, so the full gathered tensor never exists on GPU at once.
+        The chunk count derives from the local shape, which is identical on every
+        rank of the group, so the collective sequence stays in sync."""
+        dim_size = tensor.shape[tp_dim]
+        chunk_bytes = max(1, self.export_chunk_bytes // tp_size)
+        inner_rows = max(1, chunk_bytes // max(1, tensor.numel() // dim_size * tensor.element_size()))
+        out_shape = list(tensor.shape)
+        out_shape[tp_dim] = dim_size * tp_size
+        output = torch.empty(out_shape, dtype=tensor.dtype, device='cpu')
+        for start in range(0, dim_size, inner_rows):
+            end = min(dim_size, start + inner_rows)
+            local = tensor.narrow(tp_dim, start, end - start).contiguous()
+            gathered = [torch.empty_like(local) for _ in range(tp_size)]
+            dist.all_gather(gathered, local, group=tp_group)
+            del local
+            for j in range(tp_size):
+                dst = tuple(
+                    slice(j * dim_size + start, j * dim_size + end) if ax == tp_dim else slice(None)
+                    for ax in range(tensor.ndim))
+                output[dst] = gathered[j].cpu()
+            del gathered
+        return output
+
     def _all_gather_tp(self, tensor, tp_dim, is_expert):
         tensor = None if tensor is None else tensor.to('cuda')
         tp_size = self.etp_size if is_expert else self.tp_size
         tp_group = self.etp_group if is_expert else self.tp_group
         if tensor is not None and tp_dim is not None and tp_size > 1:
+            if self._stream_to_cpu() and tensor.numel() * tensor.element_size() > self.export_chunk_bytes:
+                return self._chunked_all_gather_tp(tensor, tp_dim, tp_group, tp_size)
             if tp_dim == 0:
                 # save memory
                 tensor_shape = list(tensor.shape)
@@ -363,6 +412,33 @@ class GPTBridge:
             del output
         return tensor
 
+    def _chunked_broadcast_pp(self, tensor, shape, dtype, src_rank: int, pp_group):
+        """Chunked pp/ep-pp broadcast (the pp counterpart of _chunked_all_gather_tp):
+        stream the tensor chunk by chunk instead of materializing the full buffer
+        on GPU. On the holder rank `tensor` carries the data and is returned
+        as-is; receivers pass `shape`/`dtype` from the already-broadcast meta and
+        assemble the result in host memory (ranks that do not keep the export
+        still join every collective but skip the host assembly). Both sides
+        derive the same chunk count from the meta shape."""
+        rows = self._chunk_rows(shape, torch.tensor([], dtype=dtype).element_size())
+        if tensor is not None:
+            for start in range(0, shape[0], rows):
+                end = min(shape[0], start + rows)
+                send = tensor[start:end]
+                if not send.is_cuda or send.dtype != dtype or not send.is_contiguous():
+                    send = send.to(device='cuda', dtype=dtype).contiguous()
+                dist.broadcast(send, src=src_rank, group=pp_group)
+            return tensor
+        output = torch.empty(shape, dtype=dtype, device='cpu')
+        buf = None
+        for start in range(0, shape[0], rows):
+            end = min(shape[0], start + rows)
+            if buf is None or buf.shape[0] != end - start:
+                buf = torch.empty([end - start] + list(shape[1:]), device='cuda', dtype=dtype)
+            dist.broadcast(buf, src=src_rank, group=pp_group)
+            output[start:end] = buf.cpu()
+        return output
+
     def _broadcast_ep_pp(self, tensor, is_expert):
         pp_group = self.ep_pp_group if is_expert else self.pp_group
         pp_size = self.ep_pp_size if is_expert else self.pp_size
@@ -379,6 +455,10 @@ class GPTBridge:
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)
                 shape = meta_data[1:1 + meta_data[0]].tolist()
                 dtype = dtype_mapping[meta_data[-1].item()]
+                numel = math.prod(shape) if shape else 1
+                if self._stream_to_cpu() and numel * torch.empty(
+                    (), dtype=dtype).element_size() > (self.export_chunk_bytes) and len(shape) > 0:
+                    return self._chunked_broadcast_pp(None, shape, dtype, src_rank, pp_group)
                 tensor = torch.empty(shape, device='cuda', dtype=dtype)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
             else:
@@ -386,6 +466,9 @@ class GPTBridge:
                 meta_data[1:1 + tensor.ndim] = torch.tensor(tensor.shape, dtype=torch.int64, device='cuda')
                 meta_data[-1] = dtype_mapping_r[tensor.dtype]
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)
+                if self._stream_to_cpu() and tensor.numel() * tensor.element_size() > (
+                        self.export_chunk_bytes) and tensor.ndim > 0:
+                    return self._chunked_broadcast_pp(tensor, list(tensor.shape), tensor.dtype, src_rank, pp_group)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
         return tensor
 
@@ -766,7 +849,9 @@ class GPTBridge:
         if (self._is_saving and not is_mtp and not self.config.fp8_param and not self._peft_format
                 and self.model_type == 'qwen3_5_moe'):
             return True, True
-        if self.model_type in {'glm4v_moe', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'} or self.llm_model_type in {
+        if self.model_type in {
+                'glm4v_moe', 'glm5_next', 'kimi_vl', 'qwen3_omni_moe', 'qwen3_5_moe'
+        } or self.llm_model_type in {
                 'qwen2_moe', 'qwen3_moe', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'dots1', 'ernie4_5_moe', 'glm4_moe',
                 'glm4_moe_lite', 'minimax_m2', 'olmoe', 'qwen3_next', 'glm_moe_dsa', 'deepseek_v32', 'deepseek_v4'
         }:

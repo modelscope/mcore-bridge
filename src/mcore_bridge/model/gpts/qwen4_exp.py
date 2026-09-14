@@ -23,6 +23,7 @@ from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
                        Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
                        qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules.ple import Qwen4ExpTextNGramEmbedding
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -391,6 +392,20 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             ple.ple_embedding.fill_table_from_hf(hf_state_dict)
         elif not skip_ngram_state and ple is not None:
             ple.ple_embedding.export_table_to_hf(hf_state_dict)
+        if not to_mcore and not skip_ngram_state and self.pp_size > 1:
+            # The shards are assembled on tp rank 0 of the stage owning the PLE
+            # layer -- which is exactly `pp_src_rank` within the tp0 pp group.
+            # Mirror the ngram buffers above so every pp rank (in particular the
+            # master that writes the checkpoint) carries them; groups whose tp
+            # coord does not own the table receive None and insert nothing.
+            shard_prefix = 'ple.ple_embedding.ngram_embedding'
+            keys = [f'{shard_prefix}.shard_{i}.weight' for i in range(self.config.split_ngram_parts)]
+            keys.append(Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY)
+            for key in keys:
+                obj = [hf_state_dict.get(key)]
+                dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+                if obj[0] is not None:
+                    hf_state_dict[key] = obj[0]
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),

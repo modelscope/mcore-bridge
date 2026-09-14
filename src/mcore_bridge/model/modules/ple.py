@@ -17,6 +17,9 @@ from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
 
 _MASK64 = (1 << 64) - 1
+# Cap the per-all_reduce GPU buffer when exporting the (potentially huge) ngram
+# table.
+_EXPORT_CHUNK_BYTES = 256 << 20
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
@@ -219,16 +222,26 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
 
     @torch.no_grad()
     def export_table_to_hf(self, hf_state_dict, prefix=''):
-        """Reverse of ``fill_table_from_hf``: write the offloaded table back as HF
-        shards so a full-parameter checkpoint is self-contained.
+        """Reverse of ``fill_table_from_hf``: write the n-gram table back as HF
+        shards so a full-parameter checkpoint is self-contained. Works for both
+        the host-resident (PLE_CPU_OFFLOAD=1) table and the TP-sharded
+        ``VocabParallelEmbedding`` (the default, which receives gradients and so
+        must not be silently dropped from the checkpoint).
         """
-        if not self.cpu_offload:
-            return
         total = self.padded_vocab_size
         parts = self.split_ngram_parts
         shard_size = (total + parts - 1) // parts
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         tp_group = parallel_state.get_tensor_model_parallel_group()
+        if self.cpu_offload:
+            table, table_start, table_end, dtype = (self.host_table, self.vocab_start, self.vocab_end,
+                                                    self.host_table.dtype)
+        else:
+            emb = self.ngram_embedding
+            per_partition = emb.num_embeddings_per_partition
+            table_start = tp_rank * per_partition
+            table_end = min(total, table_start + per_partition)
+            table, dtype = emb.weight.data, emb.weight.dtype
         # Inverse of fill_table_from_hf: the checkpoint format is fp8 shards +
         # scalar `weight_scale`, so divide by the scale stashed during loading and
         # cast back to fp8. Without a known scale the values cannot be represented
@@ -237,24 +250,39 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         if scale is None:
             get_logger().warning(f'`{self._NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
                                  'embedding without re-quantizing to fp8.')
+        # Reduce on GPU: NCCL has no CPU backend. Each rank scatters its owned rows
+        # into a full shard chunk, sums across TP (rows are disjoint, so sum ==
+        # gather), then rank 0 keeps the CPU copy. Chunking bounds the GPU
+        # transient: the shard can be far larger than the free VRAM left while the
+        # training state is still resident.
+        device = torch.cuda.current_device()
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+        chunk_rows = max(1, _EXPORT_CHUNK_BYTES // max(1, table.shape[-1] * elem_size))
+        out_dtype = torch.float8_e4m3fn if scale is not None else dtype
         for i in range(parts):
             cs, ce = i * shard_size, min((i + 1) * shard_size, total)
-            # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
-            # CPU. Each rank scatters its owned rows into a full shard, sums across
-            # TP (rows are disjoint, so sum == gather), then rank 0 keeps the CPU copy.
-            device = torch.cuda.current_device()
-            local = torch.zeros(ce - cs, self.host_table.shape[-1], dtype=self.host_table.dtype, device=device)
-            s, e = max(cs, self.vocab_start), min(ce, self.vocab_end)
-            if s < e:
-                local[s - cs:e - cs] = self.host_table[s - self.vocab_start:e - self.vocab_start].to(device)
-            if self._tp_size > 1:
-                torch.distributed.all_reduce(local, group=tp_group)
+            # Accumulate the shard on CPU chunk by chunk; assigning inside the
+            # loop would keep only the last chunk of each shard.
+            shard = None
             if tp_rank == 0:
-                # Re-quantize after the all_reduce: fp8 is not a valid accumulation
-                # dtype for NCCL, and the sum must happen in the loaded dtype.
-                if scale is not None:
-                    local = (local.to(torch.float32) / scale.to(local.device)).to(torch.float8_e4m3fn)
-                hf_state_dict[f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = local.cpu()
+                shard = torch.zeros(ce - cs, table.shape[-1], dtype=out_dtype, device='cpu')
+            for start in range(cs, ce, chunk_rows):
+                end = min(ce, start + chunk_rows)
+                local = torch.zeros(end - start, table.shape[-1], dtype=dtype, device=device)
+                s, e = max(start, table_start), min(end, table_end)
+                if s < e:
+                    local[s - start:e - start] = table[s - table_start:e - table_start].to(device)
+                if tp_size > 1:
+                    torch.distributed.all_reduce(local, group=tp_group)
+                if tp_rank == 0:
+                    # Re-quantize after the all_reduce: fp8 is not a valid accumulation
+                    # dtype for NCCL, and the sum must happen in the loaded dtype.
+                    if scale is not None:
+                        local = (local.to(torch.float32) / scale.to(local.device)).to(torch.float8_e4m3fn)
+                    shard[start - cs:end - cs] = local.cpu()
+            if tp_rank == 0:
+                hf_state_dict[f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight'] = shard
         if tp_rank == 0 and scale is not None:
             key = f'{prefix}{self._NGRAM_SCALE_KEY}'
             if key not in hf_state_dict:
