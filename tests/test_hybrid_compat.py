@@ -2,54 +2,106 @@
 """The shared dev numerical patch must not change other models' assembly or forward/backward."""
 import pytest
 import torch
+from test_glm5_next import _parallel_context
 from transformers import AutoConfig
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.register import get_mcore_model
-from test_glm5_next import _parallel_context
 
 
 def _config(name):
     if name == 'qwen3_5':
         from transformers import Qwen3_5Config
-        hf = Qwen3_5Config(text_config={
-            'vocab_size': 128, 'hidden_size': 256, 'intermediate_size': 512,
-            'num_hidden_layers': 2, 'num_attention_heads': 4, 'num_key_value_heads': 2,
-            'head_dim': 64, 'linear_num_key_heads': 4, 'linear_num_value_heads': 4,
-            'linear_key_head_dim': 64, 'linear_value_head_dim': 64,
-            'linear_conv_kernel_dim': 4, 'layer_types': ['linear_attention', 'full_attention'],
-            'tie_word_embeddings': False,
-        })
+        hf = Qwen3_5Config(
+            text_config={
+                'vocab_size': 128,
+                'hidden_size': 256,
+                'intermediate_size': 512,
+                'num_hidden_layers': 2,
+                'num_attention_heads': 4,
+                'num_key_value_heads': 2,
+                'head_dim': 64,
+                'linear_num_key_heads': 4,
+                'linear_num_value_heads': 4,
+                'linear_key_head_dim': 64,
+                'linear_value_head_dim': 64,
+                'linear_conv_kernel_dim': 4,
+                'layer_types': ['linear_attention', 'full_attention'],
+                'tie_word_embeddings': False,
+            })
         values = hf_to_mcore_config(hf)
         values['language_model_only'] = True
     elif name == 'deepseek_v4':
         hf = AutoConfig.for_model(
-            'deepseek_v4', vocab_size=128, hidden_size=256, num_hidden_layers=2,
-            num_attention_heads=4, num_key_value_heads=1, head_dim=32, qk_rope_head_dim=16,
-            q_lora_rank=64, o_lora_rank=32, o_groups=2, moe_intermediate_size=128,
-            n_routed_experts=4, n_shared_experts=1, num_experts_per_tok=2,
-            num_hash_layers=0, hc_mult=2, hc_sinkhorn_iters=4, sliding_window=32,
-            compress_ratios=[0, 0], index_head_dim=32, index_n_heads=4, index_topk=8,
-            max_position_embeddings=256, norm_topk_prob=True, scoring_func='sqrtsoftplus',
-            routed_scaling_factor=1.5, swiglu_limit=10.0, tie_word_embeddings=False,
+            'deepseek_v4',
+            vocab_size=128,
+            hidden_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            num_key_value_heads=1,
+            head_dim=32,
+            qk_rope_head_dim=16,
+            q_lora_rank=64,
+            o_lora_rank=32,
+            o_groups=2,
+            moe_intermediate_size=128,
+            n_routed_experts=4,
+            n_shared_experts=1,
+            num_experts_per_tok=2,
+            num_hash_layers=0,
+            hc_mult=2,
+            hc_sinkhorn_iters=4,
+            sliding_window=32,
+            compress_ratios=[0, 0],
+            index_head_dim=32,
+            index_n_heads=4,
+            index_topk=8,
+            max_position_embeddings=256,
+            norm_topk_prob=True,
+            scoring_func='sqrtsoftplus',
+            routed_scaling_factor=1.5,
+            swiglu_limit=10.0,
+            tie_word_embeddings=False,
         )
         values = hf_to_mcore_config(hf)
         values['mtp_num_layers'] = None
     else:
         from mcore_bridge.config.parser import squared_relu
         values = dict(
-            hf_model_type='nemotron_h', llm_model_type='nemotron_h', mcore_model_type='nemotron_h',
-            num_layers=4, hidden_size=256, ffn_hidden_size=512, num_attention_heads=4,
-            num_query_groups=2, padded_vocab_size=128, max_position_embeddings=256,
-            hybrid_layer_pattern='M*-E', is_hybrid_model=True, position_embedding_type='none',
-            mamba_num_heads=8, mamba_head_dim=64, mamba_num_groups=1, mamba_state_dim=16,
-            num_moe_experts=4, moe_ffn_hidden_size=128, moe_shared_expert_intermediate_size=128,
-            swiglu=False, gated_linear_unit=False, activation_func=squared_relu,
-            add_qkv_bias=False, moe_router_load_balancing_type='none',
+            hf_model_type='nemotron_h',
+            llm_model_type='nemotron_h',
+            mcore_model_type='nemotron_h',
+            num_layers=4,
+            hidden_size=256,
+            ffn_hidden_size=512,
+            num_attention_heads=4,
+            num_query_groups=2,
+            padded_vocab_size=128,
+            max_position_embeddings=256,
+            hybrid_layer_pattern='M*-E',
+            is_hybrid_model=True,
+            position_embedding_type='none',
+            mamba_num_heads=8,
+            mamba_head_dim=64,
+            mamba_num_groups=1,
+            mamba_state_dim=16,
+            num_moe_experts=4,
+            moe_ffn_hidden_size=128,
+            moe_shared_expert_intermediate_size=128,
+            swiglu=False,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            add_qkv_bias=False,
+            moe_router_load_balancing_type='none',
         )
-    values.update(params_dtype=torch.bfloat16, pipeline_dtype=torch.bfloat16, bf16=True,
-                  perform_initialization=True, use_cpu_initialization=False, overlap_p2p_comm=False)
+    values.update(
+        params_dtype=torch.bfloat16,
+        pipeline_dtype=torch.bfloat16,
+        bf16=True,
+        perform_initialization=True,
+        use_cpu_initialization=False,
+        overlap_p2p_comm=False)
     return ModelConfig(**values)
 
 

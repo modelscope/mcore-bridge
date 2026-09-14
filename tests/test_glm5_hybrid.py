@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # The gate-precision and KPool cases are adapted from Megatron-LM #7054 / be805e55 (NVIDIA license).
 import copy
-
 import pytest
 import torch
 from megatron.core import parallel_state
@@ -10,9 +9,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
-
 from test_glm5_next import _parallel_context
-
 
 pytestmark = pytest.mark.skipif(
     'kda_two_stage_gates' not in TransformerConfig.__dataclass_fields__,
@@ -29,16 +26,25 @@ def test_gate_precision_and_packed_boundaries(variant):
         assert pg.tp.size() == pg.cp.size() == pg.pp.size() == 1
         assert parallel_state.get_context_parallel_world_size() == 1
         config = TransformerConfig(
-            num_layers=1, hidden_size=256, num_attention_heads=2,
-            linear_num_key_heads=2, linear_num_value_heads=2,
-            linear_key_head_dim=128, linear_value_head_dim=128, linear_conv_kernel_dim=4,
-            params_dtype=torch.bfloat16, bf16=True, normalization='RMSNorm',
-            activation_func=torch.nn.functional.silu, kda_two_stage_gates=variant == 'kda',
-            kda_safe_gate=True, kda_lower_bound=-5.0, perform_initialization=True,
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=2,
+            linear_num_key_heads=2,
+            linear_num_value_heads=2,
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+            linear_conv_kernel_dim=4,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            normalization='RMSNorm',
+            activation_func=torch.nn.functional.silu,
+            kda_two_stage_gates=variant == 'kda',
+            kda_safe_gate=True,
+            kda_lower_bound=-5.0,
+            perform_initialization=True,
         )
-        spec = copy.deepcopy(getattr(
-            hybrid_stack_spec.submodules, f"{variant.removesuffix('_direct')}_layer"
-        ).submodules.self_attention)
+        spec = copy.deepcopy(
+            getattr(hybrid_stack_spec.submodules, f"{variant.removesuffix('_direct')}_layer").submodules.self_attention)
         if variant == 'kda':
             spec.submodules.f_a_proj = spec.submodules.g_a_proj = TELinear
             spec.submodules.f_b_proj = spec.submodules.g_b_proj = TEColumnParallelLinear
@@ -63,17 +69,16 @@ def test_gate_precision_and_packed_boundaries(variant):
             x = torch.randn(256, 128, device='cuda', dtype=torch.bfloat16, requires_grad=True)
             gate = torch.randn_like(x, requires_grad=True)
             actual = layer._apply_gated_norm(x, gate)
-            expected = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True)
-                         + config.layernorm_epsilon) * layer.out_norm.weight.float()
-                         * gate.float().sigmoid()).to(x.dtype)
+            expected = (x.float() * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + config.layernorm_epsilon)
+                        * layer.out_norm.weight.float() * gate.float().sigmoid()).to(x.dtype)
             assert (actual.float() - expected.float()).abs().mean() < 2e-5
             actual.float().sum().backward()
             assert x.grad is not None and gate.grad is not None
         if variant.startswith('kda'):
             hidden = torch.randn(260, 1, 256, device='cuda', dtype=torch.bfloat16, requires_grad=True)
             cu = torch.tensor([0, 129, 260], device='cuda', dtype=torch.int32)
-            packed = PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                                     max_seqlen_q=131, max_seqlen_kv=131)
+            packed = PackedSeqParams(
+                qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=131, max_seqlen_kv=131)
             output = layer(hidden, attention_mask=None, packed_seq_params=packed)[0]
             separate = torch.cat([layer(x, attention_mask=None)[0] for x in hidden.split([129, 131])])
             torch.testing.assert_close(output, separate, rtol=0.03, atol=0.002)
@@ -86,8 +91,8 @@ def _legacy_mhc_post(comb, streams, post, output):
     # Pins dev's original default expression; the BF16 reference must not be replaced by the FP32
     # mixing formula.
     seq, batch, count, hidden = streams.shape
-    mixed = torch.bmm(comb.view(seq * batch, count, count).transpose(1, 2),
-                      streams.view(seq * batch, count, hidden)).view_as(streams)
+    mixed = torch.bmm(comb.view(seq * batch, count, count).transpose(1, 2), streams.view(seq * batch, count,
+                                                                                         hidden)).view_as(streams)
     return post.unsqueeze(-1) * output.unsqueeze(2) + mixed
 
 
@@ -97,9 +102,13 @@ def test_mhc_precision(fp32_mixing, scale):
     from megatron.core.transformer.hyper_connection import HyperConnectionModule
 
     torch.manual_seed(42)
-    config = TransformerConfig(num_layers=1, hidden_size=32, num_attention_heads=4,
-                               layernorm_epsilon=1e-5, mhc_norm_eps_inside_sqrt=fp32_mixing,
-                               mhc_keep_mappings_in_fp32=fp32_mixing)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=32,
+        num_attention_heads=4,
+        layernorm_epsilon=1e-5,
+        mhc_norm_eps_inside_sqrt=fp32_mixing,
+        mhc_keep_mappings_in_fp32=fp32_mixing)
     layer = HyperConnectionModule(config, layer_number=1).cuda()
     residual = (torch.randn(16, 2, 128, device='cuda') * scale).to(torch.bfloat16).requires_grad_()
     output = torch.randn(16, 2, 32, device='cuda', dtype=torch.bfloat16, requires_grad=True)
@@ -107,8 +116,8 @@ def test_mhc_precision(fp32_mixing, scale):
     dtype = torch.float32 if fp32_mixing else torch.bfloat16
     assert pre.dtype == post.dtype == comb.dtype == dtype
     x = residual.float()
-    rms = torch.rsqrt(x.square().mean(-1, keepdim=True) + 1e-5) if fp32_mixing else (
-        x.norm(dim=-1, keepdim=True) / 128**0.5 + 1e-6).reciprocal()
+    rms = torch.rsqrt(x.square().mean(-1, keepdim=True)
+                      + 1e-5) if fp32_mixing else (x.norm(dim=-1, keepdim=True) / 128**0.5 + 1e-6).reciprocal()
     alpha = torch.cat([layer.alpha_pre.expand(4), layer.alpha_post.expand(4), layer.alpha_res.expand(16)])
     logits = (x @ layer.mapping_proj.weight.T) * rms * alpha + layer.bias
     torch.testing.assert_close(pre, (logits[..., :4].sigmoid() + 1e-6).to(dtype))
@@ -135,7 +144,7 @@ def test_mhc_precision(fp32_mixing, scale):
         assert tensor.grad is not None and torch.isfinite(tensor.grad).all()
 
 
-@pytest.mark.parametrize('lengths', [(1,), (7,), (3, 5, 7), (1, 1, 1)])
+@pytest.mark.parametrize('lengths', [(1, ), (7, ), (3, 5, 7), (1, 1, 1)])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 def test_kpool_causal_tail_and_packed_boundaries(lengths, dtype):
     from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_kpool
@@ -163,12 +172,16 @@ def test_kpool_causal_tail_and_packed_boundaries(lengths, dtype):
 @pytest.mark.parametrize('pp', [1, 2, 4, 8])
 def test_pipeline_pattern_keeps_hf_block_pairs(pp):
     from types import SimpleNamespace
+
     from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextHybridModel, glm5_hybrid_layer_mapping
 
     config = SimpleNamespace(
-        num_layers=90, hybrid_layer_pattern='K-' * 3 + 'DE' * 42,
-        pipeline_model_parallel_size=pp, virtual_pipeline_model_parallel_size=None,
-        pipeline_model_parallel_layout=None, num_layers_in_first_pipeline_stage=None,
+        num_layers=90,
+        hybrid_layer_pattern='K-' * 3 + 'DE' * 42,
+        pipeline_model_parallel_size=pp,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        num_layers_in_first_pipeline_stage=None,
         num_layers_in_last_pipeline_stage=None,
     )
     mapped = glm5_hybrid_layer_mapping(config)
@@ -203,8 +216,9 @@ def test_megatron_patch_is_packaged_and_detectable():
 @pytest.mark.parametrize('mode', ['full', 'selective'])
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 def test_hybrid_recompute_forward_backward(mode, dtype):
-    from mcore_bridge.model.register import get_mcore_model
     from test_glm5_next import _build_parity_models, _LazyTensor, _model_inputs
+
+    from mcore_bridge.model.register import get_mcore_model
 
     with _parallel_context():
         _, _, baseline, checkpoint, config = _build_parity_models(moe=True, dtype=dtype)
@@ -212,8 +226,10 @@ def test_hybrid_recompute_forward_backward(mode, dtype):
         inputs = _model_inputs(batch=1, sequence=8)
         reference = baseline(*inputs)
         reference.float().square().mean().backward()
-        gradients = {name: param.grad.detach().clone() for name, param in baseline.named_parameters()
-                     if param.grad is not None}
+        gradients = {
+            name: param.grad.detach().clone()
+            for name, param in baseline.named_parameters() if param.grad is not None
+        }
         config.recompute_granularity = mode
         if mode == 'full':
             config.recompute_method, config.recompute_num_layers = 'uniform', 2
@@ -228,8 +244,12 @@ def test_hybrid_recompute_forward_backward(mode, dtype):
         for name, param in recomputed.named_parameters():
             if name in gradients:
                 assert param.grad is not None, name
-                torch.testing.assert_close(param.grad, gradients[name], rtol=1e-4, atol=1e-5,
-                                           msg=lambda message, key=name: f'{key}: {message}')
+                torch.testing.assert_close(
+                    param.grad,
+                    gradients[name],
+                    rtol=1e-4,
+                    atol=1e-5,
+                    msg=lambda message, key=name: f'{key}: {message}')
 
 
 def test_packed_padding_does_not_update_expert_bias_counts():
@@ -247,8 +267,7 @@ def test_packed_padding_does_not_update_expert_bias_counts():
         assert unpadded_count == 5 * router.topk
         router.local_tokens_per_expert.zero_()
         cu = torch.tensor([0, 5, 8], device='cuda', dtype=torch.int32)
-        packed = PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu,
-                                 max_seqlen_q=5, max_seqlen_kv=5)
+        packed = PackedSeqParams(qkv_format='thd', cu_seqlens_q=cu, cu_seqlens_kv=cu, max_seqlen_q=5, max_seqlen_kv=5)
         # Matches the extra metadata swift's prepare_batch attaches; the last span is TP alignment only.
         packed.seq_lens = torch.tensor([5], device='cuda')
         packed.num_samples = 1
@@ -278,13 +297,13 @@ def test_bf16_wrapper_keeps_glm_router_state_in_fp32():
 
 def test_tp2_fp32_parameter_gradients_match_hf(monkeypatch):
     """Compares gradient values directly, telling a backward-compute error from grad_norm statistics."""
-    import os
-    import json
     import importlib
+    import json
+    import os
     import triton.language as tl
-    from types import SimpleNamespace
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
-    from test_glm5_next import _build_parity_models, _checkpoint_state, _model_inputs, _hf_logits
+    from test_glm5_next import _build_parity_models, _checkpoint_state, _hf_logits, _model_inputs
+    from types import SimpleNamespace
 
     if os.environ.get('GLM5_PARALLEL_TEST') != 'tp2':
         pytest.skip('run with GLM5_PARALLEL_TEST=tp2 torchrun --nproc-per-node=2')
@@ -298,9 +317,12 @@ def test_tp2_fp32_parameter_gradients_match_hf(monkeypatch):
         model.train()
         head.requires_grad_()
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        wrapped = DistributedDataParallel(config, DistributedDataParallelConfig(
-            grad_reduce_in_fp32=True, overlap_grad_reduce=False, use_distributed_optimizer=False),
-            model, pg_collection=pg)
+        wrapped = DistributedDataParallel(
+            config,
+            DistributedDataParallelConfig(
+                grad_reduce_in_fp32=True, overlap_grad_reduce=False, use_distributed_optimizer=False),
+            model,
+            pg_collection=pg)
         assert pg.dp.size() == 1 and pg.expt_dp.size() == 2
         assert wrapped.expert_parallel_buffers
         for param in model.language_model.decoder.layers[3].inner_layer.mlp.experts.parameters():
@@ -343,7 +365,11 @@ def test_tp2_fp32_parameter_gradients_match_hf(monkeypatch):
             # 1.2e-4 -- the same floor tp=2 shows -- so 1e-5 was unreachable at any TP.
             if not torch.allclose(observed, reference, rtol=3e-4, atol=3e-4):
                 difference = (observed - reference).norm().item()
-                failures.append({'parameter': key, 'reference_norm': reference.norm().item(),
-                                 'actual_norm': observed.norm().item(), 'difference_norm': difference,
-                                 'max_abs': (observed - reference).abs().max().item()})
+                failures.append({
+                    'parameter': key,
+                    'reference_norm': reference.norm().item(),
+                    'actual_norm': observed.norm().item(),
+                    'difference_norm': difference,
+                    'max_abs': (observed - reference).abs().max().item()
+                })
         assert not failures, json.dumps(failures, indent=2)

@@ -715,9 +715,9 @@ def test_glm5_packed_backward_produces_finite_grads():
             assert not parameter.requires_grad, f'indexer.{name} should be frozen'
             assert parameter.grad is None, f'indexer.{name} unexpectedly got a gradient'
         kda = model.language_model.decoder.layers[0].inner_layer.self_attention
-        for name, parameter in (('in_proj', kda.in_proj.weight), ('out_proj', kda.out_proj.weight), ('out_norm',
-                                                                                                 kda.out_norm.weight),
-                                ('conv1d', kda.conv1d.weight), ('A_log', kda.A_log), ('dt_bias', kda.dt_bias)):
+        for name, parameter in (('in_proj', kda.in_proj.weight), ('out_proj', kda.out_proj.weight),
+                                ('out_norm', kda.out_norm.weight), ('conv1d', kda.conv1d.weight), ('A_log', kda.A_log),
+                                ('dt_bias', kda.dt_bias)):
             assert parameter.grad is not None, f'kda.{name} got no gradient'
             assert torch.isfinite(parameter.grad).all(), f'kda.{name} gradient is not finite'
 

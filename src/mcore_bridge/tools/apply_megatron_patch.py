@@ -51,15 +51,15 @@ def main():
     if is_applied(root):
         print(f'already applied: {root}')
         return 0
-    in_git = not subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=root,
-                                capture_output=True).returncode
-    command = (['git', 'apply', '--3way', str(PATCH)] if in_git else
-               ['patch', '-p1', '--forward', '-i', str(PATCH)])
+    in_git = not subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=root, capture_output=True).returncode
+    command = (['git', 'apply', '--3way', str(PATCH)] if in_git else ['patch', '-p1', '--forward', '-i', str(PATCH)])
     proc = subprocess.run(command, cwd=root, capture_output=True, text=True)
     print(proc.stdout + proc.stderr, end='')
     if proc.returncode:
-        print(f'could not apply {PATCH.name} to {root}. If megatron drifted from the commit above, '
-              f'update it and retry:\n  {INSTALL_HINT}', file=sys.stderr)
+        print(
+            f'could not apply {PATCH.name} to {root}. If megatron drifted from the commit above, '
+            f'update it and retry:\n  {INSTALL_HINT}',
+            file=sys.stderr)
     return proc.returncode
 
 
