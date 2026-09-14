@@ -515,7 +515,12 @@ class DeepseekV4GPTModel(GPTModel):
         if not self._dspark_target_hidden_states:
             return
         if self.config.enable_hyper_connections:
-            from megatron.core.transformer.hyper_connection import learned_output_contract
+            try:
+                from megatron.core.transformer.hyper_connection import learned_output_contract
+            except ImportError:
+                raise ImportError('DSpark with hyper-connections requires `learned_output_contract` from '
+                                  '`megatron.core.transformer.hyper_connection`. Please upgrade megatron-core '
+                                  'to a newer version that supports hyper-connections.')
             contracted = []
             for hs in self._dspark_target_hidden_states:
                 c = learned_output_contract(
