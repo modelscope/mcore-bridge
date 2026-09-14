@@ -47,7 +47,7 @@ if __name__ == '__main__':
         packages=find_packages('src'),
         # The Megatron patch for GLM-5.3 ships inside the package so an installed mcore-bridge can
         # apply it (see mcore_bridge/tools/apply_megatron_patch.py).
-        package_data={'mcore_bridge': ['patches/*.patch', 'patches/README.md']},
+        package_data={'mcore_bridge': ['patches/*.patch']},
         python_requires='>=3.8.0',
         classifiers=[
             'Development Status :: 4 - Beta',
