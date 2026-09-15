@@ -74,9 +74,15 @@ class HybridModel(McoreHybridModel):
             padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
         return padding_mask.contiguous()
 
-    def forward(self, input_ids, position_ids, attention_mask=None, *args, packed_seq_params=None, **kwargs):
-        padding_mask = None
-        if packed_seq_params is None:
+    def forward(self,
+                input_ids,
+                position_ids,
+                attention_mask=None,
+                *args,
+                packed_seq_params=None,
+                padding_mask=None,
+                **kwargs):
+        if padding_mask is None and packed_seq_params is None:
             padding_mask = self._get_padding_mask(attention_mask)
         return super().forward(
             input_ids,

@@ -53,6 +53,12 @@ config_mapping = {
     'linear_key_head_dim': ['linear_key_head_dim'],
     'linear_value_head_dim': ['linear_value_head_dim'],
     'linear_conv_kernel_dim': ['linear_conv_kernel_dim'],
+    # glm5_next (KDA); `linear_lower_bound` is HF's resolved safe-gate bound
+    'linear_num_heads': ['linear_num_heads'],
+    'linear_head_dim': ['linear_head_dim'],
+    'linear_lower_bound': ['linear_lower_bound'],
+    'hc_eps': ['hc_eps'],
+    'index_kpool': ['index_kpool'],
     # qwen4_exp
     'hc_count': ['hc_count'],
     'hc_lowrank': ['hc_lowrank'],
@@ -259,6 +265,33 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             if isinstance(val, list) and val and min(val) == max(val):
                 res[key] = val[0]
         n_shared_experts = res.pop('n_shared_experts')
+    elif hf_model_type == 'glm5_next':
+        text_config = hf_config.text_config
+        num_layers = res['num_layers']
+        layer_types = text_config.layer_types
+        mlp_layer_types = text_config.mlp_layer_types
+        # `hc_mult` reaches `num_residual_streams` through config_mapping (deepseek_v4's mHC
+        # field); Megatron dev's hybrid transformer block, which expands the residual into mHC
+        # streams, reads `hc_count` for the same thing.
+        res['hc_count'] = res['num_residual_streams']
+        pattern = ''.join(('K' if attn == 'linear_attention' else 'D') + ('E' if mlp == 'sparse' else '-')
+                          for attn, mlp in zip(layer_types, mlp_layer_types))
+        res['hybrid_layer_pattern'] = pattern
+        res['is_hybrid_model'] = True
+        res['num_layers'] = len(pattern)
+        res['linear_attention_freq'] = '[' + ','.join(str(int(symbol == 'K')) for symbol in pattern) + ']'
+        res['moe_layer_freq'] = '[' + ','.join(str(int(symbol == 'E')) for symbol in pattern) + ']'
+        res['enable_hyper_connections'] = True
+        res['position_embedding_type'] = 'none'
+        # config_mapping reads `kv_channels` off HF's `head_dim`, which glm5_next forces to
+        # `qk_rope_head_dim` (0, NoPE). Restore MCore's own default so the MLA dims stay intact.
+        res['kv_channels'] = res['hidden_size'] // res['num_attention_heads']
+        res['qk_layernorm'] = True
+        res['moe_router_load_balancing_type'] = 'none'
+        res['moe_router_enable_expert_bias'] = True
+        # moe_layer_freq above already encodes mlp_layer_types; keep the generic
+        # first_k_dense_replace expansion at the end of this function from overwriting it.
+        first_k_dense_replace = None
     elif llm_model_type in {'ernie4_5', 'ernie4_5_moe', 'glm4'}:
         res['rotary_interleaved'] = True
     elif hf_model_type in {'gemma4', 'gemma4_unified'}:

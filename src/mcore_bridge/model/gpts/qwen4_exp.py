@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import math
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -23,6 +24,7 @@ from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
                        Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
                        qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules.ple import Qwen4ExpTextNGramEmbedding
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -350,7 +352,69 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())
 
-    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
+    def _broadcast_pp_weight(self, tensor, pp_src_rank: int):
+        """Cross-pp transfer of one exported weight through the tp-aligned pp
+        group. `tensor` is non-None only on the exporting rank (tp rank 0 of the
+        stage owning the PLE layer, i.e. the src of its pp group); the other pp
+        members receive it. The payload is streamed through
+        `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
+        it always rides as raw bytes (flattened uint8): any current or future
+        low-width dtype (fp8 e4m3/e5m2, int8, packed fp4, ...) is transported
+        without NCCL dtype concerns; the meta carries the original shape/dtype
+        for the receiver to view back. Groups whose src has nothing to transfer
+        (tp != 0 coords) exchange only the empty meta.
+        """
+        meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
+        dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
+        if meta[0] is None:
+            return None
+        shape, dtype_name = meta[0]
+        dtype = getattr(torch, dtype_name)
+        if tensor is not None:
+            payload = tensor.contiguous().flatten().view(torch.uint8)
+            self._chunked_broadcast_pp(payload, list(payload.shape), payload.dtype, pp_src_rank, self.pp_group)
+            return tensor
+        byte_count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        out = self._chunked_broadcast_pp(None, [byte_count], torch.uint8, pp_src_rank, self.pp_group)
+        return out.view(dtype).view(shape)
+
+    def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
+        """Lazily export the PLE table shards one by one. On the exporting rank
+        (tp rank 0 of the owning stage) each shard is assembled by the chunked
+        all_reduce inside ``iter_export_table_to_hf`` and immediately streamed
+        to the other pp members; on the other stages it is received as it
+        arrives. Nothing accumulates: only the consumer (the safetensors
+        writer) drives the pace, so no rank ever holds more than a single shard
+        of the 100GB-scale table in host memory. The per-shard collectives keep
+        every rank of the tp-aligned pp groups in lockstep, exactly like the
+        synchronous version this generator replaces.
+        """
+        parts = self.config.split_ngram_parts
+        scale_key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
+        shard_prefix = 'ple.ple_embedding.ngram_embedding'
+        # On tp != 0 ranks of the owning stage the table iterator executes the
+        # same all_reduces but yields nothing (shards exist only on tp rank 0).
+        table_iter = ple.ple_embedding.iter_export_table_to_hf() if ple is not None else iter(())
+        for i in range(parts):
+            shard = next(table_iter, (None, None))[1] if ple is not None else None
+            if self.pp_size > 1:
+                shard = self._broadcast_pp_weight(shard, pp_src_rank)
+            if shard is not None:
+                yield f'{layer_prefix}{shard_prefix}.shard_{i}.weight', shard
+        # The scale is a tiny scalar; a pickled broadcast is fine.
+        scale = None
+        if ple is not None:
+            for k, v in table_iter:
+                if k == scale_key:
+                    scale = v
+        if self.pp_size > 1:
+            obj = [scale]
+            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+            scale = obj[0]
+        if scale is not None:
+            yield f'{layer_prefix}{scale_key}', scale
+
+    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool, layer_prefix: str = ''):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
         if to_mcore:
             # Only the stage owning the PLE layer reaches this path, so it
@@ -389,8 +453,15 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if not skip_ngram_state and to_mcore:
             # The table's only ingestion path: fill from the HF checkpoint shards.
             ple.ple_embedding.fill_table_from_hf(hf_state_dict)
-        elif not skip_ngram_state and ple is not None:
-            ple.ple_embedding.export_table_to_hf(hf_state_dict)
+        if not to_mcore and not skip_ngram_state:
+            # Stream the table shards one at a time instead of accumulating the
+            # 100GB-scale table in host memory: the generator below is only
+            # consumed at _convert's yield point (the safetensors writer drives
+            # the pace), and each shard is broadcast to the other pp members as
+            # it is produced, then released once written.
+            self._pending_export_iter = self._iter_ple_table_export(ple, pp_src_rank, layer_prefix)
+        else:
+            self._pending_export_iter = None
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),
@@ -413,7 +484,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         hf_state_dict.update(self._set_layer_mlp(mg_layer, hf_state_dict, layer_idx, to_mcore))
         self._set_layer_hc(mg_layer, hf_state_dict, to_mcore)
         if (layer_idx + 1) in (self.config.ple_layer_ids or []):
-            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore)
+            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore, layer_prefix=hf_prefix)
         if to_mcore:
             hf_state_dict = {}
         else:

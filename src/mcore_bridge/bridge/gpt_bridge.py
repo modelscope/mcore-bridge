@@ -18,6 +18,7 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
                                 deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
+from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
 
@@ -28,6 +29,9 @@ EP_PP_RANK = None
 
 class GPTBridge:
     fp8_block_size = 128
+    # Bound the per-collective GPU buffer when a full gathered tensor is
+    # streamed to CPU (checkpoint save / CPU-offloaded weight sync).
+    export_chunk_bytes = EXPORT_CHUNK_BYTES
     hf_layers_prefix = 'model.layers'
     hf_mtp_prefix = 'model.layers'
     hf_embed_key = 'model.embed_tokens.weight'
@@ -336,11 +340,57 @@ class GPTBridge:
                         hf_state_dict[k] = v.to(self._target_device)
             return self._add_prefix(hf_state_dict, hf_prefix)
 
+    def _stream_to_cpu(self) -> bool:
+        """Whether large gathers/broadcasts should be chunked straight into host
+        memory. Enabled when the exported tensor is requested on CPU (checkpoint
+        save / CPU-offloaded weight sync): materializing the full gathered tensor
+        on GPU can OOM while the training state is still resident. The decision
+        only depends on properties identical across the group, so the collective
+        sequence stays in sync on every rank. Every participating rank still
+        assembles the full CPU result (matching the pre-chunking semantics); only
+        the GPU-resident full-size buffer is avoided."""
+        return self._target_device == 'cpu'
+
+    def _chunk_rows(self, shape, elem_size: int) -> int:
+        """Rows (along dim0) per broadcast/gather chunk, ~export_chunk_bytes."""
+        inner = 1
+        for s in shape[1:]:
+            inner *= s
+        rows = max(1, self.export_chunk_bytes // max(1, inner * elem_size))
+        return max(1, min(rows, shape[0]))
+
+    def _chunked_all_gather_tp(self, tensor, tp_dim: int, tp_group, tp_size: int):
+        """All-gather `tensor` along tp_dim and assemble the result in host memory
+        chunk by chunk, so the full gathered tensor never exists on GPU at once.
+        The chunk count derives from the local shape, which is identical on every
+        rank of the group, so the collective sequence stays in sync."""
+        dim_size = tensor.shape[tp_dim]
+        chunk_bytes = max(1, self.export_chunk_bytes // tp_size)
+        inner_rows = max(1, chunk_bytes // max(1, tensor.numel() // dim_size * tensor.element_size()))
+        out_shape = list(tensor.shape)
+        out_shape[tp_dim] = dim_size * tp_size
+        output = torch.empty(out_shape, dtype=tensor.dtype, device='cpu')
+        for start in range(0, dim_size, inner_rows):
+            end = min(dim_size, start + inner_rows)
+            local = tensor.narrow(tp_dim, start, end - start).contiguous()
+            gathered = [torch.empty_like(local) for _ in range(tp_size)]
+            dist.all_gather(gathered, local, group=tp_group)
+            del local
+            for j in range(tp_size):
+                dst = tuple(
+                    slice(j * dim_size + start, j * dim_size + end) if ax == tp_dim else slice(None)
+                    for ax in range(tensor.ndim))
+                output[dst] = gathered[j].cpu()
+            del gathered
+        return output
+
     def _all_gather_tp(self, tensor, tp_dim, is_expert):
         tensor = None if tensor is None else tensor.to('cuda')
         tp_size = self.etp_size if is_expert else self.tp_size
         tp_group = self.etp_group if is_expert else self.tp_group
         if tensor is not None and tp_dim is not None and tp_size > 1:
+            if self._stream_to_cpu() and tensor.numel() * tensor.element_size() > self.export_chunk_bytes:
+                return self._chunked_all_gather_tp(tensor, tp_dim, tp_group, tp_size)
             if tp_dim == 0:
                 # save memory
                 tensor_shape = list(tensor.shape)
@@ -363,6 +413,33 @@ class GPTBridge:
             del output
         return tensor
 
+    def _chunked_broadcast_pp(self, tensor, shape, dtype, src_rank: int, pp_group):
+        """Chunked pp/ep-pp broadcast (the pp counterpart of _chunked_all_gather_tp):
+        stream the tensor chunk by chunk instead of materializing the full buffer
+        on GPU. On the holder rank `tensor` carries the data and is returned
+        as-is; receivers pass `shape`/`dtype` from the already-broadcast meta and
+        assemble the result in host memory (ranks that do not keep the export
+        still join every collective but skip the host assembly). Both sides
+        derive the same chunk count from the meta shape."""
+        rows = self._chunk_rows(shape, torch.tensor([], dtype=dtype).element_size())
+        if tensor is not None:
+            for start in range(0, shape[0], rows):
+                end = min(shape[0], start + rows)
+                send = tensor[start:end]
+                if not send.is_cuda or send.dtype != dtype or not send.is_contiguous():
+                    send = send.to(device='cuda', dtype=dtype).contiguous()
+                dist.broadcast(send, src=src_rank, group=pp_group)
+            return tensor
+        output = torch.empty(shape, dtype=dtype, device='cpu')
+        buf = None
+        for start in range(0, shape[0], rows):
+            end = min(shape[0], start + rows)
+            if buf is None or buf.shape[0] != end - start:
+                buf = torch.empty([end - start] + list(shape[1:]), device='cuda', dtype=dtype)
+            dist.broadcast(buf, src=src_rank, group=pp_group)
+            output[start:end] = buf.cpu()
+        return output
+
     def _broadcast_ep_pp(self, tensor, is_expert):
         pp_group = self.ep_pp_group if is_expert else self.pp_group
         pp_size = self.ep_pp_size if is_expert else self.pp_size
@@ -379,6 +456,10 @@ class GPTBridge:
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)
                 shape = meta_data[1:1 + meta_data[0]].tolist()
                 dtype = dtype_mapping[meta_data[-1].item()]
+                numel = math.prod(shape) if shape else 1
+                elem_size = torch.empty((), dtype=dtype).element_size()
+                if self._stream_to_cpu() and numel * elem_size > self.export_chunk_bytes and len(shape) > 0:
+                    return self._chunked_broadcast_pp(None, shape, dtype, src_rank, pp_group)
                 tensor = torch.empty(shape, device='cuda', dtype=dtype)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
             else:
@@ -386,6 +467,9 @@ class GPTBridge:
                 meta_data[1:1 + tensor.ndim] = torch.tensor(tensor.shape, dtype=torch.int64, device='cuda')
                 meta_data[-1] = dtype_mapping_r[tensor.dtype]
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)
+                if self._stream_to_cpu() and tensor.numel() * tensor.element_size() > (
+                        self.export_chunk_bytes) and tensor.ndim > 0:
+                    return self._chunked_broadcast_pp(tensor, list(tensor.shape), tensor.dtype, src_rank, pp_group)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
         return tensor
 
@@ -405,7 +489,7 @@ class GPTBridge:
                 tensor = [tensor]
             if self._is_fp8_param(tensor[0]):
                 mg_scale_inv = [
-                    t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)]
+                    t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)].contiguous()
                     for t in tensor
                 ]
                 tensor = [t._rowwise_data for t in tensor]
@@ -428,6 +512,8 @@ class GPTBridge:
         if tensor.dtype == torch.uint8:
             mg_scale_inv = self._all_gather_tp(mg_scale_inv, tp_dim, is_expert)
             mg_scale_inv = self._broadcast_ep_pp(mg_scale_inv, is_expert)
+            if mg_scale_inv is not None and mg_scale_inv.device != tensor.device:
+                mg_scale_inv = mg_scale_inv.to(tensor.device)
             tensor = tensor.view(torch.float8_e4m3fn)
         assert tensor is not None, f'mg_key: {mg_key}'
         if offset:
@@ -1775,6 +1861,7 @@ class GPTBridge:
         return res
 
     def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
+        self._pending_export_iter = None
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
             hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
@@ -1824,7 +1911,11 @@ class GPTBridge:
                 yield
             else:
                 res = self._convert_hf_state_dict(res, to_mcore)
-                yield from list(self._add_prefix(res, hf_prefix).items())
+                # Drain any staged PLE table shards first: they are produced one
+                # at a time (see _iter_ple_table_export) so the 100GB-scale table
+                # never accumulates in host memory.
+                yield from self._drain_pending_export(hf_prefix)
+                yield from self._add_prefix(res, hf_prefix).items()
                 hf_state_dict = {}
 
         if (not to_mcore or is_pp_last_stage) and self.config.mtp_num_layers:
@@ -1852,6 +1943,16 @@ class GPTBridge:
             hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
             yield from list(self._add_prefix(hf_state_dict, hf_prefix).items())
         prog_bar.close()
+
+    def _drain_pending_export(self, hf_prefix: str):
+        """Yield (and release) the PLE table shards staged by _set_layer_ple."""
+        it, self._pending_export_iter = self._pending_export_iter, None
+        if it is None:
+            return
+        for k, v in it:
+            if v is None:
+                continue
+            yield from self._add_prefix(self._convert_hf_state_dict({k: v}, False), hf_prefix).items()
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
         for key in ['enorm.weight', 'hnorm.weight', 'eh_proj.weight']:

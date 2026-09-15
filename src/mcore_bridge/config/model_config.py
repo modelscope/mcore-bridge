@@ -145,6 +145,7 @@ class ModelConfig(TransformerConfig):
 
     normalization: Literal['LayerNorm', 'RMSNorm'] = 'RMSNorm'
     layernorm_epsilon: float = 1e-5
+    attention_latent_norm_epsilon: Optional[float] = None
     swiglu: bool = True
     quick_geglu: bool = False
     activation_func_clamp_value: Optional[float] = None
@@ -200,6 +201,14 @@ class ModelConfig(TransformerConfig):
     layernorm_zero_centered_gamma: bool = False
     attention_output_gate: bool = False
     linear_decoupled_in_proj: bool = False
+
+    # glm5_next: KDA linear attention (`linear_*` are HF's own field names) + k-pool DSA indexer
+    # + mHC. `hc_count` / `mhc_sinkhorn_iterations` / `num_residual_streams` are reused as-is.
+    linear_num_heads: Optional[int] = None
+    linear_head_dim: Optional[int] = None
+    linear_lower_bound: Optional[float] = None
+    hc_eps: float = 1e-6
+    index_kpool: Optional[int] = None
 
     # qwen3.8-flash-next (HC + PLE + QSA)
     hc_count: Optional[int] = None
@@ -340,6 +349,9 @@ class ModelConfig(TransformerConfig):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
+        if self.hf_model_type == 'glm5_next':
+            from mcore_bridge.model.mm_gpts.glm5_next import require_glm5_hybrid
+            require_glm5_hybrid()
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
                             'experimental attention variant requires megatron-core>=0.16.0')
@@ -417,6 +429,8 @@ class ModelConfig(TransformerConfig):
         if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
             self.csa_compress_ratios += [0] * self.mtp_num_layers
         if self.multi_latent_attention:
+            if self.attention_latent_norm_epsilon is None:
+                self.attention_latent_norm_epsilon = self.layernorm_epsilon
             # multi_latent_attention always uses interleave, which corresponds to is_neox_style=False.
             # deepseek-v32: interleave + non-interleave (indexer)
             # glm-5: interleave + interleave (indexer)
