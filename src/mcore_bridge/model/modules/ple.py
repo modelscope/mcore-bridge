@@ -12,6 +12,7 @@ from torch import nn
 from typing import List, Optional
 
 from ...utils import get_env_args, get_logger
+from ...utils.constants import EXPORT_CHUNK_BYTES
 from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
@@ -19,7 +20,7 @@ from .kernels import gather_ple_rows, ple_gate_conv_triton
 _MASK64 = (1 << 64) - 1
 # Cap the per-all_reduce GPU buffer when exporting the (potentially huge) ngram
 # table.
-_EXPORT_CHUNK_BYTES = 256 << 20
+_EXPORT_CHUNK_BYTES = EXPORT_CHUNK_BYTES
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB

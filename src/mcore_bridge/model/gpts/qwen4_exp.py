@@ -351,6 +351,33 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())
 
+    def _broadcast_pp_weight(self, tensor, pp_src_rank: int):
+        """Cross-pp transfer of one exported weight through the tp-aligned pp
+        group. `tensor` is non-None only on the exporting rank (tp rank 0 of the
+        stage owning the PLE layer, i.e. the src of its pp group); the other pp
+        members receive it. The payload is streamed through
+        `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
+        fp8 rides as uint8 (NCCL has no float8 dtype). Groups whose src has
+        nothing to transfer (tp != 0 coords) exchange only the empty meta.
+        """
+        meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
+        dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
+        if meta[0] is None:
+            return None
+        shape, dtype_name = meta[0]
+        dtype = getattr(torch, dtype_name)
+        as_uint8 = dtype == torch.float8_e4m3fn
+        if tensor is not None:
+            src_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
+            if as_uint8:
+                src_tensor = src_tensor.view(torch.uint8)
+            self._chunked_broadcast_pp(src_tensor, list(src_tensor.shape), src_tensor.dtype, pp_src_rank,
+                                       self.pp_group)
+            return tensor
+        recv_shape, recv_dtype = (shape, torch.uint8) if as_uint8 else (shape, dtype)
+        out = self._chunked_broadcast_pp(None, recv_shape, recv_dtype, pp_src_rank, self.pp_group)
+        return out.view(dtype) if as_uint8 else out
+
     def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
         if to_mcore:
@@ -395,17 +422,22 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if not to_mcore and not skip_ngram_state and self.pp_size > 1:
             # The shards are assembled on tp rank 0 of the stage owning the PLE
             # layer -- which is exactly `pp_src_rank` within the tp0 pp group.
-            # Mirror the ngram buffers above so every pp rank (in particular the
-            # master that writes the checkpoint) carries them; groups whose tp
-            # coord does not own the table receive None and insert nothing.
+            # Stream each shard to the other pp members (in particular the
+            # master that writes the checkpoint); groups whose tp coord does
+            # not own the table exchange only the empty meta.
             shard_prefix = 'ple.ple_embedding.ngram_embedding'
             keys = [f'{shard_prefix}.shard_{i}.weight' for i in range(self.config.split_ngram_parts)]
-            keys.append(Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY)
             for key in keys:
-                obj = [hf_state_dict.get(key)]
-                dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
-                if obj[0] is not None:
-                    hf_state_dict[key] = obj[0]
+                tensor = hf_state_dict.get(key)
+                transferred = self._broadcast_pp_weight(tensor, pp_src_rank)
+                if tensor is None and transferred is not None:
+                    hf_state_dict[key] = transferred
+            # The scale is a tiny scalar; a pickled broadcast is fine.
+            key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
+            obj = [hf_state_dict.get(key)]
+            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+            if obj[0] is not None:
+                hf_state_dict[key] = obj[0]
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),

@@ -18,6 +18,7 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
                                 deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
+from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
 
@@ -30,7 +31,7 @@ class GPTBridge:
     fp8_block_size = 128
     # Bound the per-collective GPU buffer when a full gathered tensor is
     # streamed to CPU (checkpoint save / CPU-offloaded weight sync).
-    export_chunk_bytes = 256 << 20
+    export_chunk_bytes = EXPORT_CHUNK_BYTES
     hf_layers_prefix = 'model.layers'
     hf_mtp_prefix = 'model.layers'
     hf_embed_key = 'model.embed_tokens.weight'
@@ -511,6 +512,8 @@ class GPTBridge:
         if tensor.dtype == torch.uint8:
             mg_scale_inv = self._all_gather_tp(mg_scale_inv, tp_dim, is_expert)
             mg_scale_inv = self._broadcast_ep_pp(mg_scale_inv, is_expert)
+            if mg_scale_inv is not None and mg_scale_inv.device != tensor.device:
+                mg_scale_inv = mg_scale_inv.to(tensor.device)
             tensor = tensor.view(torch.float8_e4m3fn)
         assert tensor is not None, f'mg_key: {mg_key}'
         if offset:
