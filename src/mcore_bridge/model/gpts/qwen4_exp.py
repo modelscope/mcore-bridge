@@ -378,7 +378,43 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         out = self._chunked_broadcast_pp(None, recv_shape, recv_dtype, pp_src_rank, self.pp_group)
         return out.view(dtype) if as_uint8 else out
 
-    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
+    def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
+        """Lazily export the PLE table shards one by one. On the exporting rank
+        (tp rank 0 of the owning stage) each shard is assembled by the chunked
+        all_reduce inside ``iter_export_table_to_hf`` and immediately streamed
+        to the other pp members; on the other stages it is received as it
+        arrives. Nothing accumulates: only the consumer (the safetensors
+        writer) drives the pace, so no rank ever holds more than a single shard
+        of the 100GB-scale table in host memory. The per-shard collectives keep
+        every rank of the tp-aligned pp groups in lockstep, exactly like the
+        synchronous version this generator replaces.
+        """
+        parts = self.config.split_ngram_parts
+        scale_key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
+        shard_prefix = 'ple.ple_embedding.ngram_embedding'
+        # On tp != 0 ranks of the owning stage the table iterator executes the
+        # same all_reduces but yields nothing (shards exist only on tp rank 0).
+        table_iter = ple.ple_embedding.iter_export_table_to_hf() if ple is not None else iter(())
+        for i in range(parts):
+            shard = next(table_iter, (None, None))[1] if ple is not None else None
+            if self.pp_size > 1:
+                shard = self._broadcast_pp_weight(shard, pp_src_rank)
+            if shard is not None:
+                yield f'{layer_prefix}{shard_prefix}.shard_{i}.weight', shard
+        # The scale is a tiny scalar; a pickled broadcast is fine.
+        scale = None
+        if ple is not None:
+            for k, v in table_iter:
+                if k == scale_key:
+                    scale = v
+        if self.pp_size > 1:
+            obj = [scale]
+            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+            scale = obj[0]
+        if scale is not None:
+            yield f'{layer_prefix}{scale_key}', scale
+
+    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool, layer_prefix: str = ''):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
         if to_mcore:
             # Only the stage owning the PLE layer reaches this path, so it
@@ -417,27 +453,15 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if not skip_ngram_state and to_mcore:
             # The table's only ingestion path: fill from the HF checkpoint shards.
             ple.ple_embedding.fill_table_from_hf(hf_state_dict)
-        elif not skip_ngram_state and ple is not None:
-            ple.ple_embedding.export_table_to_hf(hf_state_dict)
-        if not to_mcore and not skip_ngram_state and self.pp_size > 1:
-            # The shards are assembled on tp rank 0 of the stage owning the PLE
-            # layer -- which is exactly `pp_src_rank` within the tp0 pp group.
-            # Stream each shard to the other pp members (in particular the
-            # master that writes the checkpoint); groups whose tp coord does
-            # not own the table exchange only the empty meta.
-            shard_prefix = 'ple.ple_embedding.ngram_embedding'
-            keys = [f'{shard_prefix}.shard_{i}.weight' for i in range(self.config.split_ngram_parts)]
-            for key in keys:
-                tensor = hf_state_dict.get(key)
-                transferred = self._broadcast_pp_weight(tensor, pp_src_rank)
-                if tensor is None and transferred is not None:
-                    hf_state_dict[key] = transferred
-            # The scale is a tiny scalar; a pickled broadcast is fine.
-            key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
-            obj = [hf_state_dict.get(key)]
-            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
-            if obj[0] is not None:
-                hf_state_dict[key] = obj[0]
+        if not to_mcore and not skip_ngram_state:
+            # Stream the table shards one at a time instead of accumulating the
+            # 100GB-scale table in host memory: the generator below is only
+            # consumed at _convert's yield point (the safetensors writer drives
+            # the pace), and each shard is broadcast to the other pp members as
+            # it is produced, then released once written.
+            self._pending_export_iter = self._iter_ple_table_export(ple, pp_src_rank, layer_prefix)
+        else:
+            self._pending_export_iter = None
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),
@@ -460,7 +484,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         hf_state_dict.update(self._set_layer_mlp(mg_layer, hf_state_dict, layer_idx, to_mcore))
         self._set_layer_hc(mg_layer, hf_state_dict, to_mcore)
         if (layer_idx + 1) in (self.config.ple_layer_ids or []):
-            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore)
+            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore, layer_prefix=hf_prefix)
         if to_mcore:
             hf_state_dict = {}
         else:

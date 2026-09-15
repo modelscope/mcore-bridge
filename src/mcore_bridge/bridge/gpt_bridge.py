@@ -1857,6 +1857,7 @@ class GPTBridge:
         return res
 
     def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
+        self._pending_export_iter = None
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
             hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
@@ -1906,7 +1907,11 @@ class GPTBridge:
                 yield
             else:
                 res = self._convert_hf_state_dict(res, to_mcore)
-                yield from list(self._add_prefix(res, hf_prefix).items())
+                # Drain any staged PLE table shards first: they are produced one
+                # at a time (see _iter_ple_table_export) so the 100GB-scale table
+                # never accumulates in host memory.
+                yield from self._drain_pending_export(hf_prefix)
+                yield from self._add_prefix(res, hf_prefix).items()
                 hf_state_dict = {}
 
         if (not to_mcore or is_pp_last_stage) and self.config.mtp_num_layers:
@@ -1932,6 +1937,16 @@ class GPTBridge:
             hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
             yield from list(self._add_prefix(hf_state_dict, hf_prefix).items())
         prog_bar.close()
+
+    def _drain_pending_export(self, hf_prefix: str):
+        """Yield (and release) the PLE table shards staged by _set_layer_ple."""
+        it, self._pending_export_iter = self._pending_export_iter, None
+        if it is None:
+            return
+        for k, v in it:
+            if v is None:
+                continue
+            yield from self._add_prefix(self._convert_hf_state_dict({k: v}, False), hf_prefix).items()
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
         for key in ['enorm.weight', 'hnorm.weight', 'eh_proj.weight']:
