@@ -357,7 +357,7 @@ class GPTBridge:
         for s in shape[1:]:
             inner *= s
         rows = max(1, self.export_chunk_bytes // max(1, inner * elem_size))
-        return min(rows, shape[0])
+        return max(1, min(rows, shape[0]))
 
     def _chunked_all_gather_tp(self, tensor, tp_dim: int, tp_group, tp_size: int):
         """All-gather `tensor` along tp_dim and assemble the result in host memory
@@ -457,8 +457,8 @@ class GPTBridge:
                 shape = meta_data[1:1 + meta_data[0]].tolist()
                 dtype = dtype_mapping[meta_data[-1].item()]
                 numel = math.prod(shape) if shape else 1
-                if self._stream_to_cpu() and numel * torch.empty(
-                    (), dtype=dtype).element_size() > (self.export_chunk_bytes) and len(shape) > 0:
+                elem_size = torch.empty((), dtype=dtype).element_size()
+                if self._stream_to_cpu() and numel * elem_size > self.export_chunk_bytes and len(shape) > 0:
                     return self._chunked_broadcast_pp(None, shape, dtype, src_rank, pp_group)
                 tensor = torch.empty(shape, device='cuda', dtype=dtype)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
