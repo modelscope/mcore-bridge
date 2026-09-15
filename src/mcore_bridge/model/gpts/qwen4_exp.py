@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import math
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -357,8 +358,11 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         stage owning the PLE layer, i.e. the src of its pp group); the other pp
         members receive it. The payload is streamed through
         `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
-        fp8 rides as uint8 (NCCL has no float8 dtype). Groups whose src has
-        nothing to transfer (tp != 0 coords) exchange only the empty meta.
+        it always rides as raw bytes (flattened uint8): any current or future
+        low-width dtype (fp8 e4m3/e5m2, int8, packed fp4, ...) is transported
+        without NCCL dtype concerns; the meta carries the original shape/dtype
+        for the receiver to view back. Groups whose src has nothing to transfer
+        (tp != 0 coords) exchange only the empty meta.
         """
         meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
         dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
@@ -366,17 +370,13 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             return None
         shape, dtype_name = meta[0]
         dtype = getattr(torch, dtype_name)
-        as_uint8 = dtype == torch.float8_e4m3fn
         if tensor is not None:
-            src_tensor = tensor if tensor.is_contiguous() else tensor.contiguous()
-            if as_uint8:
-                src_tensor = src_tensor.view(torch.uint8)
-            self._chunked_broadcast_pp(src_tensor, list(src_tensor.shape), src_tensor.dtype, pp_src_rank,
-                                       self.pp_group)
+            payload = tensor.contiguous().flatten().view(torch.uint8)
+            self._chunked_broadcast_pp(payload, list(payload.shape), payload.dtype, pp_src_rank, self.pp_group)
             return tensor
-        recv_shape, recv_dtype = (shape, torch.uint8) if as_uint8 else (shape, dtype)
-        out = self._chunked_broadcast_pp(None, recv_shape, recv_dtype, pp_src_rank, self.pp_group)
-        return out.view(dtype) if as_uint8 else out
+        byte_count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        out = self._chunked_broadcast_pp(None, [byte_count], torch.uint8, pp_src_rank, self.pp_group)
+        return out.view(dtype).view(shape)
 
     def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
         """Lazily export the PLE table shards one by one. On the exporting rank
