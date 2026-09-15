@@ -173,6 +173,10 @@ class ModelConfig(TransformerConfig):
     moe_router_score_function: Literal['sigmoid', 'softmax'] = 'softmax'
     moe_router_bias_update_rate: float = 1e-3
     moe_router_enable_expert_bias: bool = False
+    # Model-specific VL routing belongs to mcore-bridge rather than Megatron-Core.
+    # DeepSeek-V4.1 selects a separately checkpointed correction bias for image tokens.
+    moe_router_enable_vl_bias: bool = False
+    image_token_id: Optional[int] = None
     moe_router_topk_scaling_factor: Optional[float] = None
     # 'aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'
     moe_router_load_balancing_type: Union[str, List[str]] = 'aux_loss'
@@ -244,6 +248,9 @@ class ModelConfig(TransformerConfig):
     moe_n_hash_layers: int = 0
 
     # deepseek-v4.1 engram (HF layer IDs are 0-based)
+    # Declared here as well so the bridge remains importable on the PR #7224 baseline,
+    # where NVIDIA's optional Engram extension is not installed.
+    engram_enabled: bool = False
     engram_layer_ids: Optional[List[int]] = None
     engram_num_embeddings: Optional[List[int]] = None
     engram_max_ngram_size: Optional[int] = None
@@ -302,7 +309,6 @@ class ModelConfig(TransformerConfig):
             defaults = {}
             try:
                 import mindspeed.features_manager as mfm
-                import sys
                 from argparse import ArgumentParser
                 from mindspeed.arguments import process_args
 
@@ -344,6 +350,11 @@ class ModelConfig(TransformerConfig):
         if self.num_moe_experts is not None:
             if self.moe_ffn_hidden_size is None:
                 self.moe_ffn_hidden_size = self.ffn_hidden_size
+        if self.moe_router_enable_vl_bias:
+            if not self.moe_router_enable_expert_bias:
+                raise ValueError('VL expert bias requires moe_router_enable_expert_bias.')
+            if self.image_token_id is None:
+                raise ValueError('VL expert bias requires image_token_id.')
         if self.rope_scaling is not None:
             self.rope_scaling = json_parse_to_dict(self.rope_scaling)
             if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:

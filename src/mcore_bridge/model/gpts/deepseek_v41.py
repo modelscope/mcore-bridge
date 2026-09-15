@@ -30,8 +30,6 @@ import torch
 import torch.nn.functional as F
 import transformer_engine
 from megatron.core import parallel_state
-from megatron.core.models.engram.config import EngramConfig
-from megatron.core.models.engram.layer_specs import apply_engram_to_layer_spec
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
@@ -42,6 +40,12 @@ from typing import Optional
 
 from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
+from mcore_bridge.model.modules.engram import (
+    adapt_deepseek_v41_layer_specs,
+    allow_engram_inference,
+    build_deepseek_v41_engram_config,
+    has_native_engram,
+)
 
 from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
@@ -648,20 +652,32 @@ class DeepseekV41GPTModel(DeepseekV4GPTModel):
         return result
 
     def forward(self, *args, **kwargs):
+        input_ids = kwargs.get('input_ids', args[0] if args else None)
         inference_context = kwargs.get('inference_context') or kwargs.get('inference_params')
-        capture_dspark = (
-            hasattr(self, 'dspark')
-            and not self.training
-            and inference_context is not None
-            and inference_context.is_dynamic_batching()
-            and inference_context.num_speculative_tokens > 0
-        )
-        if not capture_dspark:
-            return super().forward(*args, **kwargs)
-        if inference_context.using_cuda_graph_this_step():
-            raise RuntimeError('DSpark speculative decoding does not support CUDA graph replay yet.')
-        with self.capture_dspark_hidden_states():
-            return super().forward(*args, **kwargs)
+        if inference_context is None and len(args) > 5:
+            inference_context = args[5]
+        extra_block_kwargs = kwargs.get('extra_block_kwargs')
+        if extra_block_kwargs is None and len(args) > 7:
+            extra_block_kwargs = args[7]
+
+        with allow_engram_inference(self.config, input_ids, extra_block_kwargs) as block_kwargs:
+            if len(args) > 7:
+                args = (*args[:7], block_kwargs, *args[8:])
+            else:
+                kwargs['extra_block_kwargs'] = block_kwargs
+            capture_dspark = (
+                hasattr(self, 'dspark')
+                and not self.training
+                and inference_context is not None
+                and inference_context.is_dynamic_batching()
+                and inference_context.num_speculative_tokens > 0
+            )
+            if not capture_dspark:
+                return super().forward(*args, **kwargs)
+            if inference_context.using_cuda_graph_this_step():
+                raise RuntimeError('DSpark speculative decoding does not support CUDA graph replay yet.')
+            with self.capture_dspark_hidden_states():
+                return super().forward(*args, **kwargs)
 
     def _dspark_rotary_for_positions(self, position_ids: torch.Tensor):
         if self.position_embedding_type != 'rope' or self.rotary_pos_emb is None:
@@ -836,6 +852,11 @@ class DeepseekV41Loader(DeepseekV4Loader):
         hf_layer_ids = tuple(self.config.engram_layer_ids or ())
         if not hf_layer_ids:
             return None
+        if not has_native_engram():
+            raise RuntimeError(
+                'DeepSeek-V4.1 Engram requires NVIDIA Megatron-LM Engram support. '
+                'The PR #7224 text-backbone baseline intentionally does not provide it; '
+                'install the official Engram extension or disable Engram explicitly.')
         required = (
             'engram_num_embeddings', 'engram_max_ngram_size', 'engram_vocab_size',
             'engram_n_heads', 'engram_head_dim', 'engram_pad_token_id',
@@ -859,11 +880,11 @@ class DeepseekV41Loader(DeepseekV4Loader):
 
         max_ngram_order = self.config.engram_max_ngram_size
         image_token_id = getattr(self.config.hf_config, 'image_token_id', None)
-        engram_config = EngramConfig(
+        engram_config = build_deepseek_v41_engram_config(
             global_vocab_sizes=(self.config.engram_vocab_size,) * (max_ngram_order - 1),
             # TransformerLayer numbers are 1-based, while the official checkpoint and
-            # PCG64 multiplier seeds use the original 0-based HF layer IDs.
-            layer_ids=tuple(layer_id + 1 for layer_id in hf_layer_ids),
+            # tokenizer artifact use the original 0-based HF layer IDs.
+            placement_layer_ids=tuple(layer_id + 1 for layer_id in hf_layer_ids),
             hash_layer_ids=hf_layer_ids,
             max_ngram_order=max_ngram_order,
             num_hash_heads=self.config.engram_n_heads,
@@ -967,7 +988,7 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 core_attention_submodules.indexer.module = CSA2Indexer
         engram_config = self._get_engram_config()
         if engram_config is not None:
-            transformer_layer_spec = apply_engram_to_layer_spec(transformer_layer_spec, engram_config)
+            transformer_layer_spec = adapt_deepseek_v41_layer_specs(transformer_layer_spec, engram_config)
         return transformer_layer_spec
 
 
