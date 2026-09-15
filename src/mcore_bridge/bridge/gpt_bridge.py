@@ -405,7 +405,7 @@ class GPTBridge:
                 tensor = [tensor]
             if self._is_fp8_param(tensor[0]):
                 mg_scale_inv = [
-                    t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)]
+                    t._rowwise_scale_inv[..., :math.ceil(t._rowwise_data.shape[-1] / self.fp8_block_size)].contiguous()
                     for t in tensor
                 ]
                 tensor = [t._rowwise_data for t in tensor]
