@@ -194,14 +194,25 @@ class Glm5NextHybridModel(HybridModel):
         cu = _get_physical_cu_seqlens(packed_seq_params)
         lengths = lengths.to(device=cu.device, dtype=cu.dtype)
         assert 0 < lengths.numel() <= cu.numel() - 1
-        assert cu[-1] == position_ids.shape[-1]
+        cp_size = self.pg_collection.cp.size()
+        # Under CP the data pipeline shards position_ids/labels (zigzag) but passes cu_seqlens and
+        # seq_lens FULL, so build the mask over the full physical sequence and then shard it with the
+        # same zigzag, keeping it token-aligned with the local position_ids. At cp==1 the physical
+        # length is just the (unsharded) position count.
+        total = int(cu[-1])
+        if cp_size == 1:
+            assert total == position_ids.shape[-1]
         # The remaining spans are alignment dummy sequences with zero logical length; they must not
         # update the expert bias.
         lengths = torch.nn.functional.pad(lengths, (0, cu.numel() - 1 - lengths.numel()))
-        positions = torch.arange(position_ids.shape[-1], device=cu.device)
+        positions = torch.arange(total, device=cu.device)
         segment = torch.bucketize(positions, cu[1:], right=True)
         mask = (positions - cu[segment] >= lengths[segment])[None]
+        if cp_size > 1:
+            from mcore_bridge.utils import split_cp_inputs
+            mask = split_cp_inputs(mask, cu, 1)
         if self.config.sequence_parallel:
+            assert mask.shape[1] % self.pg_collection.tp.size() == 0, f'padding_mask.shape: {mask.shape}'
             mask = mask.chunk(self.pg_collection.tp.size(), dim=1)[self.pg_collection.tp.rank()]
         return mask.contiguous()
 
@@ -431,9 +442,6 @@ class Glm5NextLoader(ModelLoader):
 
         from ..modules import TopKRouter
         config = self.config
-        if config.context_parallel_size > 1:
-            raise NotImplementedError('The current model has no KDA/DSA context parallelism; '
-                                      'use context_parallel_size=1')
         if config.mtp_num_layers:
             raise NotImplementedError('The current model builds no MTP layers; use mtp_num_layers=0')
         if config.fp8 or config.fp4:
@@ -442,6 +450,11 @@ class Glm5NextLoader(ModelLoader):
         if config.dsa_indexer_loss_coeff:
             raise NotImplementedError('The current model has no KPool indexer auxiliary loss; '
                                       'use dsa_indexer_loss_coeff=0')
+        if config.context_parallel_size > 1:
+            if config.cp_comm_type != 'all_gather':
+                logger.warning_once("GLM5-Next under context parallelism requires cp_comm_type='all_gather'; "
+                                    "promoting to 'all_gather'.")
+                config.cp_comm_type = 'all_gather'
         config.hetereogenous_dist_checkpoint = True
         config.rope_type = MLATransformerConfig.rope_type
         config.rotary_scaling_factor = MLATransformerConfig.rotary_scaling_factor
