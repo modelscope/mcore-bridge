@@ -11,6 +11,7 @@ class LLMModelType:
     bailing_moe = 'bailing_moe'
     bailing_hybrid = 'bailing_hybrid'
     deepseek_v4 = 'deepseek_v4'
+    deepseek_v41 = 'deepseek_v41'
     glm_moe_dsa = 'glm_moe_dsa'
     nemotron_h = 'nemotron_h'
 

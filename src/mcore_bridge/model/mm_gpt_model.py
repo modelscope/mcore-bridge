@@ -82,6 +82,7 @@ class MultimodalGPTModel(MegatronModule):
         packed_seq_params: PackedSeqParams = None,
         **kwargs,
     ) -> torch.Tensor:
+        inference_context = kwargs.pop('inference_context', None)
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
@@ -107,6 +108,7 @@ class MultimodalGPTModel(MegatronModule):
             attention_mask=attention_mask,
             decoder_input=decoder_input,
             labels=labels,
+            inference_context=inference_context,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             extra_block_kwargs=kwargs,

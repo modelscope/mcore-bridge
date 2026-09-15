@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
@@ -242,6 +243,28 @@ class ModelConfig(TransformerConfig):
     mhc_init_gating_factor: float = 0.01
     moe_n_hash_layers: int = 0
 
+    # deepseek-v4.1 engram (HF layer IDs are 0-based)
+    engram_layer_ids: Optional[List[int]] = None
+    engram_num_embeddings: Optional[List[int]] = None
+    engram_max_ngram_size: Optional[int] = None
+    engram_vocab_size: Optional[int] = None
+    engram_n_heads: Optional[int] = None
+    engram_head_dim: Optional[int] = None
+    engram_pad_token_id: Optional[int] = None
+    engram_compressed_vocab_size: Optional[int] = None
+    engram_tokenizer_map: Optional[str] = None
+
+    # DeepSeek-V4.1 DSpark. This is intentionally separate from mtp_num_layers:
+    # DSpark drafts a block in parallel and adds Markov/confidence heads, whereas
+    # Megatron MTP predicts successive tokens autoregressively.
+    dspark_num_layers: Optional[int] = None
+    dspark_block_size: int = 0
+    dspark_noise_token_id: Optional[int] = None
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_markov_rank: Optional[int] = None
+    dspark_num_experts: Optional[int] = None
+    dspark_router_topk: Optional[int] = None
+
     # mtp
     mtp_decoder_input_detach: bool = False
     mtp_shared_weights: bool = False
@@ -355,6 +378,31 @@ class ModelConfig(TransformerConfig):
             self.mtp_num_layers = 1
         else:
             self.mtp_unroll_steps = self.mtp_num_layers
+        if self.dspark_num_layers is not None or self.dspark_block_size:
+            required_dspark = {
+                'dspark_num_layers': self.dspark_num_layers,
+                'dspark_block_size': self.dspark_block_size,
+                'dspark_noise_token_id': self.dspark_noise_token_id,
+                'dspark_target_layer_ids': self.dspark_target_layer_ids,
+                'dspark_markov_rank': self.dspark_markov_rank,
+                'dspark_num_experts': self.dspark_num_experts,
+                'dspark_router_topk': self.dspark_router_topk,
+            }
+            missing_dspark = [name for name, value in required_dspark.items() if value is None]
+            if missing_dspark:
+                raise ValueError(f'DSpark config is missing required fields: {missing_dspark}.')
+            if self.dspark_num_layers <= 0 or self.dspark_block_size <= 0 or self.dspark_markov_rank <= 0:
+                raise ValueError('DSpark layer count, block size and Markov rank must all be positive.')
+            if not self.dspark_target_layer_ids:
+                raise ValueError('DSpark requires at least one target layer ID.')
+            if len(set(self.dspark_target_layer_ids)) != len(self.dspark_target_layer_ids):
+                raise ValueError('DSpark target layer IDs must be unique.')
+            if min(self.dspark_target_layer_ids) < 0 or max(self.dspark_target_layer_ids) >= self.num_layers:
+                raise ValueError('DSpark target layer IDs must refer to decoder layers.')
+            if self.dspark_noise_token_id < 0 or self.dspark_noise_token_id >= self.padded_vocab_size:
+                raise ValueError('DSpark noise token ID must be inside the padded vocabulary.')
+            if self.dspark_num_experts <= 0 or not 0 < self.dspark_router_topk <= self.dspark_num_experts:
+                raise ValueError('DSpark router top-k must be positive and no larger than its expert count.')
         if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
             self.csa_compress_ratios += [0] * self.mtp_num_layers
         if self.multi_latent_attention:
@@ -418,3 +466,8 @@ class ModelConfig(TransformerConfig):
             else:
                 setattr(new_obj, k, copy.deepcopy(v, memo))
         return new_obj
+
+
+@dataclass
+class MLAModelConfig(ModelConfig, MLATransformerConfig):
+    """ModelConfig variant for models requiring native Megatron MLA semantics."""

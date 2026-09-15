@@ -162,6 +162,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
+            # The KV latent (and any CP boundary rows) must drop the dummy batch axis too;
+            # otherwise linear_kv_proj emits [t, 1, 1, d] and the V4.1 CSA2 core attention
+            # rejects the layout (it requires key/value shaped [t, 1, d]).
+            kv_compressed = kv_compressed.squeeze(1)
+            if boundary_hidden is not None:
+                boundary_hidden = boundary_hidden.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -304,6 +310,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         rotary_pos_emb = rotary_pos_emb[self.rope_layer_type]
@@ -378,6 +385,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             if boundary_hidden is not None:
                 core_attn_kwargs['boundary_hidden'] = boundary_hidden
                 core_attn_kwargs['boundary_kv'] = boundary_kv
+            if csa2_state is not None:
+                core_attn_kwargs['csa2_state'] = csa2_state
             core_attn_out = self.core_attention(
                 query,
                 key,

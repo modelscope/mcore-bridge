@@ -1758,6 +1758,10 @@ class GPTBridge:
         self._set_state_dict(lm_model, 'decoder.final_layernorm.weight', hf_state_dict, self.hf_final_layernorm_key,
                              to_mcore)
 
+    def _convert_additional_layers(self, mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage):
+        """Extension point for model-specific auxiliary stacks outside standard MTP."""
+        return ()
+
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = {}
         for k, v in hf_state_dict.items():
@@ -1838,6 +1842,8 @@ class GPTBridge:
                     res = self._convert_hf_state_dict(res, to_mcore)
                     yield from list(self._add_prefix(res, hf_prefix).items())
                     hf_state_dict = {}
+        yield from self._convert_additional_layers(
+            mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage)
         if not to_mcore or is_pp_last_stage:
             hf_state_dict.update(self._convert_post_process(mg_model, hf_state_dict, '', to_mcore))
         if to_mcore:
@@ -1948,6 +1954,7 @@ class GPTBridge:
         tqdm_desc: str = 'Exporting: ',
         disable_tqdm: bool = True,
         _is_saving: bool = False,
+        skip_unsupported_export: bool = False,
     ):
         """Export Megatron model weights to safetensors (HuggingFace) format as a generator.
 
@@ -1965,6 +1972,11 @@ class GPTBridge:
             converter: Used to perform key-value conversion on the newly exported state_dict.
             tqdm_desc: Description text for the progress bar. Defaults to 'Exporting: '.
             disable_tqdm: Whether to disable the tqdm progress bar. Defaults to True.
+            skip_unsupported_export: When True, weights whose Megatron->HF export is not implemented
+                (e.g. DeepSeek-V4.1 Engram tables, which are frozen during on-policy RL and already
+                loaded in the rollout engine) are silently skipped instead of raising. Used by the RL
+                weight-sync path; the checkpoint-save path keeps the default (False) so a saved HF
+                checkpoint stays complete.
 
         Yields:
             Tuple[str, torch.Tensor]: Key-value pairs of parameter names and tensors.
@@ -1975,6 +1987,7 @@ class GPTBridge:
         self._adapter_name = adapter_name
         self._disable_tqdm = disable_tqdm
         self._is_saving = _is_saving
+        self._skip_unsupported_export = skip_unsupported_export
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
         self._fp8_skip_modules = set()
