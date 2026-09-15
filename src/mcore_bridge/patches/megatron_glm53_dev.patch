@@ -1,0 +1,1057 @@
+diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
+index 088c09c450..54b0e63ea8 100644
+--- a/megatron/core/models/hybrid/hybrid_block.py
++++ b/megatron/core/models/hybrid/hybrid_block.py
+@@ -975,14 +975,15 @@ class HybridStack(MegatronModule):
+         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+             hc_mult = self.config.num_residual_streams
+             hc_dim = self.config.hidden_size * hc_mult
+-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+-            nn.init.xavier_uniform_(self.hc_head_fn)
+-            if self.config.sequence_parallel:
+-                setattr(self.hc_head_fn, 'sequence_parallel', True)
+-                setattr(self.hc_head_base, 'sequence_parallel', True)
+-                setattr(self.hc_head_scale, 'sequence_parallel', True)
++            if self.config.mhc_learned_output_contract:
++                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
++                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
++                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
++                nn.init.xavier_uniform_(self.hc_head_fn)
++                if self.config.sequence_parallel:
++                    setattr(self.hc_head_fn, 'sequence_parallel', True)
++                    setattr(self.hc_head_base, 'sequence_parallel', True)
++                    setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+     def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
+         # Avoid modifying the original object so users don't get surprised about their `submodules`
+@@ -1287,14 +1288,20 @@ class HybridStack(MegatronModule):
+         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+             if (self.config.mtp_num_layers or 0) > 0:
+                 mhc_multistream = hidden_states
+-            hidden_states = learned_output_contract(
+-                hidden_states,
+-                self.hc_head_fn,
+-                self.hc_head_base,
+-                self.hc_head_scale,
+-                self.config.num_residual_streams,
+-                self.config.layernorm_epsilon,
+-            )
++            if self.config.mhc_learned_output_contract:
++                hidden_states = learned_output_contract(
++                    hidden_states,
++                    self.hc_head_fn,
++                    self.hc_head_base,
++                    self.hc_head_scale,
++                    self.config.num_residual_streams,
++                    self.config.layernorm_epsilon,
++                )
++            else:
++                # GLM's output is a parameter-free mean over the streams (Megatron-LM #7054 / be805e55).
++                hidden_states = hidden_states.unflatten(
++                    -1, (self.config.num_residual_streams, self.config.hidden_size)
++                ).mean(dim=-2)
+
+         # Final layer norm.
+         if self.post_process and self.post_layer_norm:
+diff --git a/megatron/core/optimizer/__init__.py b/megatron/core/optimizer/__init__.py
+index 894d03d801..70b769b7d4 100644
+--- a/megatron/core/optimizer/__init__.py
++++ b/megatron/core/optimizer/__init__.py
+@@ -47,7 +47,6 @@ HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
+ if HAVE_EMERGING_OPTIMIZERS:
+     from emerging_optimizers.scalar_optimizers import Lion
+
+-from megatron.core import parallel_state
+ from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+ from megatron.core.optimizer_param_scheduler import (
+     ParamGroupOverride,
+@@ -686,11 +685,15 @@ def _get_megatron_optimizer_based_on_param_groups(
+         setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+
+     if pg_collection is None or not hasattr(pg_collection, 'tp'):
+-        tp_group = parallel_state.get_tensor_model_parallel_group()
+-    else:
+-        tp_group = pg_collection.tp
+-    # TODO(M4): plumb tp_group through optimizer constructors so this setattr disappears.
++        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
++    tp_group = pg_collection.tp
++    # Backport of the optimizer-side half of #6165 (AUT-1177) from main: dev carries the
++    # `expert_tp_group` parameter of param_is_not_tensor_parallel_duplicate but never passes it,
++    # so expert shards were deduplicated over the attention TP group instead of ETP.
++    expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
++    # TODO(M4): plumb TP groups through optimizer constructors so these setattrs disappear.
+     setattr(optimizer, 'tp_group', tp_group)
++    setattr(optimizer, 'expert_tp_group', expert_tp_group)
+
+     return optimizer
+
+@@ -898,11 +901,10 @@ def _get_megatron_emerging_optimizer(
+             else:
+                 optimizer = FP32Optimizer(optimizer, config, init_state_fn)
+             setattr(optimizer, 'grad_stats_parallel_group', model_parallel_group)
+-            if pg_collection is None or not hasattr(pg_collection, 'tp'):
+-                tp_group = parallel_state.get_tensor_model_parallel_group()
+-            else:
+-                tp_group = pg_collection.tp
++            tp_group = pg_collection.tp
++            expert_tp_group = getattr(pg_collection, 'expt_tp', tp_group)
+             setattr(optimizer, 'tp_group', tp_group)
++            setattr(optimizer, 'expert_tp_group', expert_tp_group)
+             results.append(optimizer)
+             continue
+         else:
+diff --git a/megatron/core/optimizer/clip_grads.py b/megatron/core/optimizer/clip_grads.py
+index 762d4aa8dc..84d8fac777 100644
+--- a/megatron/core/optimizer/clip_grads.py
++++ b/megatron/core/optimizer/clip_grads.py
+@@ -197,14 +197,15 @@ def count_zeros_fp32(
+     grad_stats_parallel_group: torch.distributed.ProcessGroup,
+     use_decoupled_grad: bool = False,
+     tp_group: Optional[torch.distributed.ProcessGroup] = None,
++    expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+ ) -> float:
+     """Counts the number of zero values in the gradients of the given parameters.
+
+     The count is performed in FP32. This method filters parameters to ensure
+     gradients are not double-counted by checking if the gradient is not None,
+-    the parameter is not shared, and the parameter is not a replica due
+-    to tensor model parallelism. It also handles parameters managed by
+-    Megatron FSDP specifically.
++    the parameter is not shared, and the parameter is not a replica due to
++    tensor model parallelism or (expert) generalized tensor parallelism. It also
++    handles parameters managed by Megatron FSDP specifically.
+
+     Args:
+         parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
+@@ -241,7 +242,9 @@ def count_zeros_fp32(
+             total_num_zeros += num_zeros
+             continue
+         is_not_shared = param_is_not_shared(param)
+-        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
++        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
++            param, tp_group=tp_group, expert_tp_group=expert_tp_group
++        )
+         if grad_not_none and is_not_shared and is_not_tp_duplicate:
+             grad_obj = getattr(param, grad_attr)
+             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index f7d2973749..c3c704ff6f 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -352,7 +352,9 @@ class MegatronOptimizer(ABC):
+             grad_not_none = grad is not None
+             is_not_shared = param_is_not_shared(param)
+             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+-                param, getattr(self, 'tp_group', None)
++                param,
++                tp_group=getattr(self, 'tp_group', None),
++                expert_tp_group=getattr(self, 'expert_tp_group', None),
+             )
+             if grad_not_none and is_not_shared and is_not_tp_duplicate:
+                 grads_for_norm.append(grad)
+@@ -519,6 +521,7 @@ class MegatronOptimizer(ABC):
+                 and getattr(params[0], "__fsdp_param__", False)
+             ),
+             tp_group=getattr(self, 'tp_group', None),
++            expert_tp_group=getattr(self, 'expert_tp_group', None),
+         )
+
+     @abstractmethod
+@@ -1958,6 +1961,8 @@ class ChainedOptimizer(MegatronOptimizer):
+                     self.config.use_precision_aware_optimizer
+                     and getattr(params[0], "__fsdp_param__", False)
+                 ),
++                tp_group=getattr(self.chained_optimizers[0], 'tp_group', None),
++                expert_tp_group=getattr(self.chained_optimizers[0], 'expert_tp_group', None),
+             )
+         else:
+             num_zeros_in_grad = 0
+diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
+index b3b829b44e..0a45360e96 100644
+--- a/megatron/core/ssm/gated_delta_net/common.py
++++ b/megatron/core/ssm/gated_delta_net/common.py
+@@ -235,7 +235,9 @@ class _GDNBase(MegatronModule):
+                 getattr(self, attr) is not None
+             ), f"Attribute {attr} for the GDN-family variant is not set"
+         # Full input projection width: q, k, v, output gate, and variant-specific gate features.
+-        self.in_proj_dim = self.qk_dim * 2 + self.v_dim * 2 + self.in_proj_extra_dim
++        # The two-stage KDA gates are not in in_proj; derive the global width from each variant's
++        # declared chunks.
++        self.in_proj_dim = sum(self.in_proj_split_sections) * self.tp_size
+
+         if self.config.fp8:
+             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
+diff --git a/megatron/core/ssm/gated_delta_net/kda.py b/megatron/core/ssm/gated_delta_net/kda.py
+index bd7fca93f3..10162f2044 100644
+--- a/megatron/core/ssm/gated_delta_net/kda.py
++++ b/megatron/core/ssm/gated_delta_net/kda.py
+@@ -33,6 +33,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
+ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
+
+ try:
++    from fla.modules.fused_norm_gate import rms_norm_gated
+     from fla.ops.kda import chunk_kda
+
+     # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
+@@ -47,6 +48,11 @@ class KimiDeltaAttentionSubmodules(GatedDeltaNetSubmodules):
+     """Submodules used by Kimi Delta Attention."""
+
+     beta_proj: ModuleSpec | type = IdentityOp
++    # From Megatron-LM #7054 / be805e55, under this file's NVIDIA license.
++    f_a_proj: ModuleSpec | type = IdentityOp
++    f_b_proj: ModuleSpec | type = IdentityOp
++    g_a_proj: ModuleSpec | type = IdentityOp
++    g_b_proj: ModuleSpec | type = IdentityOp
+
+
+ class KimiDeltaAttention(_GDNBase):
+@@ -79,6 +85,7 @@ class KimiDeltaAttention(_GDNBase):
+                 "FLA KDA is not installed. Install flash-linear-attention with KDA support."
+             )
+
++        self.two_stage_gates = config.kda_two_stage_gates
+         super().__init__(
+             config=config,
+             submodules=submodules,
+@@ -118,7 +125,38 @@ class KimiDeltaAttention(_GDNBase):
+         mark_keep_in_fp32(self.A_log)
+
+         # Pass raw g to FLA and let the KDA kernel apply A_log and dt_bias.
+-        self.use_gate_in_kernel = True
++        self.use_gate_in_kernel = not self.two_stage_gates
++        if self.two_stage_gates:
++            # HF lists GLM's conv1d as a strict-FP32 parameter; it must not be rounded when wrapping in BF16.
++            self.conv1d.float()
++            mark_keep_in_fp32(self.conv1d.weight)
++            if self.conv1d.bias is not None:
++                mark_keep_in_fp32(self.conv1d.bias)
++            for prefix, head_dim, output_dim in (
++                ("f", self.key_head_dim, self.qk_dim),
++                ("g", self.value_head_dim, self.v_dim),
++            ):
++                a_name, b_name = f"{prefix}_a_proj", f"{prefix}_b_proj"
++                setattr(
++                    self, a_name,
++                    build_module(
++                        getattr(submodules, a_name), self.hidden_size, head_dim,
++                        config=self.config, init_method=self.config.init_method,
++                        bias=bias, skip_bias_add=False, skip_weight_param_allocation=False,
++                        parallel_mode="duplicated",
++                        name=f"{name}.{a_name}" if name is not None else None,
++                    ),
++                )
++                setattr(
++                    self, b_name,
++                    build_module(
++                        getattr(submodules, b_name), head_dim, output_dim,
++                        config=self.config, init_method=self.config.init_method,
++                        gather_output=False, bias=bias, skip_bias_add=False, is_expert=False,
++                        tp_comm_buffer_name=b_name, tp_group=self.pg_collection.tp,
++                        name=f"{name}.{b_name}" if name is not None else None,
++                    ),
++                )
+
+     def _setup_variant_attrs(self) -> None:
+         """Set KDA dimensions, projection checkpoint metadata, and kernel callable."""
+@@ -138,6 +176,10 @@ class KimiDeltaAttention(_GDNBase):
+             self.qk_dim_local_tp,
+             self.v_dim_local_tp,
+         )
++        if self.two_stage_gates:
++            self.in_proj_extra_dim = 0
++            self.in_proj_split_names = self.in_proj_split_names[:3]
++            self.in_proj_split_sections = self.in_proj_split_sections[:3]
+         self.dt_bias_dim = self.qk_dim_local_tp
+         self.a_log_dim = self.num_k_heads_local_tp
+         self.gate_params_dtype = torch.float32
+@@ -187,8 +229,17 @@ class KimiDeltaAttention(_GDNBase):
+
+         x_dtype = x.dtype
+         x = x.reshape(-1, self.value_head_dim)
+-        x = self.out_norm(x)
+         gate = gate.reshape(-1, self.value_head_dim)
++        if self.two_stage_gates:
++            # HF rounds only after the norm and the sigmoid gate are multiplied; two BF16 ops are not
++            # equivalent.
++            weight = self.out_norm.weight
++            if self.config.layernorm_zero_centered_gamma:
++                weight = weight + 1
++            return rms_norm_gated(
++                x, gate, weight, None, activation="sigmoid", eps=self.config.layernorm_epsilon
++            )
++        x = self.out_norm(x)
+         return (x * torch.sigmoid(gate.float())).to(x_dtype)
+
+     def forward(
+@@ -401,6 +452,21 @@ class KimiDeltaAttention(_GDNBase):
+             packed_seq_params,
+         )
+
++        raw_g = gate = None
++        if self.two_stage_gates:
++            f_a, _ = self.f_a_proj(hidden_states)
++            raw_g, _ = self.f_b_proj(f_a)
++            g_a, _ = self.g_a_proj(hidden_states)
++            gate, _ = self.g_b_proj(g_a)
++            raw_g, _ = a2a_cp_to_hp(
++                raw_g, (self.qk_dim_local_tp,), cp_size_headwise, cp_group_headwise,
++                cu_seqlens_q, seq_len_post_headwise, packed_seq_params,
++            )
++            gate, _ = a2a_cp_to_hp(
++                gate, (self.v_dim_local_tp,), cp_size_headwise, cp_group_headwise,
++                cu_seqlens_q, seq_len_post_headwise, packed_seq_params,
++            )
++
+         if self.gdn_pre_gated_delta_rule_fusion:
+             raise NotImplementedError(
+                 "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
+@@ -428,16 +494,12 @@ class KimiDeltaAttention(_GDNBase):
+             cu_seqlens_q,
+             chunkwise_cp_context,
+             packed_seq_params=packed_seq_params,
++            raw_g=raw_g,
++            gate=gate,
+         )
+-        kernel_inputs = {
+-            "q": query,
+-            "k": key,
+-            "v": value,
+-            "g": raw_g,
+-            "beta": beta,
+-            "A_log": A_log,
+-            "dt_bias": dt_bias,
+-        }
++        kernel_inputs = {"q": query, "k": key, "v": value, "g": raw_g, "beta": beta}
++        if self.use_gate_in_kernel:
++            kernel_inputs.update(A_log=A_log, dt_bias=dt_bias)
+         nvtx_range_pop(suffix="pre_gated_delta_rule")
+
+         nvtx_range_push(suffix="gated_delta_rule")
+@@ -445,10 +507,11 @@ class KimiDeltaAttention(_GDNBase):
+             **kernel_inputs,
+             initial_state=None,
+             output_final_state=False,
+-            use_qk_l2norm_in_kernel=False,
++            use_qk_l2norm_in_kernel=self.two_stage_gates and self.use_qk_l2norm,
+             use_gate_in_kernel=self.use_gate_in_kernel,
+             safe_gate=self.config.kda_safe_gate,
+             lower_bound=self.config.kda_lower_bound,
++            state_v_first=self.two_stage_gates,
+             cu_seqlens=cu_seqlens_q,
+             cp_context=chunkwise_cp_context,
+         )
+@@ -532,12 +595,20 @@ class KimiDeltaAttention(_GDNBase):
+         cu_seqlens_q=None,
+         chunkwise_cp_context=None,
+         packed_seq_params=None,
++        *,
++        raw_g=None,
++        gate=None,
+     ):
+         """Prepare QKV, output gate, beta, and raw decay tensors before KDA."""
+
+         qkvfg = qkvfg.transpose(0, 1)
+         beta = beta.transpose(0, 1)
+-        qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
++        if self.two_stage_gates:
++            qkv = qkvfg
++            raw_g = raw_g.transpose(0, 1)
++            gate = gate.transpose(0, 1)
++        else:
++            qkv, raw_g, gate = torch.split(qkvfg, self._get_feat_dim_split(cp_size_headwise), dim=-1)
+         gate = gate.reshape(batch, seq_len, -1, self.value_head_dim)
+
+         nvtx_range_push(suffix="conv1d")
+@@ -617,6 +688,32 @@ class KimiDeltaAttention(_GDNBase):
+         A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group_headwise)
+         dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group_headwise)
+
++        if self.two_stage_gates:
++            query_key, value = torch.split(
++                qkv,
++                [2 * self.qk_dim_local_tp // cp_size_headwise,
++                 self.v_dim_local_tp // cp_size_headwise],
++                dim=-1,
++            )
++            query_key = query_key.reshape(batch, seq_len, -1, self.key_head_dim)
++            value = value.reshape(batch, seq_len, -1, self.value_head_dim)
++            query, key = query_key.chunk(2, dim=2)
++            repeat_factor = self.num_value_heads // self.num_key_heads
++            if repeat_factor > 1:
++                query = query.repeat_interleave(repeat_factor, dim=2)
++                key = key.repeat_interleave(repeat_factor, dim=2)
++            num_key_heads = A_log_local_cp.numel()
++            raw_g = raw_g.reshape(batch, seq_len, num_key_heads, self.key_head_dim)
++            beta = beta.reshape(batch, seq_len, num_key_heads).float().sigmoid()
++            from fla.ops.kda.gate import fused_kda_gate
++
++            raw_g = fused_kda_gate(
++                raw_g, A_log_local_cp.contiguous(), dt_bias=dt_bias_local_cp.contiguous(),
++                lower_bound=self.config.kda_lower_bound if self.config.kda_safe_gate else None,
++            )
++            return (query.contiguous(), key.contiguous(), value.contiguous(), gate,
++                    beta.contiguous(), raw_g.contiguous(), A_log_local_cp, dt_bias_local_cp)
++
+         nvtx_range_push(suffix="prepare_input_for_gated_delta_rule")
+         kernel_inputs = self._prepare_input_for_gated_delta_rule(
+             qkv,
+@@ -668,3 +765,8 @@ class KimiDeltaAttention(_GDNBase):
+
+         super().backward_dw()
+         self.beta_proj.backward_dw()
++        if self.two_stage_gates:
++            self.f_a_proj.backward_dw()
++            self.f_b_proj.backward_dw()
++            self.g_a_proj.backward_dw()
++            self.g_b_proj.backward_dw()
+diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
+index 3318972bae..5c84d69584 100644
+--- a/megatron/core/tensor_parallel/layers.py
++++ b/megatron/core/tensor_parallel/layers.py
+@@ -138,6 +138,14 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
+
+     for attribute in _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS:
+         maybe_copy(attribute)
++    # `allreduce` is deliberately not in the defaults above (giving it a default would tag every
++    # parameter), but copies must still carry it: `allreduce=False` is what marks expert
++    # parameters as reduced over expert DP, and param_is_not_tensor_parallel_duplicate needs it
++    # to switch duplicate filtering to the expert TP group. Without this the fp32 master params
++    # built by the float16/distributed optimizers lose the mark, expert shards get deduplicated
++    # over the attention TP group instead, and -- since the expert grad-stats group does not span
++    # attention TP -- each rank ends up clipping with a different coefficient.
++    maybe_copy("allreduce")
+
+
+ def _initialize_affine_weight_gpu(weight, init_method, partition_dim, stride=1, is_expert=False):
+diff --git a/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py b/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py
+index f1eeda16ae..b5f92f5ef8 100644
+--- a/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py
++++ b/megatron/core/transformer/experimental_attention_variant/absorbed_mla.py
+@@ -190,7 +190,11 @@ class AbsorbedMLASelfAttention(Attention):
+         self.cache_mla_latents = self.config.cache_mla_latents
+         assert not self.cache_mla_latents, "cache_mla_latents is not supported for AbsorbedMLA"
+
+-        if self.config.rope_type == "rope":
++        # The NoPE addition is from Megatron-LM #7054 / be805e55; dev's RoPE path is kept.
++        self.use_rope = self.config.qk_pos_emb_head_dim > 0
++        if not self.use_rope:
++            self.rotary_pos_emb = None
++        elif self.config.rope_type == "rope":
+             self.rotary_pos_emb = RotaryEmbedding(
+                 self.config.qk_pos_emb_head_dim,
+                 rotary_percent=self.config.rotary_percent,
+@@ -454,16 +458,20 @@ class AbsorbedMLASelfAttention(Attention):
+         # =========================================
+         # Prepare RoPE and seqlen related params
+         # =========================================
+-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+-            inference_context, None, hidden_states, self.config, packed_seq_params
+-        )
++        rotary_seq_len = None
++        if self.use_rope:
++            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
++                inference_context, None, hidden_states, self.config, packed_seq_params
++            )
+
+         mscale = 1.0
+         rotary_pos_cos = None
+         rotary_pos_sin = None
+         thd_packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+-        use_fused_rope = should_use_fused_mla_rope(self.config)
+-        if use_fused_rope:
++        use_fused_rope = self.use_rope and should_use_fused_mla_rope(self.config)
++        if not self.use_rope:
++            rotary_pos_emb = None
++        elif use_fused_rope:
+             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                 rotary_seq_len, dtype=hidden_states.dtype, packed_seq=thd_packed_seq
+             )
+@@ -595,6 +603,12 @@ class AbsorbedMLASelfAttention(Attention):
+
+             k_up_weight, _ = self._get_kv_up_weights()
+
++            if not self.use_rope:
++                q_absorbed = torch.einsum("...nd,ndk->...nk", q, k_up_weight).contiguous()
++                # Recomputation frees the output storage, so the output must not share storage with a
++                # saved input.
++                return q_absorbed, kv_compressed.clone()
++
+             if use_fused_rope:
+                 # q_no_pe: [num_tokens, n, qk_head_dim]
+                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
+index 9193f4e00a..70174144ba 100644
+--- a/megatron/core/transformer/experimental_attention_variant/dsa.py
++++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
+@@ -668,23 +668,25 @@ def _compute_index_scores(
+     Returns:
+         index_scores: FP32 [batch, seqlen_q, seqlen_k], the index scores.
+     """
+-    # Compute attention scores: q @ k^T
+-    # [seqlen_q, batch, index_n_heads, index_head_dim] @ [seqlen_k, batch, index_head_dim]^T
+-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+-    index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+-
+-    # Optionally apply ReLU activation (used by DeepSeek V3.2, not GLM5).
+-    if use_relu:
+-        index_scores = torch.relu(index_scores)
+-
+-    # Weight each head by attention weights.
+-    # [seqlen_q, batch, index_n_heads, seqlen_k] * [seqlen_q, batch, index_n_heads, 1]
+-    #   -> [seqlen_q, batch, index_n_heads, seqlen_k]
+-    index_scores = index_scores * weights.unsqueeze(-1)
+-
+-    # Sum across attention heads.
+-    # [seqlen_q, batch, index_n_heads, seqlen_k] -> [seqlen_q, batch, seqlen_k]
+-    index_scores = index_scores.sum(dim=2)
++    sq, batch, n_heads, head_dim = q.shape
++    sk = k.size(0)
++    k_fp32 = k.float()
++
++    # Chunk over seqlen_q to avoid materializing the full [sq, batch, heads, sk]
++    # fp32 tensor.  Target ~1 GB per chunk.
++    bytes_per_token = batch * n_heads * sk * 4
++    chunk_size = min(sq, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
++    index_scores = torch.empty(sq, batch, sk, dtype=torch.float32, device=q.device)
++
++    for start in range(0, sq, chunk_size):
++        end = min(start + chunk_size, sq)
++        # [chunk, batch, heads, sk]
++        scores = torch.einsum('sbhd,tbd->sbht', q[start:end].float(), k_fp32)
++        if use_relu:
++            scores.relu_()
++        # Weight and sum over heads in one step: [chunk, batch, sk]
++        index_scores[start:end] = (scores * weights[start:end].unsqueeze(-1)).sum(dim=2)
++        del scores
+
+     # Transpose to [batch, seqlen_q, seqlen_k].
+     index_scores = index_scores.transpose(0, 1)
+@@ -741,6 +743,116 @@ def fused_qk_topk_naive(
+     return index_scores, topk_indices
+
+
++# KPool/NoPE from Megatron-LM #7054 / be805e55138888da4eddd0f00ca1114d04b98b9c.
++# Under this file's NVIDIA license; this port keeps BF16/FP32 only, without the FP8 rollout branch.
++def _kpool_compress_keys(k, gate_score, ape, pool_size):
++    """Compress complete pools only; accumulate in FP32, then cast back to the input dtype so that a
++    true FP32 reference is possible."""
++    seqlen, batch, dim = k.shape
++    pools = seqlen // pool_size
++    keys = k[:pools * pool_size].reshape(pools, pool_size, batch, dim).float()
++    gates = gate_score[:pools * pool_size].reshape(pools, pool_size, batch, dim).float()
++    scores = gates + ape.float()[None, :, None, :]
++    probabilities = (scores - scores.amax(dim=1, keepdim=True)).exp()
++    pooled = (keys * probabilities).sum(dim=1) / probabilities.sum(dim=1).clamp_min(1e-12)
++    return pooled.to(k.dtype)
++
++
++def _expand_pools_to_tokens(pool_ids, pool_valid, topk_tokens, pool_size, pool_token_base=None):
++    """Expand pool indices into fixed-width token indices, keeping -1 for invalid positions."""
++    assert pool_ids.shape[1] * pool_size == topk_tokens
++    if pool_token_base is None:
++        starts = pool_ids * pool_size
++    elif pool_token_base.numel():
++        starts = pool_token_base[pool_ids.clamp_min(0)]
++    else:
++        starts = torch.zeros_like(pool_ids)
++    tokens = starts.unsqueeze(-1) + torch.arange(pool_size, device=pool_ids.device)
++    return tokens.masked_fill(~pool_valid.unsqueeze(-1), -1).reshape(
++        pool_ids.shape[0], topk_tokens
++    ).to(torch.int32)
++
++
++def _append_tail_to_topk(topk_result, seq_lens, pool_size, tail_start_override=None):
++    """Append each query's incomplete causal tail pool rather than the final pool of the whole sample."""
++    count = seq_lens.to(torch.int32).remainder(pool_size)
++    start = seq_lens.to(torch.int32) - count if tail_start_override is None else tail_start_override
++    offsets = torch.arange(pool_size - 1, device=topk_result.device)
++    tail = start[:, None] + offsets
++    tail = tail.masked_fill(offsets >= count[:, None], -1).to(topk_result.dtype)
++    return torch.cat((topk_result, tail), dim=-1)
++
++
++def fused_qk_topk_kpool(
++    q, k, weights, index_topk, pool_size, gate_score, ape, mask=None,
++    varlen_starts=None, varlen_ends=None, key_positions=None, cu_seqlens_kv=None,
++    use_relu=True, always_select_tail=True,
++):
++    """Select complete causal pools within each document; return global token indices and pool scores."""
++    if index_topk % pool_size:
++        raise ValueError("KPool index_topk must be divisible by pool_size")
++    if cu_seqlens_kv is None:
++        pooled = _kpool_compress_keys(k, gate_score, ape, pool_size)
++        bases = torch.arange(pooled.shape[0], device=k.device) * pool_size
++    else:
++        parts, base_parts = [], []
++        for start, end in zip(cu_seqlens_kv[:-1].tolist(), cu_seqlens_kv[1:].tolist()):
++            part = _kpool_compress_keys(k[start:end], gate_score[start:end], ape, pool_size)
++            parts.append(part)
++            base_parts.append(torch.arange(part.shape[0], device=k.device) * pool_size + start)
++        pooled = torch.cat(parts)
++        bases = torch.cat(base_parts)
++    scores = _compute_index_scores(q, weights, pooled, use_relu=use_relu)
++    pool_ends = bases + pool_size - 1
++    positions = key_positions[pool_ends] if key_positions is not None else pool_ends
++    starts, ends, normalized_positions = dsa_masking.normalize_varlen_bounds(
++        mask=mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
++        key_positions=positions, sk=pooled.shape[0], device=q.device,
++    )
++    if normalized_positions is not None:
++        positions = normalized_positions
++    if starts is not None:
++        scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
++    elif mask is not None:
++        scores = scores + mask[..., pool_ends]
++    else:
++        ends = torch.arange(1, q.shape[0] + 1, device=q.device)
++        starts = torch.zeros_like(ends)
++        if cu_seqlens_kv is not None:
++            cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
++            starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
++        scores = dsa_masking.apply_starts_ends_mask_to_scores(scores, starts, ends, positions)
++    budget = index_topk // pool_size
++    select = min(budget, pooled.shape[0])
++    if select:
++        values, ids = scores.topk(select, dim=-1)
++        ids = ids.masked_fill(values == float('-inf'), -1)
++    else:
++        ids = torch.empty(scores.shape[:-1] + (0,), dtype=torch.long, device=q.device)
++    if select < budget:
++        ids = torch.nn.functional.pad(ids, (0, budget - select), value=-1)
++    batch, queries = ids.shape[:2]
++    rows = batch * queries
++    flat_ids = ids.reshape(rows, budget)
++    tokens = _expand_pools_to_tokens(
++        flat_ids.clamp_min(0), flat_ids >= 0, index_topk, pool_size, bases
++    )
++    if always_select_tail:
++        ends = ends if ends is not None else torch.arange(1, queries + 1, device=q.device)
++        if starts is None:
++            starts = torch.zeros_like(ends)
++            if cu_seqlens_kv is not None:
++                cu = cu_seqlens_kv.to(device=q.device, dtype=torch.int64)
++                starts = cu[torch.searchsorted(cu[1:], ends - 1, right=True)]
++        lengths = ends - starts
++        tail_starts = ends - lengths.remainder(pool_size)
++        tokens = _append_tail_to_topk(
++            tokens, lengths.expand(batch, -1).reshape(-1), pool_size,
++            tail_start_override=tail_starts.expand(batch, -1).reshape(-1),
++        )
++    return scores, tokens.reshape(batch, queries, -1)
++
++
+ def fwd_fused_indexer_loss_naive(
+     q,
+     weights,
+@@ -975,36 +1087,47 @@ def bwd_fused_indexer_loss_naive(
+     grad_weighted_scores = grad_index_scores.unsqueeze(2)  # [sq, b, 1, sk]
+     del grad_index_scores
+
+-    # Compute forward values needed for backward
+-    scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())  # [sq, b, h, sk]
+-
+-    # Backward through multiplication by weights (with optional ReLU).
+-    if use_relu:
+-        scores_for_weights = torch.relu(scores)
+-        relu_mask = scores > 0
+-    else:
+-        scores_for_weights = scores
+-        relu_mask = None
+-    del scores
++    # Chunk over seqlen_q to avoid materializing the full [sq, b, h, sk] fp32 tensor.
++    sq_q, b_q, h_q, d_q = q.shape
++    k_fp32 = k.float()
++    bytes_per_token = b_q * h_q * sk * 4
++    chunk_size = min(sq_q, max(1, 1024 * 1024 * 1024 // max(1, bytes_per_token)))
++
++    grad_q = torch.empty(sq_q, b_q, h_q, d_q, dtype=torch.float32, device=q.device)
++    grad_weights = torch.empty(sq_q, b_q, h_q, dtype=torch.float32, device=q.device)
++    grad_k = torch.zeros(sk, b_q, d_q, dtype=torch.float32, device=q.device)
++
++    for start in range(0, sq_q, chunk_size):
++        end = min(start + chunk_size, sq_q)
++        q_chunk = q[start:end]  # [chunk, b, h, d]
++        gw_chunk = grad_weighted_scores[start:end]  # [chunk, b, 1, sk]
++        w_chunk = weights[start:end]  # [chunk, b, h]
++
++        # Forward scores for this chunk: [chunk, b, h, sk]
++        scores_chunk = torch.einsum('sbhd,tbd->sbht', q_chunk.float(), k_fp32)
++        if use_relu:
++            relu_mask_chunk = scores_chunk > 0
++            scores_chunk.relu_()
++        else:
++            relu_mask_chunk = None
+
+-    # ∂L/∂weights = grad * scores_for_weights (sum over sk)
+-    grad_weights = (grad_weighted_scores * scores_for_weights).sum(dim=-1)  # [sq, b, h]
++        # ∂L/∂weights = grad * scores (sum over sk)
++        grad_weights[start:end] = (gw_chunk * scores_chunk).sum(dim=-1)
++        del scores_chunk
+
+-    # ∂L/∂scores = grad * weights
+-    grad_scores = grad_weighted_scores * weights.unsqueeze(-1)  # [sq, b, h, sk]
+-    del grad_weighted_scores, scores_for_weights
++        # ∂L/∂scores = grad * weights: [chunk, b, h, sk]
++        grad_scores_chunk = gw_chunk * w_chunk.unsqueeze(-1)
++        if use_relu:
++            grad_scores_chunk.masked_fill_(~relu_mask_chunk, 0.0)
++            del relu_mask_chunk
+
+-    # Backward through ReLU (skip when use_relu=False)
+-    if use_relu:
+-        grad_scores = grad_scores * relu_mask.float()
+-        del relu_mask
++        # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
++        grad_q[start:end] = torch.einsum('sbht,tbd->sbhd', grad_scores_chunk, k_fp32)
++        # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)  (accumulate)
++        grad_k += torch.einsum('sbht,sbhd->tbd', grad_scores_chunk, q_chunk.float())
++        del grad_scores_chunk
+
+-    # Backward through einsum 'sbhd,tbd->sbht'
+-    # ∂L/∂q = einsum('sbht,tbd->sbhd', grad_scores, k)
+-    grad_q = torch.einsum('sbht,tbd->sbhd', grad_scores, k.float())  # [sq, b, h, d]
+-    # ∂L/∂k = einsum('sbht,sbhd->tbd', grad_scores, q)
+-    grad_k = torch.einsum('sbht,sbhd->tbd', grad_scores, q.float())  # [sk, b, d]
+-    del grad_scores
++    del grad_weighted_scores
+
+     return grad_q.to(q.dtype), grad_weights.to(weights.dtype), grad_k.to(k.dtype)
+
+@@ -1443,7 +1566,10 @@ class DSAIndexer(MegatronModule):
+         self.pg_collection = pg_collection
+
+         # Initialize Position Embedding.
+-        if self.config.rope_type == 'rope':
++        self.use_rope = self.qk_pos_emb_head_dim > 0
++        if not self.use_rope:
++            self.rotary_pos_emb = None
++        elif self.config.rope_type == 'rope':
+             self.rotary_pos_emb = RotaryEmbedding(
+                 self.qk_pos_emb_head_dim,
+                 rotary_percent=self.config.rotary_percent,
+@@ -1520,6 +1646,21 @@ class DSAIndexer(MegatronModule):
+                 skip_weight_param_allocation=False,
+                 parallel_mode="duplicated",
+             )
++        self.index_kpool = config.dsa_indexer_kpool
++        self.index_kpool_always_select_tail = config.dsa_indexer_kpool_always_select_tail
++        self._kpool_gate_score = None
++        if self.index_kpool > 1:
++            self.index_kpool_compress_ape = torch.nn.Parameter(torch.zeros(
++                self.index_kpool, self.index_head_dim, dtype=config.params_dtype,
++                device=self.linear_wk.weight.device,
++            ))
++            self.index_kpool_compress_gate = torch.nn.Parameter(torch.empty(
++                self.index_head_dim, self.hidden_size, dtype=config.params_dtype,
++                device=self.linear_wk.weight.device,
++            ))
++            config.init_method(self.index_kpool_compress_gate)
++        else:
++            self.index_kpool_compress_ape = self.index_kpool_compress_gate = None
+         self._weights_proj_te_gemm_supported: Optional[bool] = None
+         # Indexer projections are duplicated across tensor-parallel ranks, so their gradients
+         # should be averaged during final gradient synchronization.
+@@ -1557,6 +1698,8 @@ class DSAIndexer(MegatronModule):
+         rotary_pos_sin: Optional[torch.Tensor] = None,
+     ):
+         """Apply RoPE to the input tensor."""
++        if not self.use_rope:
++            return x
+         if rotary_pos_cos is not None or rotary_pos_sin is not None:
+             assert rotary_pos_cos is not None and rotary_pos_sin is not None
+             assert fused_mla_rope_inplace is not None, "Fused MLA RoPE is not available"
+@@ -1623,14 +1766,17 @@ class DSAIndexer(MegatronModule):
+         # =========================================
+         # Prepare RoPE params
+         # =========================================
+-        rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+-            None, None, x, self.config, packed_seq_params
+-        )
+-        fused_indexer_rope = self.config.dsa_indexer_rope_interleaved and should_use_fused_mla_rope(
+-            self.config
+-        )
++        rotary_seq_len = None
++        if self.use_rope:
++            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
++                None, None, x, self.config, packed_seq_params
++            )
++        fused_indexer_rope = (self.use_rope and self.config.dsa_indexer_rope_interleaved
++                              and should_use_fused_mla_rope(self.config))
+         rotary_pos_cos = rotary_pos_sin = None
+-        if fused_indexer_rope:
++        if not self.use_rope:
++            rotary_pos_emb, mscale = None, 1.0
++        elif fused_indexer_rope:
+             rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
+                 rotary_seq_len, dtype=x.dtype, packed_seq=packed_seq
+             )
+@@ -1716,6 +1862,8 @@ class DSAIndexer(MegatronModule):
+         # [seqlen, batch, hidden_size] -> [seqlen, batch, index_n_heads]
+         weights = self._project_indexer_weights(x)
+         weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
++        if self.index_kpool > 1:
++            self._kpool_gate_score = torch.nn.functional.linear(x, self.index_kpool_compress_gate)
+
+         return q, k, weights
+
+@@ -1748,9 +1896,20 @@ class DSAIndexer(MegatronModule):
+         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
+
+         # [batch, seqlen, seqlen], [batch, seqlen, index_topk]
+-        index_scores, topk_indices = fused_qk_topk_naive(
+-            q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
+-        )
++        if self.index_kpool > 1:
++            cu = None
++            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
++                _, cu = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
++            index_scores, topk_indices = fused_qk_topk_kpool(
++                q, k, weights, self.index_topk, self.index_kpool,
++                self._kpool_gate_score, self.index_kpool_compress_ape,
++                mask=mask, cu_seqlens_kv=cu, use_relu=self.config.dsa_indexer_scoring_relu,
++                always_select_tail=self.index_kpool_always_select_tail,
++            )
++        else:
++            index_scores, topk_indices = fused_qk_topk_naive(
++                q, k, weights, self.index_topk, mask, use_relu=self.config.dsa_indexer_scoring_relu
++            )
+
+         return index_scores, topk_indices
+
+@@ -2438,7 +2597,8 @@ class DSAttention(MegatronModule):
+             )
+
+         fused_output = None
+-        if use_fused_kernels and not self.index_share:
++        is_kpool = self.indexer is not None and self.indexer.index_kpool > 1
++        if use_fused_kernels and not self.index_share and not is_kpool:
+             assert q is not None and k is not None and weights is not None
+             fused_output = dsa_kernels.run_fused_dsa_attention(
+                 config=self.config,
+@@ -2581,7 +2741,19 @@ class DSAttention(MegatronModule):
+             # ===================================
+             # Get top-k indices
+             # ===================================
+-            if fused_bounds is not None:
++            if is_kpool:
++                # cuDNN's token top-k does not implement pool compression; keep dev's subsequent
++                # sparse attention path.
++                with torch.no_grad():
++                    _, topk_indices = fused_qk_topk_kpool(
++                        q, k, weights, self.index_topk, self.indexer.index_kpool,
++                        self.indexer._kpool_gate_score, self.indexer.index_kpool_compress_ape,
++                        mask=float_mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
++                        key_positions=key_positions, cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
++                        use_relu=self.config.dsa_indexer_scoring_relu,
++                        always_select_tail=self.indexer.index_kpool_always_select_tail,
++                    )
++            elif fused_bounds is not None:
+                 starts_i32, ends_i32 = fused_bounds
+                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
+                 fused_topk = dsa_kernels.run_fused_qk_topk(
+diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
+index 9b23915627..a1725a08b1 100644
+--- a/megatron/core/transformer/hyper_connection.py
++++ b/megatron/core/transformer/hyper_connection.py
+@@ -1,6 +1,7 @@
+ # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+ import math
++from functools import partial
+ from typing import TYPE_CHECKING, Optional, Tuple
+
+ import torch
+@@ -144,11 +145,30 @@ def native_h_post_bda(
+     return x_expanded + mixed
+
+
++@torch.compile
++def native_h_aggregate_fp32(x: Tensor, h_pre: Tensor) -> Tensor:
++    """GLM: round once after the FP32 mixing; the default aggregate operator is unchanged."""
++    return native_h_aggregate(x.float(), h_pre).to(x.dtype)
++
++
++@torch.compile
++def native_h_post_bda_fp32(h_res, original_residual, h_post, x, bias):
++    """GLM-only mixed-precision entry point; the graph of the original BF16 operator is unchanged."""
++    return native_h_post_bda(
++        h_res, original_residual.float(), h_post, x.float(),
++        None if bias is None else bias.float(),
++    ).to(original_residual.dtype)
++
++
+ # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
+ @torch.compile
+-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
++def native_proj_rms(
++    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
++) -> Tuple[Tensor, Tensor]:
+     """Native fused projection + RMS normalization."""
+     proj = torch.matmul(x, weight.t())
++    if eps_inside_sqrt:
++        return proj, torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+     norm = x.norm(dim=-1, keepdim=True)
+     K = x.shape[-1]
+     v = norm / math.sqrt(K) + eps
+@@ -264,7 +284,7 @@ class HyperConnectionModule(MegatronModule):
+         mark_keep_in_fp32(self.alpha_post)
+         mark_keep_in_fp32(self.alpha_res)
+         mark_keep_in_fp32(self.bias)
+-        self.norm_eps = 1e-6
++        self.norm_eps = config.layernorm_epsilon if config.mhc_norm_eps_inside_sqrt else 1e-6
+
+         # Choose implementation: unified fused kernels vs reference modules.
+         # The fused public API selects the backend per operation internally.
+@@ -276,9 +296,12 @@ class HyperConnectionModule(MegatronModule):
+         # The fused path computes the projection and compute_h in one op, so
+         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
+         # reached on the unfused path.
+-        self._proj_rms_op = native_proj_rms
++        # From Megatron-LM #7054 / be805e55; the default precision convention of other models is unchanged.
++        self._proj_rms_op = partial(native_proj_rms, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
+
+         if config.use_fused_mhc:
++            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
++                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
+             from megatron.core.fusions.fused_mhc_kernels import (
+                 fused_h_aggregate,
+                 fused_h_aggregate_into,
+@@ -296,9 +319,9 @@ class HyperConnectionModule(MegatronModule):
+             self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+         else:
+             self._sinkhorn_op = native_sinkhorn
+-            self._h_aggregate_op = native_h_aggregate
++            self._h_aggregate_op = native_h_aggregate_fp32 if config.mhc_keep_mappings_in_fp32 else native_h_aggregate
+             self._h_aggregate_into_op = native_h_aggregate_into
+-            self._h_post_bda_op = native_h_post_bda
++            self._h_post_bda_op = native_h_post_bda_fp32 if config.mhc_keep_mappings_in_fp32 else native_h_post_bda
+             self._proj_rms_compute_h_op = None
+
+         self._init_weights()
+@@ -417,7 +440,7 @@ class HyperConnectionModule(MegatronModule):
+         # The mixing weights are bounded (sigmoid outputs / doubly stochastic
+         # matrix), so after the FP32 computation they are safe to apply to the
+         # streams in the activation dtype.
+-        dtype = x.dtype
++        dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
+         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
+
+     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
+@@ -541,7 +564,7 @@ class HyperConnectionModule(MegatronModule):
+         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
+         h_res_batched = h_res.view(s * b, n, n)
+         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
+-        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
++        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
+
+         # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
+         mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+@@ -818,7 +841,7 @@ class HyperConnectionModule(MegatronModule):
+         bda_func = get_bias_dropout_add(training, fused)
+         with torch.cuda.nvtx.range("HyperConnection::bda"):
+             output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+-        return output
++        return output.to(original_residual.dtype) if self.config.mhc_keep_mappings_in_fp32 else output
+
+     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
+     def _fused_h_res_h_post_bda_with_checkpoint(
+@@ -893,7 +916,7 @@ class HyperConnectionModule(MegatronModule):
+                         bias_expanded = None
+                 with torch.cuda.nvtx.range("HyperConnection::bda"):
+                     output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
+-                return output
++                return output.to(original_residual.dtype) if self.config.mhc_keep_mappings_in_fp32 else output
+
+             ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
+             if has_bias:
+diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
+index 35a6d87388..23b5589e77 100644
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -382,6 +382,12 @@ class TransformerConfig(ModelParallelConfig):
+     dsa_indexer_k_norm_fp32: bool = False
+     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
+
++    dsa_indexer_kpool: int = 1
++    """Tokens per index pool; 1 keeps the original per-token top-k."""
++
++    dsa_indexer_kpool_always_select_tail: bool = False
++    """Append the incomplete causal tail pool of every query."""
++
+     dsa_indexer_weights_proj_use_quantization: bool = True
+     """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+     quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+@@ -443,6 +449,10 @@ class TransformerConfig(ModelParallelConfig):
+     linear_num_value_heads: Optional[int] = 32
+     """Number of value and gate heads for the gated delta net."""
+
++    # GLM numerical extensions, from Megatron-LM #7054 / be805e55 (NVIDIA license).
++    kda_two_stage_gates: bool = False
++    """Use separate low-rank forget and output gates; the input projection holds QKV only."""
++
+     kda_safe_gate: bool = False
+     """Whether the KDA kernel should use bounded gate values."""
+
+@@ -1299,6 +1309,15 @@ class TransformerConfig(ModelParallelConfig):
+     mhc_init_gating_factor: float = 0.01
+     """Initial value of Gating Factor (alpha in paper)."""
+
++    mhc_norm_eps_inside_sqrt: bool = False
++    """Compute the mHC norm as rsqrt(mean(x**2) + layernorm_epsilon)."""
++
++    mhc_keep_mappings_in_fp32: bool = False
++    """Keep mHC coefficients and the residual mixing in FP32, casting to the activation dtype at the end."""
++
++    mhc_learned_output_contract: bool = True
++    """When disabled, average the residual streams and build no learnable output-contraction parameter."""
++
+     use_fused_mhc: bool = False
+     """Use unified fused kernels for mHC operations.
+
+diff --git a/tests/unit_tests/tensor_parallel/test_layers.py b/tests/unit_tests/tensor_parallel/test_layers.py
+index 43fda3a7a4..39d1d02397 100644
+--- a/tests/unit_tests/tensor_parallel/test_layers.py
++++ b/tests/unit_tests/tensor_parallel/test_layers.py
+@@ -3,6 +3,7 @@ import pytest
+ import torch
+
+ from megatron.core.tensor_parallel.layers import (
++    copy_tensor_model_parallel_attributes,
+     linear_with_frozen_weight,
+     param_is_not_tensor_parallel_duplicate,
+ )
+@@ -38,6 +39,32 @@ def test_param_is_not_tensor_parallel_duplicate_uses_parameter_parallel_group(
+     assert actual is expected
+
+
++def test_copy_tensor_model_parallel_attributes_mirrors_allreduce():
++    """fp32 master copies must keep the `allreduce` flag that marks expert parameters.
++
++    param_is_not_tensor_parallel_duplicate switches duplicate filtering to the expert TP group
++    based on that flag. Losing it on the float16/distributed optimizer clones makes expert shards
++    deduplicate over the attention TP group instead, and since the expert grad-stats group does not
++    span attention TP, each rank then clips with a different coefficient.
++    """
++    expert = torch.nn.Parameter(torch.ones(1))
++    expert.allreduce = False
++    expert_copy = torch.nn.Parameter(torch.ones(1))
++
++    copy_tensor_model_parallel_attributes(expert_copy, expert)
++
++    assert expert_copy.allreduce is False
++
++    # `allreduce` is deliberately absent from _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS: a default there
++    # would tag every parameter. Only an explicit source flag is mirrored.
++    plain = torch.nn.Parameter(torch.ones(1))
++    plain_copy = torch.nn.Parameter(torch.ones(1))
++
++    copy_tensor_model_parallel_attributes(plain_copy, plain)
++
++    assert not hasattr(plain_copy, "allreduce")
++
++
+ @pytest.mark.parametrize("tensor_parallel,allreduce_dgrad", [(1, False), (8, True)])
+ def test_LinearWithFrozenWeight(tensor_parallel, allreduce_dgrad):
+     Utils.initialize_model_parallel(tensor_parallel, 1)

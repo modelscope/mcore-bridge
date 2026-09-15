@@ -6,6 +6,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import VocabParallelEmbedding, scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from typing import Optional
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import reconstruct_tensor_cp, split_cp_inputs
@@ -80,6 +81,10 @@ class MultimodalGPTModel(MegatronModule):
         labels: torch.Tensor = None,
         inference_params: InferenceParams = None,
         packed_seq_params: PackedSeqParams = None,
+        # Same knob as GPTModel.forward. Left to **kwargs it would be routed into
+        # extra_block_kwargs and silently dropped, so a TP caller asking for gathered logits would
+        # get the local vocab shard back.
+        runtime_gather_output: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
@@ -109,6 +114,7 @@ class MultimodalGPTModel(MegatronModule):
             labels=labels,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
+            runtime_gather_output=runtime_gather_output,
             extra_block_kwargs=kwargs,
         )
 

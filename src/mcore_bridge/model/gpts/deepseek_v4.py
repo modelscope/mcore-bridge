@@ -329,7 +329,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         boundary_hidden = None
         boundary_rotary_pos_emb = None
         if use_thd_cp:
-            from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
+            # https://github.com/NVIDIA/Megatron-LM/pull/6372
+            try:
+                from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
+            except ModuleNotFoundError:
+                from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
             boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
                 hidden_states,
                 self._dsv4_compress_ratio,
