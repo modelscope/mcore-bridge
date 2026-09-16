@@ -37,7 +37,7 @@ from mcore_bridge.utils import is_master
 from ..modules.engram import DeepseekV41Engram, DeepseekV41TransformerLayer
 from ..rope import get_rope_inv_freq
 from .deepseek_v41 import (CSA2Compressor, CSA2Indexer, DeepseekV41Bridge, DeepseekV41Loader,
-                           DSv4HybridSelfAttention)
+                           DeepseekV41MultimodalGPTModel, DSv4HybridSelfAttention)
 
 try:
     from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
@@ -145,6 +145,12 @@ if _HYBRID_MODEL_AVAILABLE:
         # like the GPT ``DeepseekV41MultimodalGPTModel``). Expose it so that guard short-circuits;
         # the real vision tower arrives with the multimodal wrapper in B4.
         visual = None
+
+        # ``MultimodalGPTModel.forward`` (B4 wrapper) reads ``language_model.extra_forward_keys``
+        # to forward a whitelist of extra kwargs into the decoder. ``McoreHybridModel`` has no such
+        # attribute (it lives on the mcore-bridge ``GPTModel``, default ``[]``); expose the same
+        # empty default so the wrapper treats the hybrid backbone exactly like the GPT one.
+        extra_forward_keys: List[str] = []
 
         @staticmethod
         def _segment_main_pattern(config) -> Optional[str]:
@@ -265,6 +271,14 @@ if _HYBRID_MODEL_AVAILABLE:
         _visual_forward_keys = ('pixel_values', 'image_grid_thw', 'image_token_types', 'token_types')
 
         def forward(self, *args, **kwargs):
+            # The B4 multimodal wrapper (``MultimodalGPTModel.forward``) always funnels the
+            # decoder's extra kwargs through ``extra_block_kwargs`` -- the mcore-bridge ``GPTModel``
+            # calling convention. Upstream ``HybridModel.forward`` has no such parameter (it threads
+            # ``input_ids`` into the decoder itself, hybrid_model.py), so unpack the container here
+            # and let the visual-key strip below drop anything the text backbone does not consume.
+            extra_block_kwargs = kwargs.pop('extra_block_kwargs', None)
+            if extra_block_kwargs:
+                kwargs.update(extra_block_kwargs)
             if kwargs.get('pixel_values') is not None:
                 raise NotImplementedError(
                     'DeepSeek-V4.1 hybrid (pipeline-parallel) path is text-only in B1; multimodal '
@@ -272,9 +286,32 @@ if _HYBRID_MODEL_AVAILABLE:
             for key in self._visual_forward_keys:
                 kwargs.pop(key, None)
             return super().forward(*args, **kwargs)
+
+    class DeepseekV41MultimodalHybridModel(DeepseekV41MultimodalGPTModel):
+        """Multimodal wrapper (B4) hosting the PP-capable ``HybridModel`` backbone.
+
+        ``MultimodalGPTModel`` consumes its ``language_model`` through a backbone-agnostic
+        interface -- ``embedding(input_ids, position_ids)`` / ``vp_stage`` /
+        ``share_embeddings_and_output_weights`` / ``extra_forward_keys`` /
+        ``set_input_tensor`` / ``get_input_tensor`` / ``shared_embedding_or_output_weight`` plus
+        the standard forward signature -- all of which :class:`DeepseekV41HybridStackModel`
+        provides (``extra_forward_keys`` is added on it for exactly this). So the only change from
+        the GPT :class:`DeepseekV41MultimodalGPTModel` is swapping the language-model class; the
+        vision tower, image-embed injection (``_patch_word_embeddings``) and the vision/aligner
+        weight bridging (``MultimodalGPTBridge._convert_pre_process``) are inherited unchanged.
+
+        The wrapper injects image embeddings into the embedding output and clears the visual
+        kwargs before the language model runs, so the hybrid backbone only ever sees a text batch
+        (its ``forward`` strips ``_visual_forward_keys`` as a defensive backstop). The DSpark
+        speculative-decoding helpers inherited from the GPT wrapper are inference-only and stay
+        deferred on the hybrid path (see :meth:`DeepseekV41HybridLoader.build_model`).
+        """
+
+        language_model_cls = DeepseekV41HybridStackModel
 else:
     DeepseekV41HyperConnectionHybridLayer = None
     DeepseekV41HybridStackModel = None
+    DeepseekV41MultimodalHybridModel = None
 
 
 @dataclass
@@ -374,11 +411,12 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
     B1 covers the text backbone; B3 adds the DSpark (``mtp.*``) draft stack on top (attached in
     :meth:`build_model`, mapped in :meth:`DeepseekV41HybridBridge._convert_additional_layers`).
     Autoregressive MTP (``mtp_num_layers`` / ``MultiTokenPredictionBlock``) does not apply to
-    V4.1 -- its ``mtp.*`` checkpoint keys *are* DSpark -- so it stays disabled here. The
-    multimodal wrapper (B4) is still added separately.
+    V4.1 -- its ``mtp.*`` checkpoint keys *are* DSpark -- so it stays disabled here. B4 wraps the
+    backbone in :class:`DeepseekV41MultimodalHybridModel` (the vision tower + image-embed
+    injection), mirroring the GPT :class:`DeepseekV41MultimodalGPTModel`.
     """
 
-    model_cls = DeepseekV41HybridStackModel
+    model_cls = DeepseekV41MultimodalHybridModel
 
     def _engram_placement_layer_ids(self, hf_layer_ids):
         """On HybridStack, HF layer ``e`` becomes the attention-only 'D' layer at hybrid index
@@ -491,10 +529,15 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
                 layer.__class__ = DeepseekV41HyperConnectionHybridLayer
 
     def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
-        """Build via ``HybridModel``, skipping ``ModelLoader.build_model``'s GPT layer-spec
-        post-processing (MLA / router / TransformerLayer substitution): a ``HybridStack`` spec
-        exposes per-symbol submodules instead, and the DSv4 attention swap is done in
-        ``get_transformer_layer_spec`` above."""
+        """Build the multimodal wrapper around ``HybridModel``, skipping ``ModelLoader.build_model``'s
+        GPT layer-spec post-processing (MLA / router / TransformerLayer substitution): a
+        ``HybridStack`` spec exposes per-symbol submodules instead, and the DSv4 attention swap is
+        done in ``get_transformer_layer_spec`` above.
+
+        ``model`` is :class:`DeepseekV41MultimodalHybridModel` (vision tower + wrapper); the hybrid
+        text backbone -- which owns the decoder / MoE / Engram layers the fix-ups below touch --
+        is nested under ``model.language_model``, so they target that (matching the GPT wrapper,
+        where the same fix-ups and DSpark live under ``language_model``)."""
         self._hybrid_config = self._build_hybrid_config()
         model = self.model_cls(
             config=self._hybrid_config,
@@ -503,16 +546,16 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
             post_process=post_process,
             vp_stage=vp_stage,
         )
-        self._rewrap_engram_hyper_connection_layers(model)
-        self._set_linear_is_expert(model)
+        language_model = getattr(model, 'language_model', model)
+        self._rewrap_engram_hyper_connection_layers(language_model)
+        self._set_linear_is_expert(language_model)
         # DSpark (B3): the ``mtp.*`` draft stack is backbone-agnostic (plain
-        # experimental-attention layers), so reuse the GPT loader's builder. The hybrid model is
-        # text-only (no ``language_model`` wrapper, see :meth:`DeepseekV41HybridBridge._lm`), so
-        # the stack attaches to the model itself. Inference-time target-layer capture on
-        # HybridStack is deferred (it is not exercised by training / weight round-trip, mirroring
-        # B1's deferral of ``allow_engram_inference``); the stack only needs to exist so its
-        # parameters are loaded / saved via ``mtp.*``.
-        self._attach_dspark(model, post_process)
+        # experimental-attention layers), so reuse the GPT loader's builder. It attaches to the
+        # hybrid text backbone (``language_model.dspark``), mirroring the GPT wrapper. Inference-time
+        # target-layer capture on HybridStack is deferred (it is not exercised by training / weight
+        # round-trip, mirroring B1's deferral of ``allow_engram_inference``); the stack only needs
+        # to exist so its parameters are loaded / saved via ``mtp.*``.
+        self._attach_dspark(language_model, post_process)
         return model
 
 
@@ -572,14 +615,28 @@ class DeepseekV41HybridBridge(DeepseekV41Bridge):
         # ``DeepseekV41HybridLoader._engram_placement_layer_ids``), so map it back to HF space.
         return (engram.layer_number - 1) // 2
 
+    def _set_word_embeddings(self, mg_model, hf_state_dict, to_mcore):
+        # The base ``MultimodalGPTBridge`` resolves the language model with a raw
+        # ``getattr(mg_model, 'language_model')``; route it through :meth:`_lm` so both the
+        # multimodal wrapper (B4) and a bare backbone resolve correctly.
+        self._set_state_dict(self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key,
+                             to_mcore)
+
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
-        # Text-only word embeddings; visual embeds (image_start/end/newline) are B4.
+        # First pipeline stage of a multimodal model: the vision tower + aligner + image_* markers
+        # live on the wrapper (``mg_model.visual``). Reuse the GPT ``DeepseekV41Bridge`` pre-process
+        # verbatim (``MultimodalGPTBridge`` word-embeddings + vision/aligner block, then the
+        # image_start/end/newline markers); ``_set_word_embeddings`` above resolves the LM via
+        # ``_lm``. ``super()`` here is ``DeepseekV41Bridge`` (MRO), matching the GPT path exactly.
+        if getattr(mg_model, 'visual', None) is not None:
+            return super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
+        # No vision tower on this rank (text-only backbone, or a non-first PP stage where the
+        # wrapper built ``visual=None``): map only the word embeddings.
         if to_mcore:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         else:
             hf_state_dict = {}
-        lm_model = self._lm(mg_model)
-        self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
+        self._set_word_embeddings(mg_model, hf_state_dict, to_mcore)
         if to_mcore:
             return {}
         return self._add_prefix(hf_state_dict, hf_prefix)

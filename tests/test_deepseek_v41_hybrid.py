@@ -511,3 +511,115 @@ def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
     with pytest.raises(RuntimeError, match='DSpark weights require the draft stack'):
         list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=False, is_pp_last_stage=True))
 
+
+# --- B4: multimodal wrapper hosting the hybrid backbone -----------------------------------------
+
+def test_multimodal_hybrid_wrapper_hosts_hybrid_backbone():
+    # The B4 wrapper is just the GPT multimodal model with the language-model class swapped for the
+    # PP-capable hybrid backbone; everything else (vision tower, image-embed injection) is inherited.
+    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41MultimodalGPTModel
+    from mcore_bridge.model.gpts.deepseek_v41_hybrid import (DeepseekV41HybridStackModel,
+                                                             DeepseekV41MultimodalHybridModel)
+    assert issubclass(DeepseekV41MultimodalHybridModel, DeepseekV41MultimodalGPTModel)
+    assert DeepseekV41MultimodalHybridModel.language_model_cls is DeepseekV41HybridStackModel
+
+
+def test_hybrid_stack_exposes_extra_forward_keys():
+    # ``MultimodalGPTModel.forward`` reads ``language_model.extra_forward_keys``; the hybrid backbone
+    # must expose the same empty default the GPT ``GPTModel`` carries.
+    assert DeepseekV41HybridStackModel.extra_forward_keys == []
+
+
+def test_hybrid_loader_model_cls_is_multimodal_wrapper():
+    from mcore_bridge.model.gpts.deepseek_v41_hybrid import DeepseekV41MultimodalHybridModel
+    assert DeepseekV41HybridLoader.model_cls is DeepseekV41MultimodalHybridModel
+
+
+def test_hybrid_pre_process_delegates_to_gpt_when_visual_present(monkeypatch):
+    # First PP stage of a multimodal model: the wrapper carries a vision tower, so pre-process must
+    # reuse the GPT DeepseekV41Bridge path (word embeddings + vision/aligner + image_* markers).
+    from types import SimpleNamespace
+
+    bridge = object.__new__(DeepseekV41HybridBridge)
+    called = []
+    monkeypatch.setattr(DeepseekV41Bridge, '_convert_pre_process',
+                        lambda self, mg, sd, pfx, tm: called.append((mg, pfx, tm)) or {'SUPER': True})
+    mg_model = SimpleNamespace(visual=object())
+    out = bridge._convert_pre_process(mg_model, {}, '', to_mcore=True)
+    assert out == {'SUPER': True}
+    assert called == [(mg_model, '', True)]
+
+
+def test_hybrid_pre_process_text_only_when_no_visual(monkeypatch):
+    # No vision tower on this rank (text backbone, or a non-first PP stage where ``visual=None``):
+    # only the word embeddings are mapped, and the GPT vision path is never entered.
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(DeepseekV41Bridge, '_convert_pre_process',
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError('vision path must not run')))
+    bridge = object.__new__(DeepseekV41HybridBridge)
+    calls = []
+    bridge._set_word_embeddings = lambda mg, sd, tm: calls.append((mg, tm))
+    bridge._remove_prefix = lambda sd, pfx: sd
+    bridge._add_prefix = lambda sd, pfx: sd
+    mg_model = SimpleNamespace(visual=None)
+    assert bridge._convert_pre_process(mg_model, {'x': 1}, '', to_mcore=True) == {}
+    assert calls == [(mg_model, True)]
+
+
+def test_hybrid_set_word_embeddings_resolves_via_lm():
+    # ``_set_word_embeddings`` must resolve the LM through ``_lm`` so both the wrapper and a bare
+    # backbone map ``embedding.word_embeddings.weight`` onto the right module.
+    from types import SimpleNamespace
+
+    bridge = object.__new__(DeepseekV41HybridBridge)
+    bridge.hf_embed_key = 'model.embed_tokens.weight'
+    recorded = []
+    bridge._set_state_dict = lambda mod, mkey, sd, hkey, tm: recorded.append((mod, mkey, hkey, tm))
+
+    language_model = SimpleNamespace(tag='lm')
+    bridge._set_word_embeddings(SimpleNamespace(language_model=language_model), {}, to_mcore=True)
+    bare = SimpleNamespace()  # no wrapper -> _lm returns the model itself
+    bridge._set_word_embeddings(bare, {}, to_mcore=False)
+    assert recorded == [
+        (language_model, 'embedding.word_embeddings.weight', 'model.embed_tokens.weight', True),
+        (bare, 'embedding.word_embeddings.weight', 'model.embed_tokens.weight', False),
+    ]
+
+
+@requires_hybrid
+def test_hybrid_forward_unpacks_extra_block_kwargs(monkeypatch):
+    # ``MultimodalGPTModel.forward`` funnels the decoder's extra kwargs through ``extra_block_kwargs``
+    # (the GPTModel calling convention), but upstream ``HybridModel.forward`` has no such parameter --
+    # it threads ``input_ids`` itself. The hybrid stack must unpack that container before delegating,
+    # strip visual keys, and forward anything else, otherwise a text-only wrapper run raises
+    # ``HybridModel.forward() got an unexpected keyword argument 'extra_block_kwargs'``.
+    from mcore_bridge.model.gpts import deepseek_v41_hybrid as hyb
+
+    received = {}
+    monkeypatch.setattr(hyb.HybridModel, 'forward',
+                        lambda self, *a, **k: received.update(args=a, kwargs=k) or 'OUT')
+    stack = object.__new__(DeepseekV41HybridStackModel)  # no distributed init; forward is self-contained
+    out = DeepseekV41HybridStackModel.forward(
+        stack, input_ids=1, extra_block_kwargs={'image_grid_thw': 7, 'foo': 'bar'})
+    assert out == 'OUT'
+    kwargs = received['kwargs']
+    assert 'extra_block_kwargs' not in kwargs   # container unpacked, not forwarded verbatim
+    assert 'image_grid_thw' not in kwargs       # visual key stripped
+    assert kwargs['foo'] == 'bar'               # unknown extra kwarg still threaded through
+    assert kwargs['input_ids'] == 1
+
+
+@requires_hybrid
+def test_hybrid_forward_rejects_pixel_values_from_extra_block_kwargs(monkeypatch):
+    # Defense in depth: a multimodal batch that smuggles ``pixel_values`` via ``extra_block_kwargs``
+    # must still hit the text-only guard (the wrapper injects image embeds and clears them, so the
+    # backbone never legitimately sees pixels).
+    from mcore_bridge.model.gpts import deepseek_v41_hybrid as hyb
+
+    monkeypatch.setattr(hyb.HybridModel, 'forward', lambda self, *a, **k: 'OUT')
+    stack = object.__new__(DeepseekV41HybridStackModel)
+    with pytest.raises(NotImplementedError, match='text-only'):
+        DeepseekV41HybridStackModel.forward(stack, input_ids=1, extra_block_kwargs={'pixel_values': 1})
+
+
