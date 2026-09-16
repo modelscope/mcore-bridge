@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """DeepSeek-V4.1 on megatron-core's ``HybridModel`` (pipeline-parallel path).
 
-The default :class:`DeepseekV41Loader` builds a ``GPTModel`` whose custom
+The legacy :class:`DeepseekV41Loader` builds a ``GPTModel`` whose custom
 ``TransformerBlock`` owns the CSA2 / single-pass-mHC forward. Upstream refuses to
 run that block under pipeline parallelism::
 
@@ -19,8 +19,9 @@ layer (``E`` for MoE, ``-`` for dense). So a hybrid stack has ``2 * num_layers``
 and every per-layer config array that CSA2 indexes by ``layer_number - 1`` must be
 re-expanded into this doubled index space (see :func:`derive_hybrid_layer_config`).
 
-This module keeps the GPT loader untouched (golden baseline) and adds the hybrid path
-alongside it; both are validated to agree before the default is switched.
+This module keeps the GPT loader available as a force-off regression baseline; the
+hybrid path is now the default for every layout (plan step B5) after both were
+validated to agree at iter-1 loss/grad and on the weight key ledger.
 """
 import copy
 from dataclasses import dataclass

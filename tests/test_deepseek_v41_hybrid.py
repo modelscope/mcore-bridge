@@ -397,30 +397,36 @@ def _route_config(pp, forced=None):
     return SimpleNamespace(pipeline_model_parallel_size=pp, deepseek_v41_hybrid=forced)
 
 
-def test_use_hybrid_auto_on_pp_and_forced_override():
-    # Auto: GPTModel at PP1 (golden baseline), HybridModel once PP>1 (upstream blocks GPT there).
-    assert _deepseek_v41_use_hybrid(_route_config(1)) is False
+def test_use_hybrid_default_on_and_forced_override():
+    # Default (B5 switch): HybridModel for every layout now that B1-B4 align with the GPT baseline.
+    assert _deepseek_v41_use_hybrid(_route_config(1)) is True
     assert _deepseek_v41_use_hybrid(_route_config(2)) is True
-    # Explicit flag wins either way (force-on aligns hybrid vs GPT at PP1; force-off stays GPT).
-    assert _deepseek_v41_use_hybrid(_route_config(1, forced=True)) is True
+    # Explicit force-off drops back to the GPTModel golden baseline (kept as a regression path).
+    assert _deepseek_v41_use_hybrid(_route_config(1, forced=False)) is False
     assert _deepseek_v41_use_hybrid(_route_config(2, forced=False)) is False
+    # Force-on is redundant now but must still route to hybrid.
+    assert _deepseek_v41_use_hybrid(_route_config(1, forced=True)) is True
 
 
 @requires_hybrid
 def test_loader_new_dispatches_to_hybrid():
     # __new__ routing only (no __init__), so no distributed init is required.
+    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1))) is DeepseekV41HybridLoader
     assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(2))) is DeepseekV41HybridLoader
     assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1, forced=True))) is DeepseekV41HybridLoader
-    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1))) is DeepseekV41Loader
+    # Force-off keeps the GPTModel golden baseline.
+    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1, forced=False))) is DeepseekV41Loader
     # A directly instantiated subclass must not re-dispatch (cls-is guard).
     assert type(DeepseekV41HybridLoader.__new__(DeepseekV41HybridLoader, _route_config(1))) is DeepseekV41HybridLoader
 
 
 @requires_hybrid
 def test_bridge_new_dispatches_to_hybrid():
+    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1))) is DeepseekV41HybridBridge
     assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(2))) is DeepseekV41HybridBridge
     assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1, forced=True))) is DeepseekV41HybridBridge
-    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1))) is DeepseekV41Bridge
+    # Force-off keeps the GPTModel golden baseline.
+    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1, forced=False))) is DeepseekV41Bridge
     assert type(DeepseekV41HybridBridge.__new__(DeepseekV41HybridBridge, _route_config(1))) is DeepseekV41HybridBridge
 
 

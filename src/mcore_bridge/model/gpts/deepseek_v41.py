@@ -846,17 +846,18 @@ class DeepseekV41MultimodalGPTModel(MultimodalGPTModel):
 def _deepseek_v41_use_hybrid(config) -> bool:
     """Whether to build DeepSeek-V4.1 on the ``HybridModel`` (PP-capable) path.
 
-    The default ``GPTModel`` path is the golden baseline and stays the default until the hybrid
-    path is fully aligned (plan step B5). Upstream refuses to run the V4.1 ``dsv4_hybrid`` block
-    under pipeline parallelism, so the hybrid loader/bridge are auto-selected whenever
-    ``pipeline_model_parallel_size > 1``. The ``deepseek_v41_hybrid`` config flag (settable via
-    ``--megatron_extra_kwargs``) overrides this: ``True`` forces the hybrid path on at PP1 (used to
-    align it against the GPTModel baseline), ``False`` keeps GPTModel even at PP>1.
+    The ``HybridModel`` path is now the default (plan step B5): B1-B4 validated it against the
+    ``GPTModel`` golden baseline (iter-1 loss/grad within the bf16/MoE non-determinism band and a
+    clean weight key ledger), and it is the only path that supports pipeline parallelism, so it is
+    selected for every layout. The ``deepseek_v41_hybrid`` config flag (settable via
+    ``--megatron_extra_kwargs``) overrides this: ``False`` drops back to the ``GPTModel`` golden
+    baseline (kept as a regression path; note upstream refuses ``GPTModel`` at ``PP>1``), ``True``
+    is redundant but still forces hybrid.
     """
     forced = getattr(config, 'deepseek_v41_hybrid', None)
     if forced is not None:
         return bool(forced)
-    return (getattr(config, 'pipeline_model_parallel_size', 1) or 1) > 1
+    return True
 
 
 class DeepseekV41Loader(DeepseekV4Loader):
