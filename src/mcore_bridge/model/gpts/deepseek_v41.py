@@ -985,9 +985,23 @@ class DeepseekV41Loader(DeepseekV4Loader):
 
     def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
         model = super().build_model(pre_process, post_process, vp_stage)
+        self._attach_dspark(model.language_model, post_process)
+        return model
+
+    def _attach_dspark(self, language_model, post_process):
+        """Build the DSpark (``mtp.*``) draft stack and attach it to ``language_model`` on the
+        final pipeline stage.
+
+        Backbone-agnostic: the draft layers are plain experimental-attention-variant
+        ``TransformerLayer`` instances (see :meth:`get_dspark_layer_spec`), independent of whether
+        the main model is a ``GPTModel`` or ``HybridModel``. The GPT path passes
+        ``model.language_model``; the hybrid path (which has no ``language_model`` wrapper) passes
+        the ``HybridModel`` itself -- both expose ``pg_collection`` / ``vocab_size`` / ``config``.
+        The stack is never part of the training forward (capture is inference-only), so it only
+        needs to exist here so its parameters are loaded / saved through the ``mtp.*`` bridge.
+        """
         if not self.config.dspark_num_layers or not post_process:
-            return model
-        language_model = model.language_model
+            return
         dspark_config, dspark_layer_specs = self.get_dspark_layer_spec()
         layers = [
             build_module(
@@ -1012,7 +1026,6 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 config=language_model.config,
                 tp_group=language_model.pg_collection.tp,
             )
-        return model
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
@@ -1225,7 +1238,13 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         dspark = getattr(language_model, 'dspark', None)
         if dspark is None:
             raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
+        yield from self._convert_dspark_stack(language_model, dspark, hf_state_dict, hf_prefix, to_mcore)
 
+    def _convert_dspark_stack(self, language_model, dspark, hf_state_dict, hf_prefix, to_mcore):
+        """Map the DSpark draft layers + endpoints between HF ``mtp.*`` keys and the megatron
+        stack. Backbone-agnostic (the draft layers are plain ``TransformerLayer`` instances), so
+        both the GPT and hybrid bridges reuse it; they differ only in how they locate ``dspark``
+        and guard the pipeline stage."""
         # On a PP>1 last stage with untied embeddings, DSpark owns a dedicated input
         # embedding (see build_model). Load it from the same HF source as the base
         # first-stage embedding. On export the first stage already emits this tensor,

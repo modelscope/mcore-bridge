@@ -423,3 +423,91 @@ def test_bridge_new_dispatches_to_hybrid():
     assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1))) is DeepseekV41Bridge
     assert type(DeepseekV41HybridBridge.__new__(DeepseekV41HybridBridge, _route_config(1))) is DeepseekV41HybridBridge
 
+
+# --- B3: DSpark (``mtp.*``) draft stack on the hybrid path ---------------------------------------
+
+def _dspark_bridge(dspark_num_layers=1):
+    # object.__new__ so no distributed init; only the DSpark dispatch fields are needed. Record
+    # calls into the shared ``_convert_dspark_stack`` so we assert dispatch + stage guards without
+    # building a real stack (that is the GPU acceptance step).
+    from types import SimpleNamespace
+
+    bridge = object.__new__(DeepseekV41HybridBridge)
+    bridge.config = SimpleNamespace(dspark_num_layers=dspark_num_layers)
+    calls = []
+    bridge._convert_dspark_stack = (
+        lambda language_model, dspark, hf_state_dict, hf_prefix, to_mcore:
+        (calls.append((language_model, dspark)) or iter(['SENTINEL'])))
+    return bridge, calls
+
+
+def test_hybrid_convert_additional_layers_maps_dspark_via_lm():
+    # The hybrid model is text-only (no ``language_model`` wrapper), so ``_lm`` resolves the model
+    # itself; the DSpark stack attached there is mapped through the shared base helper.
+    from types import SimpleNamespace
+
+    bridge, calls = _dspark_bridge()
+    dspark = object()
+    mg_model = SimpleNamespace(dspark=dspark)  # no ``language_model`` -> _lm returns mg_model
+    out = list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=True, is_pp_last_stage=True))
+    assert out == ['SENTINEL']
+    assert calls == [(mg_model, dspark)]
+
+
+def test_hybrid_convert_additional_layers_resolves_language_model_wrapper():
+    # Forward-compat with B4: when a multimodal wrapper is present, ``_lm`` unwraps it and the
+    # DSpark stack is looked up on the nested language model.
+    from types import SimpleNamespace
+
+    bridge, calls = _dspark_bridge()
+    dspark = object()
+    language_model = SimpleNamespace(dspark=dspark)
+    mg_model = SimpleNamespace(language_model=language_model)
+    out = list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=True, is_pp_last_stage=True))
+    assert out == ['SENTINEL']
+    assert calls == [(language_model, dspark)]
+
+
+def test_hybrid_convert_additional_layers_skips_without_dspark():
+    # No draft stack configured -> nothing to convert, base helper untouched.
+    from types import SimpleNamespace
+
+    bridge, calls = _dspark_bridge(dspark_num_layers=0)
+    mg_model = SimpleNamespace(dspark=object())
+    out = list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=True, is_pp_last_stage=True))
+    assert out == []
+    assert calls == []
+
+
+def test_hybrid_convert_additional_layers_load_skips_non_last_stage():
+    # On load only the final stage owns the stack; earlier stages are guarded out.
+    from types import SimpleNamespace
+
+    bridge, calls = _dspark_bridge()
+    mg_model = SimpleNamespace()  # no ``dspark`` on this stage
+    out = list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=True, is_pp_last_stage=False))
+    assert out == []
+    assert calls == []
+
+
+def test_hybrid_convert_additional_layers_export_skips_non_last_stage_without_stack():
+    # On export a non-last PP stage has no draft stack; it must skip quietly (not raise), unlike
+    # the final stage where a missing stack is a real error.
+    from types import SimpleNamespace
+
+    bridge, calls = _dspark_bridge()
+    mg_model = SimpleNamespace()  # no ``dspark``
+    out = list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=False, is_pp_last_stage=False))
+    assert out == []
+    assert calls == []
+
+
+def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
+    import pytest
+    from types import SimpleNamespace
+
+    bridge, _ = _dspark_bridge()
+    mg_model = SimpleNamespace()  # last stage but stack missing -> misbuilt model
+    with pytest.raises(RuntimeError, match='DSpark weights require the draft stack'):
+        list(bridge._convert_additional_layers(mg_model, {}, 'prefix.', to_mcore=False, is_pp_last_stage=True))
+

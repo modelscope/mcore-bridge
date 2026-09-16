@@ -371,8 +371,11 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
     ``DeepseekV41Loader`` is left untouched; this loader derives its own config copy so both
     paths can coexist in one process.
 
-    B1 covers the text backbone only. MTP (B2), DSpark capture (B3) and the multimodal wrapper
-    (B4) are added on top; here MTP is disabled so the backbone can be aligned in isolation.
+    B1 covers the text backbone; B3 adds the DSpark (``mtp.*``) draft stack on top (attached in
+    :meth:`build_model`, mapped in :meth:`DeepseekV41HybridBridge._convert_additional_layers`).
+    Autoregressive MTP (``mtp_num_layers`` / ``MultiTokenPredictionBlock``) does not apply to
+    V4.1 -- its ``mtp.*`` checkpoint keys *are* DSpark -- so it stays disabled here. The
+    multimodal wrapper (B4) is still added separately.
     """
 
     model_cls = DeepseekV41HybridStackModel
@@ -408,8 +411,10 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
         # HybridStack picks E/- from the pattern; keep moe_layer_freq consistent with the doubled
         # space so any layer-count validation that reads it still agrees with num_layers.
         cfg.moe_layer_freq = [1 if symbol == 'E' else 0 for symbol in derived.hybrid_layer_pattern]
-        # MTP on HybridModel is B2 (its inner attention cannot use the CSA2 'D' symbol, which
-        # rejects is_mtp_layer). Disable it for the B1 backbone-only alignment.
+        # Autoregressive MTP does not apply to V4.1: the parser never sets ``mtp_num_layers``
+        # (it maps ``num_nextn_predict_layers`` to ``dspark_num_layers`` instead), and the
+        # ``mtp.*`` checkpoint keys are the DSpark draft stack (attached in ``build_model``, B3).
+        # Keep it disabled so no ``MultiTokenPredictionBlock`` is built.
         cfg.mtp_num_layers = None
         return cfg
 
@@ -500,6 +505,14 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
         )
         self._rewrap_engram_hyper_connection_layers(model)
         self._set_linear_is_expert(model)
+        # DSpark (B3): the ``mtp.*`` draft stack is backbone-agnostic (plain
+        # experimental-attention layers), so reuse the GPT loader's builder. The hybrid model is
+        # text-only (no ``language_model`` wrapper, see :meth:`DeepseekV41HybridBridge._lm`), so
+        # the stack attaches to the model itself. Inference-time target-layer capture on
+        # HybridStack is deferred (it is not exercised by training / weight round-trip, mirroring
+        # B1's deferral of ``allow_engram_inference``); the stack only needs to exist so its
+        # parameters are loaded / saved via ``mtp.*``.
+        self._attach_dspark(model, post_process)
         return model
 
 
@@ -652,12 +665,25 @@ class DeepseekV41HybridBridge(DeepseekV41Bridge):
         return self._add_prefix(local_state, layer_prefix)
 
     def _convert_additional_layers(self, mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage):
-        """B1 hybrid backbone has no DSpark draft stack (that is B3), so there are no additional
-        layers to convert -- unlike the GPT bridge, whose base method walks ``mg_model.language_model``
-        (absent on the text-only ``DeepseekV41HybridStackModel``). MTP (B2) is likewise skipped in
-        :meth:`_convert`. Yielding nothing keeps the backbone-only load/export intact."""
-        return
-        yield  # noqa: keep this an empty generator (matches the base method's protocol)
+        """Map the DSpark (``mtp.*``) draft stack (B3).
+
+        The draft layers are plain experimental-attention ``TransformerLayer`` instances --
+        identical in both paths -- so the base :meth:`DeepseekV41Bridge._convert_dspark_stack`
+        mapping is reused verbatim; only where the stack lives differs. On the hybrid path it is
+        attached to the model itself (no ``language_model`` wrapper, so use :meth:`_lm`) and only
+        on the final pipeline stage, so non-last stages have nothing to convert (on load the base
+        guard skips them; on export ``dspark`` is simply absent). MTP (``mtp_num_layers``) is
+        skipped in :meth:`_convert` and does not apply to V4.1."""
+        if not self.config.dspark_num_layers or (to_mcore and not is_pp_last_stage):
+            return
+        language_model = self._lm(mg_model)
+        dspark = getattr(language_model, 'dspark', None)
+        if dspark is None:
+            if not is_pp_last_stage:
+                # Export from a non-last PP stage: the draft stack lives on the final stage only.
+                return
+            raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
+        yield from self._convert_dspark_stack(language_model, dspark, hf_state_dict, hf_prefix, to_mcore)
 
     def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
         """Backbone conversion with a 1->2 layer fan-out.
