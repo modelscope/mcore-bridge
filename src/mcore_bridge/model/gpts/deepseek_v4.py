@@ -100,7 +100,15 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             '`pip install git+https://github.com/NVIDIA/Megatron-LM@dev`')
         with _patch_YarnRotaryEmbedding(config):
             super().__init__(config, *args, **kwargs)
-        self.layer_type = self.config.hf_config.layer_types[self.layer_number - 1]
+        # ``layer_types`` is an HF-space (length ``num_layers``) list. On the HybridStack the layer
+        # index space is doubled -- HF layer ``i`` becomes attention layer ``2*i`` (1-based
+        # ``layer_number`` ``2*i + 1``) and MLP layer ``2*i + 1`` -- so map the hybrid layer_number
+        # back to the HF index. On the GPT stack ``layer_number - 1`` is already the HF index.
+        if getattr(self.config, 'is_hybrid_model', False):
+            hf_layer_idx = (self.layer_number - 1) // 2
+        else:
+            hf_layer_idx = self.layer_number - 1
+        self.layer_type = self.config.hf_config.layer_types[hf_layer_idx]
         self.rope_layer_type = 'main' if self.layer_type == 'sliding_attention' else 'compress'
         if config.fp8_param:
             group_proj_in_size = self.query_projection_size // config.o_groups

@@ -187,6 +187,24 @@ def test_engram_placement_and_hf_layer_id_round_trip():
         assert bridge._engram_hf_layer_id(SimpleNamespace(layer_number=layer_number)) == hf_id
 
 
+def test_num_hybrid_layers_normalizes_both_layer_spaces():
+    # ``_convert`` sees ``self.config`` in two layer spaces. On load it is the GPT-space config
+    # (num_layers == N, no pattern) whose built decoder holds 2*N layers; on export it is the
+    # doubled hybrid config (num_layers == 2*N, pattern populated). Both must yield 2*N so the
+    # loop matches the decoder's real layer count -- a regression guard for the export bug where
+    # ``2 * num_layers`` on the doubled config over-counted and dereferenced None layers.
+    from types import SimpleNamespace
+
+    from mcore_bridge.model.gpts.deepseek_v41_hybrid import DeepseekV41HybridBridge
+
+    load_cfg = SimpleNamespace(num_layers=4, hybrid_layer_pattern=None)
+    export_cfg = SimpleNamespace(num_layers=8, hybrid_layer_pattern='DEDEDEDE')
+    assert DeepseekV41HybridBridge._num_hybrid_layers(load_cfg) == 8
+    assert DeepseekV41HybridBridge._num_hybrid_layers(export_cfg) == 8
+    # A config missing the attribute entirely is treated as GPT-space (load).
+    assert DeepseekV41HybridBridge._num_hybrid_layers(SimpleNamespace(num_layers=3)) == 6
+
+
 import pytest  # noqa: E402
 
 from mcore_bridge.model.gpts.deepseek_v41_hybrid import (  # noqa: E402
@@ -197,26 +215,51 @@ requires_hybrid = pytest.mark.skipif(
 
 
 @requires_hybrid
-def test_hc_wrapper_declines_fast_path_only_for_engram_layers():
-    # The V4.1 wrapper subclass returns None (forcing the full-forward `_call_inner_layer`
-    # path, which applies Engram) iff the inner layer carries an Engram module; otherwise it
-    # must delegate unchanged to the base fast path.
+def test_hc_wrapper_applies_engram_on_nstream_before_delegating():
+    # The V4.1 wrapper subclass overrides ``forward``: for an Engram-carrying inner layer it adds
+    # the n-stream Engram delta to ``hidden_states`` BEFORE delegating to the base wrapper forward
+    # (aggregation + fast-path attention), reproducing the GPTModel golden order. A plain inner
+    # layer delegates unchanged with no Engram add.
     from types import SimpleNamespace
     from unittest.mock import patch
 
-    engram_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
-    engram_layer.inner_layer = SimpleNamespace(engram=object())
-    assert engram_layer._call_inner_transformer_layer_without_local_bda('h', 'mask') is None
+    import torch
 
+    # Engram-carrying layer: a constant unit delta is added, so the tensor handed to the base
+    # forward is the input plus that delta.
+    def engram(hidden_states, input_ids, inference_context):
+        return torch.ones_like(hidden_states)
+
+    engram_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
+    engram_layer.inner_layer = SimpleNamespace(engram=engram)
+    h = torch.zeros(2, 1, 4)
+    ids = torch.zeros(2, 1, dtype=torch.long)
+    with patch.object(HyperConnectionHybridLayer, 'forward', return_value='OUT') as base_fwd:
+        assert engram_layer.forward(h, input_ids=ids) == 'OUT'
+    passed = base_fwd.call_args.args[0]
+    assert torch.equal(passed, torch.ones_like(h))  # delta added before delegating
+
+    # Plain layer (no Engram): delegate unchanged, forwarding the original tensor untouched.
     plain_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
     plain_layer.inner_layer = SimpleNamespace(engram=None)
-    sentinel = object()
-    with patch.object(
-            HyperConnectionHybridLayer,
-            '_call_inner_transformer_layer_without_local_bda',
-            return_value=sentinel) as base_call:
-        assert plain_layer._call_inner_transformer_layer_without_local_bda('h', 'mask') is sentinel
-        base_call.assert_called_once()
+    with patch.object(HyperConnectionHybridLayer, 'forward', return_value='OUT') as base_fwd:
+        assert plain_layer.forward(h, input_ids=ids) == 'OUT'
+    assert base_fwd.call_args.args[0] is h
+
+
+@requires_hybrid
+def test_hc_wrapper_requires_input_ids_for_engram_layer():
+    # An Engram layer cannot run without token IDs (needed for the n-gram hash), so forward
+    # raises rather than silently dropping the Engram contribution.
+    from types import SimpleNamespace
+
+    import pytest
+    import torch
+
+    engram_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
+    engram_layer.inner_layer = SimpleNamespace(engram=lambda *a, **k: 0)
+    with pytest.raises(ValueError, match='input token IDs'):
+        engram_layer.forward(torch.zeros(2, 1, 4), input_ids=None)
 
 
 @requires_hybrid
@@ -257,4 +300,126 @@ def test_rewrap_noop_without_hyper_connections():
     loader._rewrap_engram_hyper_connection_layers(model)
 
     assert type(engram_wrapper) is HyperConnectionHybridLayer
+
+
+from mcore_bridge.model.gpts.deepseek_v41_hybrid import DeepseekV41HybridStackModel  # noqa: E402
+
+
+def _seg_config(pattern, **overrides):
+    from types import SimpleNamespace
+    cfg = dict(
+        hybrid_layer_pattern=pattern,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        num_layers_in_first_pipeline_stage=None,
+        num_layers_in_last_pipeline_stage=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
+    cfg.update(overrides)
+    return SimpleNamespace(**cfg)
+
+
+@requires_hybrid
+def test_segment_main_pattern_block_aligned_even_split():
+    # 4 blocks over pp=2 -> two whole blocks per stage.
+    cfg = _seg_config('DEDEDEDE', pipeline_model_parallel_size=2)
+    assert DeepseekV41HybridStackModel._segment_main_pattern(cfg) == 'DEDE|DEDE'
+
+
+@requires_hybrid
+def test_segment_main_pattern_uneven_split_front_loads_extra_blocks():
+    # 4 blocks over pp=3 -> divmod(4,3)=(1,1): first stage gets 2 blocks, the rest 1 each.
+    cfg = _seg_config('DEDEDEDE', pipeline_model_parallel_size=3)
+    assert DeepseekV41HybridStackModel._segment_main_pattern(cfg) == 'DEDE|DE|DE'
+
+
+@requires_hybrid
+def test_segment_main_pattern_vpp_multiplies_stages():
+    # pp=2 * vp=2 = 4 stages, consecutive segments ordered (vp0,pp0),(vp0,pp1),(vp1,pp0),(vp1,pp1)
+    # to match upstream segment_index = vp_stage * pp_size + pp_rank.
+    cfg = _seg_config('DEDEDEDE', pipeline_model_parallel_size=2, virtual_pipeline_model_parallel_size=2)
+    assert DeepseekV41HybridStackModel._segment_main_pattern(cfg) == 'DE|DE|DE|DE'
+
+
+@requires_hybrid
+def test_segment_main_pattern_pp1_is_noop():
+    cfg = _seg_config('DEDEDEDE', pipeline_model_parallel_size=1)
+    assert DeepseekV41HybridStackModel._segment_main_pattern(cfg) == 'DEDEDEDE'
+
+
+@requires_hybrid
+def test_segment_main_pattern_respects_explicit_pipes_and_uneven_layout():
+    # An explicit '|' layout or num_layers_in_first/last_pipeline_stage is passed through
+    # untouched; upstream + the post-build even-boundary guard validate it.
+    assert DeepseekV41HybridStackModel._segment_main_pattern(
+        _seg_config('DEDE|DEDE', pipeline_model_parallel_size=2)) == 'DEDE|DEDE'
+    assert DeepseekV41HybridStackModel._segment_main_pattern(
+        _seg_config('DEDEDEDE', pipeline_model_parallel_size=2,
+                    num_layers_in_first_pipeline_stage=2)) == 'DEDEDEDE'
+
+
+@requires_hybrid
+def test_segment_main_pattern_raises_when_stage_gets_no_block():
+    import pytest
+    # 2 blocks cannot cover 4 stages.
+    with pytest.raises(ValueError, match='at least one attention'):
+        DeepseekV41HybridStackModel._segment_main_pattern(
+            _seg_config('DEDE', pipeline_model_parallel_size=4))
+
+
+@requires_hybrid
+def test_segment_main_pattern_rejects_pipeline_layout():
+    import pytest
+    with pytest.raises(ValueError, match='pipeline_model_parallel_layout'):
+        DeepseekV41HybridStackModel._segment_main_pattern(
+            _seg_config('DEDEDEDE', pipeline_model_parallel_size=2, pipeline_model_parallel_layout=[[0], [1]]))
+
+
+@requires_hybrid
+def test_resolve_hybrid_layer_pattern_segments_then_defers_to_base():
+    # With MTP off the resolver just returns the block-segmented main pattern; pp=1 returns the
+    # bare pattern (base resolver, no MTP suffix appended).
+    assert DeepseekV41HybridStackModel._resolve_hybrid_layer_pattern(
+        _seg_config('DEDEDEDE', pipeline_model_parallel_size=2)) == 'DEDE|DEDE'
+    assert DeepseekV41HybridStackModel._resolve_hybrid_layer_pattern(
+        _seg_config('DEDEDEDE', pipeline_model_parallel_size=1)) == 'DEDEDEDE'
+
+
+from mcore_bridge.model.gpts.deepseek_v41 import (  # noqa: E402
+    DeepseekV41Bridge, DeepseekV41Loader, _deepseek_v41_use_hybrid)
+from mcore_bridge.model.gpts.deepseek_v41_hybrid import (  # noqa: E402
+    DeepseekV41HybridBridge, DeepseekV41HybridLoader)
+
+
+def _route_config(pp, forced=None):
+    from types import SimpleNamespace
+    return SimpleNamespace(pipeline_model_parallel_size=pp, deepseek_v41_hybrid=forced)
+
+
+def test_use_hybrid_auto_on_pp_and_forced_override():
+    # Auto: GPTModel at PP1 (golden baseline), HybridModel once PP>1 (upstream blocks GPT there).
+    assert _deepseek_v41_use_hybrid(_route_config(1)) is False
+    assert _deepseek_v41_use_hybrid(_route_config(2)) is True
+    # Explicit flag wins either way (force-on aligns hybrid vs GPT at PP1; force-off stays GPT).
+    assert _deepseek_v41_use_hybrid(_route_config(1, forced=True)) is True
+    assert _deepseek_v41_use_hybrid(_route_config(2, forced=False)) is False
+
+
+@requires_hybrid
+def test_loader_new_dispatches_to_hybrid():
+    # __new__ routing only (no __init__), so no distributed init is required.
+    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(2))) is DeepseekV41HybridLoader
+    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1, forced=True))) is DeepseekV41HybridLoader
+    assert type(DeepseekV41Loader.__new__(DeepseekV41Loader, _route_config(1))) is DeepseekV41Loader
+    # A directly instantiated subclass must not re-dispatch (cls-is guard).
+    assert type(DeepseekV41HybridLoader.__new__(DeepseekV41HybridLoader, _route_config(1))) is DeepseekV41HybridLoader
+
+
+@requires_hybrid
+def test_bridge_new_dispatches_to_hybrid():
+    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(2))) is DeepseekV41HybridBridge
+    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1, forced=True))) is DeepseekV41HybridBridge
+    assert type(DeepseekV41Bridge.__new__(DeepseekV41Bridge, _route_config(1))) is DeepseekV41Bridge
+    assert type(DeepseekV41HybridBridge.__new__(DeepseekV41HybridBridge, _route_config(1))) is DeepseekV41HybridBridge
 

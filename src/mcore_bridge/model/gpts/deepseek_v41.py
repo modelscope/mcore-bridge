@@ -843,11 +843,37 @@ class DeepseekV41MultimodalGPTModel(MultimodalGPTModel):
         return self.language_model.compute_dspark_speculative_tokens(*args, **kwargs)
 
 
+def _deepseek_v41_use_hybrid(config) -> bool:
+    """Whether to build DeepSeek-V4.1 on the ``HybridModel`` (PP-capable) path.
+
+    The default ``GPTModel`` path is the golden baseline and stays the default until the hybrid
+    path is fully aligned (plan step B5). Upstream refuses to run the V4.1 ``dsv4_hybrid`` block
+    under pipeline parallelism, so the hybrid loader/bridge are auto-selected whenever
+    ``pipeline_model_parallel_size > 1``. The ``deepseek_v41_hybrid`` config flag (settable via
+    ``--megatron_extra_kwargs``) overrides this: ``True`` forces the hybrid path on at PP1 (used to
+    align it against the GPTModel baseline), ``False`` keeps GPTModel even at PP>1.
+    """
+    forced = getattr(config, 'deepseek_v41_hybrid', None)
+    if forced is not None:
+        return bool(forced)
+    return (getattr(config, 'pipeline_model_parallel_size', 1) or 1) > 1
+
+
 class DeepseekV41Loader(DeepseekV4Loader):
     model_cls = DeepseekV41MultimodalGPTModel
     # Native V4.1 forward owns CSA2State + SinglePassMHCState. Using it only for
     # this loader avoids changing the custom bridge block used by V4/DSpark/MTP.
     transformer_block = McoreTransformerBlock
+
+    def __new__(cls, config=None, *args, **kwargs):
+        # Auto-route to the HybridModel loader on the PP path (or when forced); the subclass
+        # instantiates itself directly, so the ``cls is`` guard prevents re-dispatch. ``config``
+        # is optional so ``__new__(cls)`` (used by tests to skip __init__) keeps working.
+        if cls is DeepseekV41Loader and config is not None and _deepseek_v41_use_hybrid(config):
+            from .deepseek_v41_hybrid import DeepseekV41HybridLoader
+            if DeepseekV41HybridLoader is not None:
+                return super().__new__(DeepseekV41HybridLoader)
+        return super().__new__(cls)
 
     def _engram_placement_layer_ids(self, hf_layer_ids):
         """Map 0-based HF Engram layer IDs to 1-based ``TransformerLayer`` placement numbers.
@@ -1010,6 +1036,16 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     _ENGRAM_LOAD_CHUNK_ROWS = 65536
     additional_dim0_keys = DeepseekV4Bridge.additional_dim0_keys | {'embed', 'head'}
     additional_dim1_keys = DeepseekV4Bridge.additional_dim1_keys | {'main_proj'}
+
+    def __new__(cls, config=None, *args, **kwargs):
+        # Mirror the loader's routing so the bridge and the built model always agree on the path
+        # (this bridge is created in ``ModelConfig.__post_init__`` where PP size is already set).
+        # ``config`` is optional so ``__new__(cls)`` (used by tests to skip __init__) keeps working.
+        if cls is DeepseekV41Bridge and config is not None and _deepseek_v41_use_hybrid(config):
+            from .deepseek_v41_hybrid import DeepseekV41HybridBridge
+            if DeepseekV41HybridBridge is not None:
+                return super().__new__(DeepseekV41HybridBridge)
+        return super().__new__(cls)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
         result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)

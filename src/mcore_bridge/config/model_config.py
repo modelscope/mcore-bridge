@@ -255,6 +255,11 @@ class ModelConfig(TransformerConfig):
     mhc_sinkhorn_iterations: int = 20
     mhc_init_gating_factor: float = 0.01
     moe_n_hash_layers: int = 0
+    # DeepSeek-V4.1 pipeline-parallel path selector (None = auto). The default GPTModel path is
+    # the golden baseline and cannot run PP>1, so the HybridModel loader/bridge are auto-selected
+    # when pipeline_model_parallel_size > 1. Set explicitly (e.g. via --megatron_extra_kwargs) to
+    # force the hybrid path on at PP1 (baseline alignment) or off. See deepseek_v41.py.
+    deepseek_v41_hybrid: Optional[bool] = None
 
     # deepseek-v4.1 engram (HF layer IDs are 0-based)
     # Declared here as well so the bridge remains importable on the PR #7224 baseline,
