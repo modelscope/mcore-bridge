@@ -482,7 +482,7 @@ index f1eeda16ae..b5f92f5ef8 100644
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/experimental_attention_variant/dsa.py b/megatron/core/transformer/experimental_attention_variant/dsa.py
-index 9193f4e00a..70174144ba 100644
+index 9193f4e00a..4d372419fa 100644
 --- a/megatron/core/transformer/experimental_attention_variant/dsa.py
 +++ b/megatron/core/transformer/experimental_attention_variant/dsa.py
 @@ -668,23 +668,25 @@ def _compute_index_scores(
@@ -820,7 +820,22 @@ index 9193f4e00a..70174144ba 100644
 
          return index_scores, topk_indices
 
-@@ -2438,7 +2597,8 @@ class DSAttention(MegatronModule):
+@@ -2392,6 +2551,14 @@ class DSAttention(MegatronModule):
+                             f"k_seqlen={k.size(0)}, expected={kv_reorder_idx.numel()}"
+                         )
+                     k = k.index_select(0, kv_reorder_idx)
++                    # Apply the same CP gather + reorder to the kpool gate score so it
++                    # matches the now-global key length (otherwise the per-seg reshape
++                    # in _kpool_compress_keys crashes with a size mismatch).
++                    gate = self.indexer._kpool_gate_score
++                    if gate is not None and gate.size(0) in local_cp_kv_lens:
++                        gate = gather_from_sequence_parallel_region(gate, group=cp_group)
++                        gate = gate.index_select(0, kv_reorder_idx)
++                        self.indexer._kpool_gate_score = gate
+                 if sequence_parallel_tp and q.size(0) != sq:
+                     if (
+                         q.size(0) != sequence_parallel_tp_full_rows
+@@ -2438,7 +2605,8 @@ class DSAttention(MegatronModule):
              )
 
          fused_output = None
@@ -830,7 +845,7 @@ index 9193f4e00a..70174144ba 100644
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2741,19 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2749,19 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================

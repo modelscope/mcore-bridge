@@ -14,9 +14,6 @@ away once they land upstream.
 index-score computation from its current head `3fceb0715`. The chunking matters at real scale --
 with `index_n_heads=32` the un-chunked fp32 `[seqlen_q, batch, heads, seqlen_k]` tensor is 8 GiB at
 sequence 8192 and 128 GiB when packed to 32768 -- and is bit-identical to the un-chunked version.
-Deliberately not taken from that head: its context-parallel gather of the kpool gate score (this
-model rejects CP) and main's different indexer-loss gradient formula (not a memory fix, and it would
-change deepseek_v4 / glm_moe_dsa, which do use the indexer loss).
 
 Idempotent. `git apply --3way` is used inside a git checkout, so an upstream edit outside the lines
 we change does not block it and a real overlap is left as a visible conflict rather than dropped;
