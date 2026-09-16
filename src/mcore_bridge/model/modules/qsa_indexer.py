@@ -4,6 +4,11 @@ import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
 
+# Byte budget for the transient score tile in select_token_indices_thd: the (token, block)
+# scoring is chunked over queries to avoid OOM from the full [T, n_heads, NB] fp32 tensor.
+# Tests monkeypatch this to compare one chunk (un-chunked reference) vs many chunks.
+_QSA_INDEX_SCORE_CHUNK_BYTES = 1024 * 1024 * 1024
+
 
 class Qwen4ExpTextRMSNorm(nn.Module):
 
@@ -356,20 +361,32 @@ class QSAIndexer(nn.Module):
         first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
         block_keys = apply_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
 
-        # ---- score every (token, block) pair ----
-        scores = torch.einsum('thd,kd->thk', q.float(), block_keys.float())
-        scores = torch.relu(scores).sum(dim=1) / math.sqrt(self.index_head_dim)  # [T, NB]
-
-        # ---- restrict to same-document, causally-before blocks ----
+        # ---- score every (token, block) pair, chunked over queries ----
+        # The score -> relu -> head-sum -> mask -> top-k pipeline is row-wise independent, so it is
+        # processed in query chunks and only each row's top-k survives. This keeps peak memory at
+        # O(chunk * NB) instead of materializing the full [T, n_heads, NB] fp32 score tensor (and the
+        # [T, NB] masked copy), which is O(seq^2 / compress_ratio) and OOMs at long packed sequences.
+        # Numerically identical to the un-chunked form: every row is computed the same way.
         q_nblocks = (pos_in_doc + 1) // R  # [T]
-        valid = (block_doc[None, :] == token_doc[:, None]) & \
-            (block_in_doc_idx[None, :] < q_nblocks[:, None])  # [T, NB]
-        scores = scores.masked_fill(~valid, float('-inf'))
+        k = min(self.block_topk, NB)
+        scale = math.sqrt(self.index_head_dim)
+        chunk = max(1, min(T, _QSA_INDEX_SCORE_CHUNK_BYTES // max(1, self.index_n_heads * NB * 4)))
+        top_blocks = torch.empty(T, k, dtype=torch.long, device=device)
+        keep = torch.empty(T, k, dtype=torch.bool, device=device)
+        for start in range(0, T, chunk):
+            end = min(start + chunk, T)
+            sc = torch.einsum('thd,kd->thk', q[start:end].float(), block_keys.float())
+            sc = torch.relu(sc).sum(dim=1) / scale  # [c, NB]
+            td = token_doc[start:end]
+            valid_c = (block_doc[None, :] == td[:, None]) & \
+                (block_in_doc_idx[None, :] < q_nblocks[start:end, None])  # [c, NB]
+            sc = sc.masked_fill(~valid_c, float('-inf'))
+            tb = sc.topk(k, dim=-1).indices  # [c, k] into [0, NB)
+            top_blocks[start:end] = tb
+            keep[start:end] = valid_c.gather(1, tb)
+        del sc, valid_c, tb
 
         # ---- top-k blocks -> token indices ----
-        k = min(self.block_topk, NB)
-        top_blocks = scores.topk(k, dim=-1).indices  # [T, k] into [0, NB)
-        keep = valid.gather(1, top_blocks)  # [T, k]
         arange_r = torch.arange(R, device=device)
         base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R  # [T, k]
         top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)  # [T, k*R]

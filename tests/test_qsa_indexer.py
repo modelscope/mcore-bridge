@@ -1,7 +1,90 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import pytest
 import torch
 
 from mcore_bridge.model.modules.qsa_indexer import _materialize_rope, _rotate_half
+
+
+def _packed_inputs(idx, doc_lens, hidden_size, d, device):
+    """Build a packed (thd) multi-doc input for select_token_indices_thd."""
+    T = sum(doc_lens)
+    cu = [0]
+    for L in doc_lens:
+        cu.append(cu[-1] + L)
+    cu_seqlens = torch.tensor(cu, dtype=torch.long, device=device)
+    hidden_tok = torch.randn(T, hidden_size, device=device)
+    freqs = torch.randn(T, 1, 1, d, device=device)
+    return hidden_tok, freqs, cu_seqlens
+
+
+def _make_idx(compress_ratio, budget, device):
+    from test_qwen4_exp_units import _make_config
+
+    from mcore_bridge.model.modules.qsa_indexer import QSAIndexer
+    cfg = _make_config(compress_ratio=compress_ratio, budget=budget)
+    idx = QSAIndexer(cfg).to(device)
+    with torch.no_grad():
+        idx.index_qk_proj.weight.normal_(0, 0.02)
+        idx.q_layernorm.weight.normal_(0, 0.02)
+        idx.k_layernorm.weight.normal_(0, 0.02)
+    return idx, cfg
+
+
+def test_qsa_thd_chunked_matches_single_chunk_bitwise(monkeypatch):
+    """Chunked (token, block) scoring must be bitwise identical to the un-chunked reference.
+
+    The score -> relu -> head-sum -> mask -> top-k pipeline is row-wise independent, so forcing a
+    single chunk (chunk >= T) reproduces the original full-einsum behaviour exactly; a small chunk
+    budget exercises the multi-chunk path. Both must return identical indices.
+    """
+    import mcore_bridge.model.modules.qsa_indexer as qi
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    torch.manual_seed(0)
+    idx, cfg = _make_idx(compress_ratio=4, budget=32, device=device)
+    d = cfg.indexer_head_dim
+    # each doc longer than block_topk blocks so the selection is genuinely sparse
+    per = 4 * (idx.block_topk + 4)
+    hidden_tok, freqs, cu_seqlens = _packed_inputs(idx, [per, per + 4, per + 8], cfg.hidden_size, d, device)
+
+    monkeypatch.setattr(qi, '_QSA_INDEX_SCORE_CHUNK_BYTES', 1 << 62)  # single chunk = un-chunked ref
+    one = idx.select_token_indices_thd(hidden_tok, freqs, cu_seqlens, force_materialize=True)
+    monkeypatch.setattr(qi, '_QSA_INDEX_SCORE_CHUNK_BYTES', 1024)  # tiny budget = many chunks
+    many = idx.select_token_indices_thd(hidden_tok, freqs, cu_seqlens, force_materialize=True)
+    assert torch.equal(one, many), 'chunked selection diverged from the un-chunked reference'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='peak-memory regression needs a GPU')
+def test_qsa_thd_peak_memory_seq_shape_insensitive():
+    """Peak selection memory must not track the packed sequence shape at equal total tokens.
+
+    Pattern A = few long docs (large per-doc NB), pattern B = many short docs; both at the same
+    total token count. Before the chunked scoring the peak tracked [T, n_heads, NB] (i.e. the
+    s^2/compress_ratio term), so B (larger total NB) peaked far above A. With chunking the peak is
+    O(chunk * NB) and the two patterns must be close.
+    """
+    import mcore_bridge.model.modules.qsa_indexer as qi
+    torch.manual_seed(0)
+    idx, cfg = _make_idx(compress_ratio=4, budget=32, device='cuda')
+    d = cfg.indexer_head_dim
+    per = 4 * (idx.block_topk + 8)
+    n = 8
+    total = per * n
+    cases = {
+        'few_long': [total // 2, total // 2],  # 2 long docs
+        'many_short': [per] * n,  # n short docs, same total tokens
+    }
+    peaks = {}
+    for name, doc_lens in cases.items():
+        hidden_tok, freqs, cu_seqlens = _packed_inputs(idx, doc_lens, cfg.hidden_size, d, 'cuda')
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        idx.select_token_indices_thd(hidden_tok, freqs, cu_seqlens, force_materialize=True)
+        torch.cuda.synchronize()
+        peaks[name] = torch.cuda.max_memory_allocated()
+        del hidden_tok, freqs, cu_seqlens
+    ratio = peaks['many_short'] / max(1, peaks['few_long'])
+    assert ratio < 1.3, (f'peak memory tracks sequence shape (many_short/few_long={ratio:.2f}); peaks={peaks}; '
+                         'the (token, block) scoring is not chunked')
 
 
 def test_materialize_rope_preserves_mrope_batch_dimension():
