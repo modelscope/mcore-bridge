@@ -37,7 +37,7 @@ class MLLMModelType:
     llava_onevision1_5 = 'llava_onevision1_5'
     minicpmv4_6 = 'minicpmv4_6'
     muse_glimmer = 'muse_glimmer'
-    deepseek_v4_flash_vision = 'deepseek_v4_flash_vision'
+    deepseek_v4_vl = 'deepseek_v4_vl'
 
 
 class ModelType(LLMModelType, MLLMModelType):

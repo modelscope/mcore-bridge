@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+import torch.nn as nn
 import transformer_engine
 import warnings
 from contextlib import nullcontext
@@ -459,13 +460,7 @@ class DSparkMultiTokenPredictionLayer(MultiTokenPredictionLayer):
         orig_mhc = config.enable_hyper_connections
         config.enable_hyper_connections = False
 
-        linear_cls = getattr(submodules, 'eh_proj', None)
-        if linear_cls is None or linear_cls is IdentityOp:
-            linear_cls = getattr(submodules, 'e_proj', None)
-        if linear_cls is None or linear_cls is IdentityOp:
-            raise ValueError('DSparkMultiTokenPredictionLayer requires a column-parallel linear '
-                             'class in submodules.eh_proj or submodules.e_proj')
-
+        # We don't need the standard eh_proj for any DSpark layer.
         orig_eh_proj = getattr(submodules, 'eh_proj', None)
         submodules.eh_proj = IdentityOp
         try:
@@ -475,51 +470,95 @@ class DSparkMultiTokenPredictionLayer(MultiTokenPredictionLayer):
             if orig_eh_proj is not None:
                 submodules.eh_proj = orig_eh_proj
 
-        n_target_layers = len(config.dspark_target_layer_ids) if config.dspark_target_layer_ids else 1
-        main_proj_in_size = config.hidden_size * n_target_layers
+        # Determine which DSpark stage this is.
+        # layer_number is 1-indexed; mtp_num_layers is the total count.
+        is_first_layer = self.layer_number == 1
+        is_last_layer = self.layer_number == config.mtp_num_layers
 
-        norm_impl = getattr(submodules, 'enorm', None) or getattr(submodules, 'layer_norm', None)
-        if norm_impl is None:
-            raise ValueError('DSparkMultiTokenPredictionLayer requires a norm class in '
-                             'submodules.enorm or submodules.layer_norm')
-        self.main_norm = norm_impl(
-            config=config,
-            hidden_size=config.hidden_size,
-            eps=config.layernorm_epsilon,
-        )
+        self._dspark_is_first = is_first_layer
+        self._dspark_is_last = is_last_layer
+        self._dspark_target_hs = None
 
-        if config.fp8_param:
-            fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
-        else:
-            fp8_context = nullcontext()
-        with fp8_context:
-            self.main_proj = build_module(
-                linear_cls,
-                main_proj_in_size,
-                config.hidden_size,
-                config=config,
-                init_method=config.init_method,
-                gather_output=False,
-                bias=False,
-                skip_bias_add=False,
-                is_expert=False,
-                tp_comm_buffer_name='mtp_main_proj',
-                tp_group=self.tp_group,
-            )
-
+        # Nil out the standard MHC projection modules — they are never used in DSpark.
         self.e_proj = None
         self.h_proj = None
         self.enorm = None
         self.hnorm = None
         self.eh_proj = None
-        self._dspark_target_hs = None
+
+        if is_first_layer:
+            # main_proj: [hidden_size * n_target_layers, hidden_size]
+            n_target_layers = len(config.dspark_target_layer_ids) if config.dspark_target_layer_ids else 1
+            main_proj_in_size = config.hidden_size * n_target_layers
+
+            linear_cls = getattr(submodules, 'e_proj', None) or getattr(submodules, 'eh_proj', None)
+            if linear_cls is None or linear_cls is IdentityOp:
+                raise ValueError('DSparkMultiTokenPredictionLayer requires a column-parallel linear '
+                                 'class in submodules.e_proj or submodules.eh_proj')
+
+            norm_impl = getattr(submodules, 'enorm', None) or getattr(submodules, 'layer_norm', None)
+            if norm_impl is None:
+                raise ValueError('DSparkMultiTokenPredictionLayer requires a norm class in '
+                                 'submodules.enorm or submodules.layer_norm')
+
+            self.main_norm = norm_impl(
+                config=config,
+                hidden_size=config.hidden_size,
+                eps=config.layernorm_epsilon,
+            )
+
+            if config.fp8_param:
+                fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
+            else:
+                fp8_context = nullcontext()
+            with fp8_context:
+                self.main_proj = build_module(
+                    linear_cls,
+                    main_proj_in_size,
+                    config.hidden_size,
+                    config=config,
+                    init_method=config.init_method,
+                    gather_output=False,
+                    bias=False,
+                    skip_bias_add=False,
+                    is_expert=False,
+                    tp_comm_buffer_name='mtp_main_proj',
+                    tp_group=self.tp_group,
+                )
+
+        if is_last_layer:
+            # confidence_head: Linear(hidden_size + markov_rank, 1), fp32
+            # markov_head: Embedding(vocab_size, markov_rank) for markov_w1,
+            #              Linear(markov_rank, vocab_size) for markov_w2.
+            # These are used only at inference time for the speculative-decoding output path.
+            # We create them as simple nn.Module so weight loading works.
+            markov_rank = config.dspark_markov_rank
+            vocab_size = config.padded_vocab_size
+
+            self.confidence_head = nn.Module()
+            self.confidence_head.proj = nn.Linear(config.hidden_size + markov_rank, 1, bias=False, dtype=torch.float32)
+
+            self.markov_head = nn.Module()
+            # markov_w1: embedding lookup, weight shape [vocab_size, markov_rank]
+            self.markov_head.markov_w1 = nn.Embedding(vocab_size, markov_rank)
+            # markov_w2: output projection, weight shape [vocab_size, markov_rank]
+            self.markov_head.markov_w2 = nn.Linear(markov_rank, vocab_size, bias=False)
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
+        """First layer: project target-layer hidden states via main_proj + main_norm.
+
+        Non-first layers: pass through hidden_states directly (no embedding projection).
+        """
+        if not self._dspark_is_first:
+            # Middle/last layers: hidden_states are already in the right shape.
+            return hidden_states
+
         target_hs = self._dspark_target_hs
         if target_hs is not None:
             hidden_states = target_hs
             self._dspark_target_hs = None
         else:
+            # Fallback: repeat the incoming hidden states for each target layer.
             n_target = len(self.config.dspark_target_layer_ids) if self.config.dspark_target_layer_ids else 1
             if n_target > 1:
                 hidden_states = hidden_states.unsqueeze(-1).repeat(1, 1, n_target).flatten(-2)

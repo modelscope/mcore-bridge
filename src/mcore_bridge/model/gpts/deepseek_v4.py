@@ -4,8 +4,10 @@ import torch
 import transformer_engine.pytorch as te
 from contextlib import contextmanager
 from megatron.core import tensor_parallel
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.packed_seq_params import PackedSeqParams
 from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
@@ -735,9 +737,13 @@ class DeepseekV4Bridge(GPTBridge):
             self._set_state_dict(mg_mlp, 'router.tid2eid', hf_state_dict, 'gate.tid2eid', to_mcore)
             kwargs['moe_router_enable_expert_bias'] = False
         super()._set_router(mg_mlp, hf_state_dict, to_mcore, **kwargs)
+        # Convert gate.bias_vl -> router.vl_bias (VL models only, non-hash layers only).
+        if getattr(self.config, 'moe_router_enable_vl_bias', False) and not is_hash_layer:
+            self._set_state_dict(mg_mlp, 'router.vl_bias', hf_state_dict, 'gate.bias_vl', to_mcore)
 
     def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
         if getattr(self.config, 'dspark_enabled', False):
+<<<<<<< HEAD
             # DSpark MTP
             for key in ['main_proj.weight', 'main_norm.weight']:
                 self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
@@ -746,6 +752,33 @@ class DeepseekV4Bridge(GPTBridge):
             for key in ['hc_head_base', 'hc_head_fn', 'hc_head_scale']:
                 if key in hf_state_dict:
                     self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+=======
+            # DSpark MTP — per-layer keys
+            layer_number = mtp_layer.layer_number if mtp_layer is not None else 1
+            mtp_num_layers = self.config.mtp_num_layers
+
+            # First layer: main_proj + main_norm
+            if layer_number == 1:
+                for key in ['main_proj.weight', 'main_norm.weight']:
+                    if key in hf_state_dict:
+                        self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+
+            # Last layer: final_layernorm + hc_head + confidence_head + markov_head
+            if layer_number == mtp_num_layers:
+                if 'norm.weight' in hf_state_dict:
+                    self._set_state_dict(mtp_layer, 'final_layernorm.weight', hf_state_dict, 'norm.weight', to_mcore)
+                for key in ['hc_head_base', 'hc_head_fn', 'hc_head_scale']:
+                    if key in hf_state_dict:
+                        self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+                # confidence_head
+                if 'confidence_head.proj.weight' in hf_state_dict:
+                    self._set_state_dict(mtp_layer, 'confidence_head.proj.weight', hf_state_dict,
+                                         'confidence_head.proj.weight', to_mcore)
+                # markov_head
+                for key in ['markov_head.markov_w1.weight', 'markov_head.markov_w2.weight']:
+                    if key in hf_state_dict:
+                        self._set_state_dict(mtp_layer, key, hf_state_dict, key, to_mcore)
+>>>>>>> b539a4d (new support)
         else:
             # Standard MHC MTP
             for key in ['enorm.weight', 'hnorm.weight', 'e_proj.weight', 'h_proj.weight']:

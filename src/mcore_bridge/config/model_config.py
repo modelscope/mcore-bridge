@@ -253,6 +253,19 @@ class ModelConfig(TransformerConfig):
     dspark_target_layer_ids: Optional[List[int]] = None
     dspark_markov_rank: int = 256
 
+    # deepseek-v4-flash-vision
+    vision_n_layers: Optional[int] = None
+    vision_dim: Optional[int] = None
+    vision_n_heads: Optional[int] = None
+    vision_inter_dim: Optional[int] = None
+    vision_patch_size: Optional[int] = None
+    vision_rope_theta: float = 10000.0
+    vision_downsample_ratio: Optional[int] = None
+    vision_max_n_token: Optional[int] = None
+    vision_min_pixels: Optional[int] = None
+    vision_max_wh_ratio: Optional[int] = None
+    moe_router_enable_vl_bias: bool = False
+
     # visual
     language_model_only: bool = False
     hf_config: Optional[PretrainedConfig] = None
@@ -374,6 +387,9 @@ class ModelConfig(TransformerConfig):
         self._check_npu()
         if self.mcore_model_type is None:
             self.mcore_model_type = get_mcore_model_type(self.hf_model_type)
+        if (self.mcore_model_type == 'deepseek_v4' and getattr(self, 'vision_n_layers', None)
+                and self.vision_n_layers > 0):
+            self.mcore_model_type = 'deepseek_v4_vl'
         self.model_meta = get_model_meta(self.mcore_model_type)
         self.is_multimodal = self.model_meta.visual_cls is not None
         if self.is_multimodal and not self.language_model_only:
