@@ -25,6 +25,7 @@ mcore-bridge models keep the custom TransformerBlock path.
 import copy
 import os
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import torch
 import torch.nn.functional as F
@@ -848,6 +849,14 @@ class DeepseekV41Loader(DeepseekV4Loader):
     # this loader avoids changing the custom bridge block used by V4/DSpark/MTP.
     transformer_block = McoreTransformerBlock
 
+    def _engram_placement_layer_ids(self, hf_layer_ids):
+        """Map 0-based HF Engram layer IDs to 1-based ``TransformerLayer`` placement numbers.
+
+        On the GPT stack HF layer ``e`` is one ``TransformerLayer`` numbered ``e + 1``. The
+        HybridStack loader overrides this because there each HF layer becomes two hybrid layers.
+        """
+        return tuple(layer_id + 1 for layer_id in hf_layer_ids)
+
     def _get_engram_config(self):
         hf_layer_ids = tuple(self.config.engram_layer_ids or ())
         if not hf_layer_ids:
@@ -884,7 +893,7 @@ class DeepseekV41Loader(DeepseekV4Loader):
             global_vocab_sizes=(self.config.engram_vocab_size,) * (max_ngram_order - 1),
             # TransformerLayer numbers are 1-based, while the official checkpoint and
             # tokenizer artifact use the original 0-based HF layer IDs.
-            placement_layer_ids=tuple(layer_id + 1 for layer_id in hf_layer_ids),
+            placement_layer_ids=self._engram_placement_layer_ids(hf_layer_ids),
             hash_layer_ids=hf_layer_ids,
             max_ngram_order=max_ngram_order,
             num_hash_heads=self.config.engram_n_heads,
@@ -941,6 +950,11 @@ class DeepseekV41Loader(DeepseekV4Loader):
             attention_spec = layer_spec.submodules.self_attention
             attention_spec.module = DeepseekV41DSparkAttention
             attention_spec.submodules.core_attention.module = DeepseekV41DSparkCoreAttention
+        # DSpark specs bypass ModelLoader.build_model, so apply the same router
+        # override the main layers get: swap the vendored McoreTopKRouter for the
+        # custom TopKRouter, otherwise the draft MoE has no ``expert_bias_vl`` and
+        # loading the checkpoint's ``mtp.*.ffn.gate.bias_vl`` asserts.
+        self._replace_router(SimpleNamespace(layer_specs=layer_specs))
         return dspark_config, layer_specs
 
     def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
@@ -1053,12 +1067,21 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 rows = self._dequantize_engram_rows(rows, row_scales)
                 table.weight.data[local_start:local_end].copy_(
                     rows.to(device=table.weight.device, dtype=table.weight.dtype))
+        hf_layer_id = self._engram_hf_layer_id(engram)
         expected_rows = self.config.engram_num_embeddings[
-            self.config.engram_layer_ids.index(engram.layer_number - 1)]
+            self.config.engram_layer_ids.index(hf_layer_id)]
         if flat_offset != expected_rows:
             raise ValueError(
-                f'Engram layer {engram.layer_number - 1} expected {expected_rows} flat rows, '
+                f'Engram layer {hf_layer_id} expected {expected_rows} flat rows, '
                 f'but its prime tables contain {flat_offset}.')
+
+    def _engram_hf_layer_id(self, engram):
+        """Recover the 0-based HF layer ID from a built Engram's 1-based ``layer_number``.
+
+        On the GPT stack ``layer_number == hf_id + 1``. The HybridStack bridge overrides this
+        because its Engram sits on the doubled-space attention layer ``2 * hf_id + 1``.
+        """
+        return engram.layer_number - 1
 
     def _set_layer_engram(self, mg_layer, hf_state_dict, to_mcore):
         engram = self._get_layer_engram(mg_layer)

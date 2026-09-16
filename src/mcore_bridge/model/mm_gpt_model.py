@@ -59,7 +59,8 @@ class MultimodalGPTModel(MegatronModule):
                     kwargs.update(res)
                     res = inputs_embeds
             if self.config.context_parallel_size > 1:
-                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
+                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1,
+                                      cp_partition_mode=self.config.cp_partition_mode)
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 res = scatter_to_sequence_parallel_region(res, group=_self.tp_group)
@@ -91,11 +92,13 @@ class MultimodalGPTModel(MegatronModule):
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
+        cp_partition_mode = self.config.cp_partition_mode
         needs_split = cp_size > 1 and input_ids is not None and position_ids.shape[-1] * cp_size == input_ids.shape[-1]
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            input_ids_ = input_ids if needs_split else reconstruct_tensor_cp(input_ids, packed_seq_params, dim=1)
+            input_ids_ = input_ids if needs_split else reconstruct_tensor_cp(
+                input_ids, packed_seq_params, dim=1, cp_partition_mode=cp_partition_mode)
             kwargs.update({'input_ids': input_ids_, 'packed_seq_params': packed_seq_params})
             with self._patch_word_embeddings(kwargs):
                 decoder_input = self.language_model.embedding(input_ids=input_ids_, position_ids=position_ids)
@@ -106,7 +109,8 @@ class MultimodalGPTModel(MegatronModule):
             kwargs = {}
         kwargs.update(extra_kwargs)
         if needs_split:
-            input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1)
+            input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1,
+                                        cp_partition_mode=cp_partition_mode)
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,

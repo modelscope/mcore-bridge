@@ -550,6 +550,74 @@ def test_engram_adapter_remaps_checkpoint_layers_to_megatron_layers(tmp_path):
     assert config.excluded_token_ids == (99,)
 
 
+def _engram_config_for_validation(tmp_path):
+    artifact = tmp_path / 'tokenizer-map.json'
+    artifact.write_text(json.dumps({
+        'format': 'megatron-engram-token-map',
+        'version': 1,
+        'source_vocab_size': 8,
+        'compressed_vocab_size': 8,
+        'pad_token_id': 0,
+        'compressed_pad_token_id': 0,
+        'max_ngram_order': 3,
+        'hash_seed': 0,
+        'layer_ids': [0],
+        'layer_multipliers': {'0': [11, 13, 15]},
+        'remap': list(range(8)),
+    }))
+    return engram_adapter.build_deepseek_v41_engram_config(
+        placement_layer_ids=(1,),
+        hash_layer_ids=(0,),
+        global_vocab_sizes=(17, 19),
+        max_ngram_order=3,
+        num_hash_heads=1,
+        memory_dim=4,
+        kernel_size=1,
+        hash_seed=0,
+        boundary_token_id=0,
+        tokenizer_map_path=str(artifact),
+    )
+
+
+def test_engram_config_allows_context_parallelism_but_keeps_the_other_guards(tmp_path):
+    if not engram_adapter.has_native_engram():
+        pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
+    config = _engram_config_for_validation(tmp_path)
+    parallelism = dict(
+        context_parallel_size=2,
+        tensor_model_parallel_size=1,
+        expert_tensor_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        sequence_parallel=False,
+    )
+
+    # V4.1 hashes the full sequence locally and slices it, so CP no longer has to be 1.
+    config._validate_parallelism(SimpleNamespace(**parallelism), None)
+
+    with pytest.raises(ValueError, match='expert_tensor_parallel_size'):
+        config._validate_parallelism(
+            SimpleNamespace(**{**parallelism, 'expert_tensor_parallel_size': 2}), None)
+    with pytest.raises(ValueError, match='virtual pipeline'):
+        config._validate_parallelism(
+            SimpleNamespace(**{**parallelism, 'virtual_pipeline_model_parallel_size': 2}), None)
+
+
+def test_engram_config_allows_packed_sequences_without_losing_the_pipeline_guard(tmp_path):
+    if not engram_adapter.has_native_engram():
+        pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
+    config = _engram_config_for_validation(tmp_path)
+    assert not config.variant_spec.supports_packed_sequences
+
+    config._validate_packed_sequences(
+        SimpleNamespace(pipeline_model_parallel_size=1), packed_sequences=True)
+    # The temporary variant override must not leak into the hashing path.
+    assert not config.variant_spec.supports_packed_sequences
+
+    with pytest.raises(ValueError, match='pipeline_model_parallel_size > 2'):
+        config._validate_packed_sequences(
+            SimpleNamespace(pipeline_model_parallel_size=4), packed_sequences=True)
+
+
 def test_engram_hash_blocks_suffixes_after_excluded_token():
     hashes = engram_adapter._hash_token_windows(
         token_windows=torch.tensor([[[5, -1, 7]]]),
@@ -595,6 +663,146 @@ def test_engram_static_inference_cache_matches_full_sequence_hashing():
 
     assert torch.equal(torch.cat((prefill_hashes, decode_hashes), dim=1), full_hashes)
     assert torch.equal(torch.cat((prefill_live, decode_live), dim=1), full_live)
+
+
+def _ngram_hash_kwargs():
+    return dict(
+        tokenizer_remap=None,
+        multipliers=torch.tensor([11, 13, 15]),
+        table_sizes=torch.tensor([997, 991]),
+        max_ngram_order=3,
+        num_hash_heads=1,
+        boundary_token_id=0,
+        reset_at_boundary=False,
+    )
+
+
+def test_engram_packed_hashes_match_separately_hashed_documents():
+    # The DeepSeek variant carries no boundary token in the stream, so cu_seqlens is the only
+    # thing that stops an n-gram window from reaching into the previous packed document.
+    packed_row = torch.tensor([[5, 6, 7, 8, 9]])
+    kwargs = _ngram_hash_kwargs()
+
+    packed = engram_adapter._build_ngram_hashes(
+        packed_row, cu_seqlens=torch.tensor([0, 2, 5]), **kwargs)
+    separate = torch.cat(
+        (
+            engram_adapter._build_ngram_hashes(packed_row[:, :2], **kwargs),
+            engram_adapter._build_ngram_hashes(packed_row[:, 2:], **kwargs),
+        ),
+        dim=1,
+    )
+
+    assert torch.equal(packed, separate)
+    # Without the reset the second document would mix in tokens 5 and 6.
+    assert not torch.equal(packed, engram_adapter._build_ngram_hashes(packed_row, **kwargs))
+
+
+def test_engram_hashes_are_unchanged_when_cu_seqlens_spans_one_document():
+    packed_row = torch.tensor([[5, -1, 7, 8]])
+    kwargs = _ngram_hash_kwargs()
+
+    assert torch.equal(
+        engram_adapter._build_ngram_hashes(packed_row, cu_seqlens=torch.tensor([0, 4]), **kwargs),
+        engram_adapter._build_ngram_hashes(packed_row, **kwargs),
+    )
+
+
+def test_engram_rejects_cu_seqlens_that_does_not_cover_the_row():
+    with pytest.raises(ValueError, match='cu_seqlens ends at'):
+        engram_adapter._build_ngram_hashes(
+            torch.tensor([[5, 6, 7]]), cu_seqlens=torch.tensor([0, 2]), **_ngram_hash_kwargs())
+
+
+def _bare_engram(context_parallel_size=1, sequence_parallel=False):
+    module = engram_adapter.DeepseekV41Engram.__new__(engram_adapter.DeepseekV41Engram)
+    torch.nn.Module.__init__(module)
+    module.config = SimpleNamespace(
+        context_parallel_size=context_parallel_size, sequence_parallel=sequence_parallel)
+    return module
+
+
+def test_engram_context_parallel_slices_reassemble_the_global_hashes(monkeypatch):
+    from mcore_bridge.utils import megatron_utils
+
+    global_hashes = torch.arange(2 * 8 * 3).view(2, 8, 3)
+    cp_size = 4
+    monkeypatch.setattr(megatron_utils.mpu, 'get_context_parallel_world_size', lambda: cp_size)
+
+    slices = []
+    for cp_rank in range(cp_size):
+        monkeypatch.setattr(megatron_utils.mpu, 'get_context_parallel_rank', lambda rank=cp_rank: rank)
+        slices.append(_bare_engram(cp_size)._slice_for_context_parallel(global_hashes))
+
+    # Contiguous partitioning must hand rank r the block [r * local, (r + 1) * local).
+    assert all(item.shape == (2, 2, 3) for item in slices)
+    assert torch.equal(torch.cat(slices, dim=1), global_hashes)
+
+
+def test_contiguous_cp_reconstruct_inverts_the_matching_split(monkeypatch):
+    """Multimodal V4.1 splits embeddings/input_ids itself, so both directions must
+    honour ``cp_partition_mode``: reconstructing a contiguous shard with the zigzag
+    layout silently reorders tokens away from what the DSv4 THD CP forward assumes."""
+    from mcore_bridge.utils import megatron_utils
+
+    global_ids = torch.arange(8).view(1, 8)
+    cp_size, cp_rank = 2, 1
+    local_length = global_ids.shape[1] // cp_size
+    monkeypatch.setattr(megatron_utils.mpu, 'get_context_parallel_world_size', lambda: cp_size)
+    monkeypatch.setattr(megatron_utils.mpu, 'get_context_parallel_rank', lambda: cp_rank)
+    monkeypatch.setattr(megatron_utils.mpu, 'get_context_parallel_group', lambda: 'cp-group')
+
+    shard = megatron_utils.split_cp_inputs(global_ids, None, 1, cp_partition_mode='contiguous')
+
+    def fake_all_gather(output_list, tensor, group=None):
+        assert group == 'cp-group'
+        assert torch.equal(tensor, shard)
+        for rank, buffer in enumerate(output_list):
+            buffer.copy_(global_ids[:, rank * local_length:(rank + 1) * local_length])
+
+    monkeypatch.setattr(torch.distributed, 'all_gather', fake_all_gather)
+    assert torch.equal(
+        megatron_utils.reconstruct_tensor_cp(shard, None, dim=1, cp_partition_mode='contiguous'),
+        global_ids,
+    )
+    # The default zigzag layout must not be applied to a contiguous shard.
+    assert not torch.equal(
+        megatron_utils.reconstruct_tensor_cp(shard, None, dim=1), global_ids)
+
+
+def test_engram_gathers_cp_sharded_input_ids_but_leaves_full_ones_alone(monkeypatch):
+    full_ids = torch.arange(8).view(1, 8)
+    cp_size, cp_rank = 4, 2
+    local_length = 2
+
+    monkeypatch.setattr(engram_adapter.mpu, 'get_context_parallel_group', lambda: 'cp-group')
+
+    def fake_all_gather(output_list, tensor, group=None):
+        assert group == 'cp-group'
+        assert torch.equal(tensor, full_ids[:, cp_rank * local_length:(cp_rank + 1) * local_length])
+        for rank, buffer in enumerate(output_list):
+            buffer.copy_(full_ids[:, rank * local_length:(rank + 1) * local_length])
+
+    monkeypatch.setattr(torch.distributed, 'all_gather', fake_all_gather)
+    module = _bare_engram(cp_size)
+
+    shard = full_ids[:, cp_rank * local_length:(cp_rank + 1) * local_length]
+    assert torch.equal(
+        module._gather_input_ids_for_context_parallel(shard, local_length), full_ids)
+    # Multimodal models keep input_ids whole and split the embeddings instead.
+    assert module._gather_input_ids_for_context_parallel(full_ids, local_length) is full_ids
+    with pytest.raises(ValueError, match='matches neither'):
+        module._gather_input_ids_for_context_parallel(full_ids[:, :5], local_length)
+
+
+def test_engram_cp_local_sequence_length_undoes_the_inner_sp_split(monkeypatch):
+    monkeypatch.setattr(engram_adapter, 'get_pg_size', lambda group: 2)
+    hidden_states = torch.zeros(4, 1, 8)
+
+    assert _bare_engram(2)._cp_local_sequence_length(hidden_states) == 4
+    module = _bare_engram(2, sequence_parallel=True)
+    module.tp_group = None
+    assert module._cp_local_sequence_length(hidden_states) == 8
 
 
 def test_engram_layer_spec_uses_bridge_owned_module():
