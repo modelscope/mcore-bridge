@@ -35,14 +35,23 @@ def has_native_engram() -> bool:
     return EngramConfig is not None
 
 
-class _ContextParallelSizeOneView:
-    """Read-only view of a transformer config that reports ``context_parallel_size == 1``.
+class _RelaxedParallelismView:
+    """Read-only view of a transformer config that hides the CP and VPP guards.
 
-    Lets the Engram validators reuse every upstream parallelism check except the CP one,
-    without mutating the shared transformer config.
+    Lets the Engram validators reuse every upstream parallelism check except the two
+    DeepSeek-V4.1 has shown safe to drop, without mutating the shared transformer config:
+
+    * ``context_parallel_size``: V4.1 hashes the full sequence locally and then slices its own
+      CP interval, so no n-gram window ever crosses a CP rank boundary.
+    * ``virtual_pipeline_model_parallel_size``: ``Engram.forward`` is self-contained (it never
+      exchanges state across pipeline/VP stages), and its layer placement keys off the
+      vp_stage-aware global ``layer_number`` that ``select_pipeline_segment`` assigns to each
+      chunk. The hybrid stack's ``__init__`` block-alignment guard rejects any partial-block
+      stage at build time, so an Engram-carrying ``D`` layer can never be split across stages.
     """
 
     context_parallel_size = 1
+    virtual_pipeline_model_parallel_size = None
 
     def __init__(self, transformer_config):
         self._transformer_config = transformer_config
@@ -80,15 +89,16 @@ if EngramConfig is not None:
                 self.layer_ids = placement_layer_ids
 
         def _validate_parallelism(self, transformer_config, sequence_length):
-            # DeepseekV41Engram hashes the full sequence locally and then selects its own CP
-            # slice, so no window ever has to cross a CP rank boundary. Drop only the upstream
-            # `context_parallel_size == 1` rejection and keep every other check.
+            # Drop only the upstream CP and VPP rejections (see _RelaxedParallelismView for why
+            # both are safe on the V4.1 hybrid path) and keep every other check -- etp==tp, the
+            # SP rank-local history length, etc. CP shortens the rank-local slice the SP check
+            # compares against, so apply it here before delegating.
             context_parallel_size = transformer_config.context_parallel_size
             if sequence_length is not None:
                 # The SP checks compare against a rank-local slice, which CP shortens first.
                 sequence_length = sequence_length // context_parallel_size
             super()._validate_parallelism(
-                _ContextParallelSizeOneView(transformer_config), sequence_length)
+                _RelaxedParallelismView(transformer_config), sequence_length)
 
         def _validate_packed_sequences(self, transformer_config, packed_sequences):
             # DeepseekV41Engram restarts its n-gram windows at every cu_seqlens document

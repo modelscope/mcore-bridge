@@ -986,10 +986,10 @@ class DeepseekV41Loader(DeepseekV4Loader):
 
     def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
         model = super().build_model(pre_process, post_process, vp_stage)
-        self._attach_dspark(model.language_model, post_process)
+        self._attach_dspark(model.language_model, post_process, vp_stage=vp_stage)
         return model
 
-    def _attach_dspark(self, language_model, post_process):
+    def _attach_dspark(self, language_model, post_process, vp_stage: Optional[int] = None):
         """Build the DSpark (``mtp.*``) draft stack and attach it to ``language_model`` on the
         final pipeline stage.
 
@@ -1000,6 +1000,13 @@ class DeepseekV41Loader(DeepseekV4Loader):
         the ``HybridModel`` itself -- both expose ``pg_collection`` / ``vocab_size`` / ``config``.
         The stack is never part of the training forward (capture is inference-only), so it only
         needs to exist here so its parameters are loaded / saved through the ``mtp.*`` bridge.
+
+        ``vp_stage`` must be threaded into ``build_module`` because the draft layers reuse the
+        experimental-attention ``TransformerLayer``, whose ``__init__`` calls
+        ``get_transformer_layer_offset`` -- and that helper asserts ``vp_stage is not None`` under
+        VPP. The draft stack keeps its own local 1-based numbering; the pipeline offset the helper
+        adds is the same value the last stage already applied under plain PP (0 for the tiny draft
+        stack), so this only satisfies the VPP assertion without changing placement.
         """
         if not self.config.dspark_num_layers or not post_process:
             return
@@ -1010,6 +1017,7 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 config=dspark_config,
                 layer_number=index + 1,
                 pg_collection=language_model.pg_collection,
+                vp_stage=vp_stage,
             )
             for index, layer_spec in enumerate(dspark_layer_specs)
         ]

@@ -556,7 +556,7 @@ class DeepseekV41HybridLoader(DeepseekV41Loader):
         # target-layer capture on HybridStack is deferred (it is not exercised by training / weight
         # round-trip, mirroring B1's deferral of ``allow_engram_inference``); the stack only needs
         # to exist so its parameters are loaded / saved via ``mtp.*``.
-        self._attach_dspark(language_model, post_process)
+        self._attach_dspark(language_model, post_process, vp_stage=vp_stage)
         return model
 
 

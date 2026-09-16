@@ -579,7 +579,7 @@ def _engram_config_for_validation(tmp_path):
     )
 
 
-def test_engram_config_allows_context_parallelism_but_keeps_the_other_guards(tmp_path):
+def test_engram_config_allows_context_and_virtual_pipeline_but_keeps_the_other_guards(tmp_path):
     if not engram_adapter.has_native_engram():
         pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
     config = _engram_config_for_validation(tmp_path)
@@ -593,13 +593,14 @@ def test_engram_config_allows_context_parallelism_but_keeps_the_other_guards(tmp
 
     # V4.1 hashes the full sequence locally and slices it, so CP no longer has to be 1.
     config._validate_parallelism(SimpleNamespace(**parallelism), None)
-
+    # VPP is now allowed too: Engram.forward is self-contained and layer placement uses the
+    # vp_stage-aware global layer_number, so the upstream blanket VPP guard is dropped.
+    config._validate_parallelism(
+        SimpleNamespace(**{**parallelism, 'virtual_pipeline_model_parallel_size': 2}), None)
+    # ... but only the CP and VPP guards are relaxed; every other parallelism check still fires.
     with pytest.raises(ValueError, match='expert_tensor_parallel_size'):
         config._validate_parallelism(
             SimpleNamespace(**{**parallelism, 'expert_tensor_parallel_size': 2}), None)
-    with pytest.raises(ValueError, match='virtual pipeline'):
-        config._validate_parallelism(
-            SimpleNamespace(**{**parallelism, 'virtual_pipeline_model_parallel_size': 2}), None)
 
 
 def test_engram_config_allows_packed_sequences_without_losing_the_pipeline_guard(tmp_path):

@@ -31,6 +31,16 @@ class MultimodalGPTModel(MegatronModule):
                                                       **kwargs)
         self.vp_stage = self.language_model.vp_stage
         self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
+        # Surface the language model's typed-pipeline payload interface on the wrapper. The PP
+        # schedulers locate it with ``get_attr_wrapped_model(chunk, 'pipeline_payload_factory')``,
+        # which only descends through ``.module`` wrappers and never reaches ``self.language_model``.
+        # Without this a HybridModel backbone that configures a custom cross-stage payload (e.g.
+        # DeepSeek-V4.1 CSA2 / single-pass mHC) is not recognised as typed, so both the 1F1B and the
+        # interleaved (VPP) schedules fall back to the shape-based ``P2PCommunicator`` -- which calls
+        # ``.size()`` on the payload object and crashes. Backbones without a payload (plain
+        # ``GPTModel``, GLM's HybridModel adapter) expose ``None`` here and keep the legacy path.
+        self.pipeline_payload_factory = getattr(self.language_model, 'pipeline_payload_factory', None)
+        self.pipeline_payload_spec = getattr(self.language_model, 'pipeline_payload_spec', None)
         self.model_meta = config.model_meta
         self.visual = None
         if pre_process and self.model_meta.visual_cls is not None:
