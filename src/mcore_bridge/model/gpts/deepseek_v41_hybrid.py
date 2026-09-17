@@ -19,12 +19,12 @@ layer (``E`` for MoE, ``-`` for dense). So a hybrid stack has ``2 * num_layers``
 and every per-layer config array that CSA2 indexes by ``layer_number - 1`` must be
 re-expanded into this doubled index space (see :func:`derive_hybrid_layer_config`).
 
-This module keeps the GPT loader available as a force-off regression baseline; the
-hybrid path is now the default for every layout (plan step B5) after both were
-validated to agree at iter-1 loss/grad and on the weight key ledger.
+The HybridModel path is the sole maintained DeepSeek-V4.1 implementation. The legacy
+GPTModel path is deprecated and scheduled for removal.
 """
 import copy
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import List, Optional, Sequence, Union
 
 import torch
@@ -217,6 +217,7 @@ if _HYBRID_MODEL_AVAILABLE:
             # identical to the GPTModel baseline. ``get_rotary_seq_len`` reads ``decoder.input_tensor``
             # when the local ``hidden_states`` is ``None``, so this also covers PP intermediate/last
             # stages.
+            self._dsv4_position_ids = None
             self._build_dsv4_rotary_tables()
             self.decoder.register_forward_pre_hook(self._inject_dsv4_rotary_pos_emb, with_kwargs=True)
 
@@ -245,14 +246,33 @@ if _HYBRID_MODEL_AVAILABLE:
 
         def _dsv4_rotary_pos_emb(self, transformer_input, packed_seq_params, inference_context=None):
             """Return the ``{'main', 'compress'}`` RoPE dict the DSv4 attention indexes by
-            ``rope_layer_type`` (mirrors ``DeepseekV4GPTModel._get_rotary_pos_emb``)."""
+            ``rope_layer_type`` (mirrors ``DeepseekV4GPTModel._get_rotary_pos_emb`` plus the
+            packed pre-indexing ``GPTModel.forward`` does).
+
+            The DSv4 attention consumes *per-token* frequencies row-aligned with the hidden states
+            (see ``_apply_mla_rope``), not a position->frequency table. For one sequence per row the
+            table is already row-aligned, but under ``thd`` packing a row holds several sequences
+            whose positions restart, so the table (sized by the longest sequence) must be indexed by
+            ``position_ids`` here -- exactly what the GPT path does in ``GPTModel.forward``. Under CP
+            ``position_ids`` arrives already split with the hidden states' partition mode, so the
+            indexed frequencies come out rank-local while keeping absolute positions.
+            """
             rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
                 inference_context, self.decoder, transformer_input, self.config, packed_seq_params)
             packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
-            return {
+            rotary_pos_emb = {
                 'main': self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq),
                 'compress': self.compress_rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq),
             }
+            if packed_seq and not self.config.apply_rope_fusion:
+                position_ids = self._dsv4_position_ids
+                if position_ids is None:
+                    raise ValueError('DeepSeek-V4.1 hybrid needs position_ids on every pipeline '
+                                     'stage to pre-index the MLA rotary table under sequence '
+                                     'packing.')
+                assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
+                rotary_pos_emb = {k: v[position_ids[0]] for k, v in rotary_pos_emb.items()}
+            return rotary_pos_emb
 
         def _inject_dsv4_rotary_pos_emb(self, module, args, kwargs):
             if kwargs.get('rotary_pos_emb') is not None:
@@ -286,7 +306,16 @@ if _HYBRID_MODEL_AVAILABLE:
                     'inputs require the B4 multimodal wrapper.')
             for key in self._visual_forward_keys:
                 kwargs.pop(key, None)
-            return super().forward(*args, **kwargs)
+            # Upstream ``HybridModel.forward`` never threads position_ids into the decoder, so stash
+            # it for the rotary pre-hook (see :meth:`_dsv4_rotary_pos_emb`).
+            position_ids = kwargs.get('position_ids')
+            if position_ids is None and len(args) > 1:
+                position_ids = args[1]
+            self._dsv4_position_ids = position_ids
+            try:
+                return super().forward(*args, **kwargs)
+            finally:
+                self._dsv4_position_ids = None
 
     class DeepseekV41MultimodalHybridModel(DeepseekV41MultimodalGPTModel):
         """Multimodal wrapper (B4) hosting the PP-capable ``HybridModel`` backbone.
@@ -624,23 +653,19 @@ class DeepseekV41HybridBridge(DeepseekV41Bridge):
                              to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
-        # First pipeline stage of a multimodal model: the vision tower + aligner + image_* markers
-        # live on the wrapper (``mg_model.visual``). Reuse the GPT ``DeepseekV41Bridge`` pre-process
-        # verbatim (``MultimodalGPTBridge`` word-embeddings + vision/aligner block, then the
-        # image_start/end/newline markers); ``_set_word_embeddings`` above resolves the LM via
-        # ``_lm``. ``super()`` here is ``DeepseekV41Bridge`` (MRO), matching the GPT path exactly.
-        if getattr(mg_model, 'visual', None) is not None:
-            return super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
-        # No vision tower on this rank (text-only backbone, or a non-first PP stage where the
-        # wrapper built ``visual=None``): map only the word embeddings.
-        if to_mcore:
-            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
-        else:
-            hf_state_dict = {}
-        self._set_word_embeddings(mg_model, hf_state_dict, to_mcore)
-        if to_mcore:
-            return {}
-        return self._add_prefix(hf_state_dict, hf_prefix)
+        # Delegate to ``DeepseekV41Bridge._convert_pre_process`` (``super()`` via MRO) unconditionally
+        # instead of branching on *this* rank's ``mg_model.visual``. On export every pipeline stage runs
+        # ``_convert`` -> ``_convert_pre_process``, and the base path issues the *same* pp-group collective
+        # sequence on all ranks: word-embeddings (routed through ``_lm`` by the ``_set_word_embeddings``
+        # override), then the config-guarded vision/aligner block and the image_* markers, all driven via
+        # ``_set_module``/``_set_state_dict`` which stay in lockstep even where the submodule is ``None``
+        # (see ``_set_module``'s ``src_rank`` all-reduce / ``_set_state_dict``'s ``state`` all-reduce).
+        # A per-rank ``visual is not None`` guard would skip that whole block on non-first stages (where
+        # the wrapper built ``visual=None``), desynchronizing the collectives so the last stage's later
+        # per-layer ``has_model`` all-reduce reads a stale value -> ``next(mg_models)`` -> ``StopIteration``.
+        # On load only the first stage reaches this method (see ``_convert``'s ``is_pp_first_stage`` guard),
+        # so the vision tower is always present there and the base path behaves exactly as before.
+        return super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
 
     def _convert_post_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
         if to_mcore:
@@ -681,7 +706,10 @@ class DeepseekV41HybridBridge(DeepseekV41Bridge):
         self._set_state_dict(hyper_connection, 'bias', hf_state_dict, f'hc_{hf_key}_base', to_mcore)
         has_hyper_connection = hyper_connection is not None
         has_hyper_connection = self._reduce_tensor_pp_group(has_hyper_connection, to_mcore)
-        if has_hyper_connection:
+        # ``alpha_*`` bypass ``_set_state_dict``, so mirror the peft guard the GPT
+        # ``_set_hyper_connection`` applies -- these are frozen base weights and must stay out of
+        # ``adapter_model.safetensors``.
+        if has_hyper_connection and not self._peft_format:
             if to_mcore:
                 alpha = hf_state_dict[f'hc_{hf_key}_scale'].load()
                 for i, alpha_suffix in enumerate(['pre', 'post', 'res']):
@@ -729,18 +757,17 @@ class DeepseekV41HybridBridge(DeepseekV41Bridge):
         identical in both paths -- so the base :meth:`DeepseekV41Bridge._convert_dspark_stack`
         mapping is reused verbatim; only where the stack lives differs. On the hybrid path it is
         attached to the model itself (no ``language_model`` wrapper, so use :meth:`_lm`) and only
-        on the final pipeline stage, so non-last stages have nothing to convert (on load the base
-        guard skips them; on export ``dspark`` is simply absent). MTP (``mtp_num_layers``) is
-        skipped in :meth:`_convert` and does not apply to V4.1."""
+        on the final pipeline stage. During export non-last stages use an empty structural proxy so
+        every PP rank executes the same collective sequence. MTP (``mtp_num_layers``) is skipped in
+        :meth:`_convert` and does not apply to V4.1."""
         if not self.config.dspark_num_layers or (to_mcore and not is_pp_last_stage):
             return
         language_model = self._lm(mg_model)
         dspark = getattr(language_model, 'dspark', None)
         if dspark is None:
-            if not is_pp_last_stage:
-                # Export from a non-last PP stage: the draft stack lives on the final stage only.
-                return
-            raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
+            if to_mcore or is_pp_last_stage:
+                raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
+            dspark = SimpleNamespace(layers=[None] * self.config.dspark_num_layers)
         yield from self._convert_dspark_stack(language_model, dspark, hf_state_dict, hf_prefix, to_mcore)
 
     def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):

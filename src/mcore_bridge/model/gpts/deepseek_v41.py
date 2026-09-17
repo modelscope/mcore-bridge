@@ -1023,6 +1023,16 @@ class DeepseekV41Loader(DeepseekV4Loader):
         ]
         language_model.dspark = DeepseekV41DSparkStack(dspark_config, layers)
         self._set_linear_is_expert(language_model.dspark)
+        # ``Float16Module`` casts every unmarked float buffer, and mcore's ``TopKRouter`` only
+        # restores the aux-loss-free bias to fp32 lazily -- from ``forward`` and from
+        # ``_save_to_state_dict``. The draft stack never runs in the training forward, and the
+        # bridge copies ``param.data`` directly instead of going through the state-dict hooks, so
+        # without this marker the checkpoint's fp32 ``mtp.*.ffn.gate.bias`` would round-trip
+        # through bf16. The main layers escape it only because their routers do run.
+        for layer in layers:
+            expert_bias = getattr(getattr(layer.mlp, 'router', None), 'expert_bias', None)
+            if expert_bias is not None:
+                mark_keep_in_fp32(expert_bias)
         # DSpark embeds its draft seed with the base input embedding. On a PP>1 last
         # stage with untied embeddings the base model has no ``embedding`` here, so
         # build a dedicated replicated DSpark embedding; the bridge loads it from

@@ -402,11 +402,20 @@ class DeepseekV41Engram(Engram):
         if packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', None) == 'thd':
             # cu_seqlens_q stays global: the data pipeline builds it before the CP split.
             cu_seqlens = getattr(packed_seq_params, 'cu_seqlens_q', None)
-            if context_parallel and getattr(packed_seq_params, 'cp_partition_mode',
-                                            'zigzag') != 'contiguous':
-                raise ValueError(
-                    "Engram with context parallelism requires cp_partition_mode='contiguous', "
-                    'matching the DSv4 THD CP forward.')
+            cp_partition_mode = getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+        else:
+            # Non-packed CP carries the partition layout on the transformer config instead of on
+            # packed_seq_params (see mm_gpt_model's CP data path).
+            cp_partition_mode = getattr(self.config, 'cp_partition_mode', 'zigzag')
+        if context_parallel and cp_partition_mode != 'contiguous':
+            # Both _gather_input_ids_for_context_parallel (rank-order concat) and
+            # _slice_for_context_parallel (contiguous slice) assume contiguous CP blocks, so a
+            # zigzag layout would silently mis-align the hashes with the local hidden states.
+            # Fail loud on every CP path -- packed (THD) and non-packed alike -- matching the
+            # DSv4 THD CP forward.
+            raise ValueError(
+                "Engram with context parallelism requires cp_partition_mode='contiguous', "
+                'matching the DSv4 THD CP forward.')
 
         nvtx_range_push('engram.hash')
         try:

@@ -1756,7 +1756,11 @@ class GPTBridge:
             self._set_state_dict(hyper_connection, 'bias', hf_state_dict, f'hc_{hf_key}_base', to_mcore)
             has_hyper_connection = hyper_connection is not None
             has_hyper_connection = self._reduce_tensor_pp_group(has_hyper_connection, to_mcore)
-            if has_hyper_connection:
+            # ``alpha_*`` are frozen base parameters written outside ``_set_state_dict``, so they
+            # need the peft guard the mapping_proj/bias calls above get for free -- otherwise a
+            # LoRA export writes base weights into ``adapter_model.safetensors`` and a LoRA load
+            # demands a key the adapter does not carry. Same shape as the Engram export guard.
+            if has_hyper_connection and not self._peft_format:
                 if to_mcore:
                     alpha = hf_state_dict[f'hc_{hf_key}_scale'].load()
                     for i, alpha_suffix in enumerate(['pre', 'post', 'res']):
