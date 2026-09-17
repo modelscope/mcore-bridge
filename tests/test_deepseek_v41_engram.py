@@ -15,7 +15,6 @@ from mcore_bridge.model.gpts.deepseek_v41 import (
     DeepseekV41Aligner,
     DeepseekV41Bridge,
     DeepseekV41DSparkAttention,
-    DeepseekV41GPTModel,
     DeepseekV41Vision,
     DeepseekV41VisionTransformer,
 )
@@ -31,16 +30,6 @@ from mcore_bridge.model.modules.dspark import (
     verify_dspark_draft,
 )
 from mcore_bridge.utils.safetensors import SafetensorLazyLoader
-
-
-def test_dspark_target_hidden_averages_mhc_streams():
-    hidden = torch.arange(2 * 3 * 4 * 5, dtype=torch.float32).view(2, 3, 20)
-
-    actual = DeepseekV41GPTModel._contract_dspark_target_hidden(hidden, num_streams=4)
-    expected = hidden.view(2, 3, 4, 5).mean(dim=2)
-
-    assert actual.shape == (2, 3, 5)
-    torch.testing.assert_close(actual, expected)
 
 
 def test_dspark_config_is_kept_separate_from_standard_mtp():
@@ -68,6 +57,7 @@ def test_dspark_config_is_kept_separate_from_standard_mtp():
 
 
 def test_dspark_input_builds_parallel_noise_block():
+
     class _Projection(torch.nn.Module):
 
         def forward(self, hidden_states):
@@ -101,6 +91,7 @@ def test_dspark_input_builds_parallel_noise_block():
 
 
 def test_dspark_markov_head_returns_full_logits_and_embedding():
+
     class _Head(torch.nn.Module):
 
         def forward(self, hidden_states, runtime_gather_output):
@@ -109,9 +100,7 @@ def test_dspark_markov_head_returns_full_logits_and_embedding():
 
     module = DeepseekV41DSparkMarkovHead.__new__(DeepseekV41DSparkMarkovHead)
     torch.nn.Module.__init__(module)
-    module.embed = torch.nn.Embedding.from_pretrained(
-        torch.tensor([[1., 2.], [3., 4.], [5., 6.]]),
-    )
+    module.embed = torch.nn.Embedding.from_pretrained(torch.tensor([[1., 2.], [3., 4.], [5., 6.]]), )
     module.head = _Head()
 
     logits, embedding = module(torch.tensor([0, 2]))
@@ -233,11 +222,12 @@ def test_dspark_verification_accepts_only_strict_matching_prefix():
 
     assert torch.equal(result.accepted_lengths, torch.tensor([3, 1, 0]))
     assert torch.equal(result.next_tokens, torch.tensor([14, 99, 98]))
-    assert torch.equal(result.accepted_mask, torch.tensor([
-        [True, True, True],
-        [True, False, False],
-        [False, False, False],
-    ]))
+    assert torch.equal(result.accepted_mask,
+                       torch.tensor([
+                           [True, True, True],
+                           [True, False, False],
+                           [False, False, False],
+                       ]))
 
     confidence = torch.tensor([[10.0, -10.0, 10.0]] * 3)
     result = verify_dspark_draft(draft_ids, target_ids, confidence, confidence_threshold=0.5)
@@ -262,6 +252,7 @@ def test_dspark_state_preserves_recompute_inputs():
 
 
 def test_dspark_stack_prefill_and_decode_lifecycle():
+
     class _Input(torch.nn.Module):
 
         def forward(self, main_hidden, input_ids, embedding):
@@ -301,7 +292,7 @@ def test_dspark_stack_prefill_and_decode_lifecycle():
             state = kwargs['cross_layer_state']
             self.received_main_hidden = state.main_hidden
             mhc_state = kwargs['mhc_state']
-            mhc_state.pre_mix = hidden_states.new_full(hidden_states.shape[:2] + (2,), 0.5)
+            mhc_state.pre_mix = hidden_states.new_full(hidden_states.shape[:2] + (2, ), 0.5)
             return hidden_states + 1, None
 
     class _Output(torch.nn.Module):
@@ -329,8 +320,7 @@ def test_dspark_stack_prefill_and_decode_lifecycle():
     ) is None
     for layer in stack.layers:
         prefill_main, prefill_rotary, prefill_context, prefill_start, prefill_slots = (
-            layer.self_attention.prefill_args
-        )
+            layer.self_attention.prefill_args)
         torch.testing.assert_close(prefill_main, main_hidden[..., :2])
         assert prefill_rotary is rotary
         assert prefill_context is None
@@ -370,6 +360,7 @@ def test_dspark_confidence_head_uses_fp32_projection():
 
 
 def test_dspark_output_applies_markov_recurrence_in_block_order():
+
     class _OutputLayer(torch.nn.Module):
 
         def forward(self, hidden_states, runtime_gather_output):
@@ -411,72 +402,6 @@ def test_dspark_output_applies_markov_recurrence_in_block_order():
     assert torch.equal(dspark_sample(logits, temperature=0), output_ids[:, 1:])
 
 
-def test_dspark_model_commits_only_verified_states_before_proposal():
-    class _DSpark:
-
-        def __init__(self):
-            self.updates = []
-
-        def resolve_cache_slots(self, request_ids, live_request_ids):
-            assert torch.equal(request_ids.cpu(), torch.tensor([10, 20]))
-            assert torch.equal(live_request_ids.cpu(), torch.tensor([10, 20]))
-            return torch.tensor([2, 0], device=request_ids.device)
-
-        def update_main_cache(
-            self,
-            main_hidden,
-            rotary_pos_emb,
-            *,
-            start_pos,
-            cache_slots,
-            inference_context,
-        ):
-            self.updates.append((main_hidden.clone(), start_pos.clone(), cache_slots.clone()))
-
-    model = DeepseekV41GPTModel.__new__(DeepseekV41GPTModel)
-    torch.nn.Module.__init__(model)
-    model.config = SimpleNamespace(sequence_parallel=False, dspark_block_size=3)
-    model.dspark = _DSpark()
-    captured = torch.arange(5 * 4, dtype=torch.float32).view(5, 1, 4)
-    model.get_dspark_main_hidden = lambda: captured
-    model._dspark_rotary_for_positions = lambda positions: positions.float()
-    proposal_args = {}
-
-    def forward_dspark(main_hidden, input_ids, **kwargs):
-        proposal_args.update(main_hidden=main_hidden, input_ids=input_ids, **kwargs)
-        output_ids = torch.tensor([[31, 32, 33, 34], [41, 42, 43, 44]])
-        return output_ids, None, None
-
-    model.forward_dspark = forward_dspark
-    context = SimpleNamespace(
-        total_request_count=2,
-        paused_request_count=0,
-        num_decode_requests=1,
-        request_query_lengths=torch.tensor([3, 2], dtype=torch.int32),
-        request_ids=torch.tensor([10, 20], dtype=torch.int32),
-        token_to_position_in_request=torch.tensor([5, 6, 7, 0, 1], dtype=torch.int32),
-        using_cuda_graph_this_step=lambda: False,
-    )
-
-    proposals = model.compute_dspark_speculative_tokens(
-        next_token_ids=torch.tensor([31, 41]),
-        accepted_token_counts=torch.tensor([1, 0]),
-        last_accepted_seq_indices=torch.tensor([1, 4]),
-        num_speculative_tokens=2,
-        inference_context=context,
-        sample_fn=lambda logits: logits.argmax(dim=-1),
-    )
-
-    assert len(model.dspark.updates) == 2
-    torch.testing.assert_close(model.dspark.updates[0][0], captured[:2])
-    torch.testing.assert_close(model.dspark.updates[1][0], captured[3:5])
-    assert model.dspark.updates[0][1].item() == 5
-    assert model.dspark.updates[1][1].item() == 0
-    assert torch.equal(proposal_args['start_pos'], torch.tensor([6, 1]))
-    torch.testing.assert_close(proposal_args['main_hidden'], captured[[1, 4]].transpose(0, 1))
-    assert torch.equal(proposals, torch.tensor([[32, 42], [33, 43]]))
-
-
 def test_controller_routes_speculative_proposals_to_dspark_provider():
     calls = {}
 
@@ -516,23 +441,27 @@ def test_engram_adapter_remaps_checkpoint_layers_to_megatron_layers(tmp_path):
     if not engram_adapter.has_native_engram():
         pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
     artifact = tmp_path / 'tokenizer-map.json'
-    artifact.write_text(json.dumps({
-        'format': 'megatron-engram-token-map',
-        'version': 1,
-        'source_vocab_size': 8,
-        'compressed_vocab_size': 8,
-        'pad_token_id': 0,
-        'compressed_pad_token_id': 0,
-        'max_ngram_order': 3,
-        'hash_seed': 0,
-        'layer_ids': [0, 2],
-        'layer_multipliers': {'0': [11, 13, 15], '2': [17, 19, 21]},
-        'remap': list(range(8)),
-    }))
+    artifact.write_text(
+        json.dumps({
+            'format': 'megatron-engram-token-map',
+            'version': 1,
+            'source_vocab_size': 8,
+            'compressed_vocab_size': 8,
+            'pad_token_id': 0,
+            'compressed_pad_token_id': 0,
+            'max_ngram_order': 3,
+            'hash_seed': 0,
+            'layer_ids': [0, 2],
+            'layer_multipliers': {
+                '0': [11, 13, 15],
+                '2': [17, 19, 21]
+            },
+            'remap': list(range(8)),
+        }))
     config = engram_adapter.build_deepseek_v41_engram_config(
         placement_layer_ids=(1, 3),
         hash_layer_ids=(0, 2),
-        excluded_token_ids=(99,),
+        excluded_token_ids=(99, ),
         global_vocab_sizes=(17, 19),
         max_ngram_order=3,
         num_hash_heads=1,
@@ -547,27 +476,30 @@ def test_engram_adapter_remaps_checkpoint_layers_to_megatron_layers(tmp_path):
     assert config.hash_layer_ids == (0, 2)
     assert config.layer_multipliers == {1: (11, 13, 15), 3: (17, 19, 21)}
     assert set(config.table_sizes_by_layer) == {1, 3}
-    assert config.excluded_token_ids == (99,)
+    assert config.excluded_token_ids == (99, )
 
 
 def _engram_config_for_validation(tmp_path):
     artifact = tmp_path / 'tokenizer-map.json'
-    artifact.write_text(json.dumps({
-        'format': 'megatron-engram-token-map',
-        'version': 1,
-        'source_vocab_size': 8,
-        'compressed_vocab_size': 8,
-        'pad_token_id': 0,
-        'compressed_pad_token_id': 0,
-        'max_ngram_order': 3,
-        'hash_seed': 0,
-        'layer_ids': [0],
-        'layer_multipliers': {'0': [11, 13, 15]},
-        'remap': list(range(8)),
-    }))
+    artifact.write_text(
+        json.dumps({
+            'format': 'megatron-engram-token-map',
+            'version': 1,
+            'source_vocab_size': 8,
+            'compressed_vocab_size': 8,
+            'pad_token_id': 0,
+            'compressed_pad_token_id': 0,
+            'max_ngram_order': 3,
+            'hash_seed': 0,
+            'layer_ids': [0],
+            'layer_multipliers': {
+                '0': [11, 13, 15]
+            },
+            'remap': list(range(8)),
+        }))
     return engram_adapter.build_deepseek_v41_engram_config(
-        placement_layer_ids=(1,),
-        hash_layer_ids=(0,),
+        placement_layer_ids=(1, ),
+        hash_layer_ids=(0, ),
         global_vocab_sizes=(17, 19),
         max_ngram_order=3,
         num_hash_heads=1,
@@ -595,12 +527,10 @@ def test_engram_config_allows_context_and_virtual_pipeline_but_keeps_the_other_g
     config._validate_parallelism(SimpleNamespace(**parallelism), None)
     # VPP is now allowed too: Engram.forward is self-contained and layer placement uses the
     # vp_stage-aware global layer_number, so the upstream blanket VPP guard is dropped.
-    config._validate_parallelism(
-        SimpleNamespace(**{**parallelism, 'virtual_pipeline_model_parallel_size': 2}), None)
+    config._validate_parallelism(SimpleNamespace(**{**parallelism, 'virtual_pipeline_model_parallel_size': 2}), None)
     # ... but only the CP and VPP guards are relaxed; every other parallelism check still fires.
     with pytest.raises(ValueError, match='expert_tensor_parallel_size'):
-        config._validate_parallelism(
-            SimpleNamespace(**{**parallelism, 'expert_tensor_parallel_size': 2}), None)
+        config._validate_parallelism(SimpleNamespace(**{**parallelism, 'expert_tensor_parallel_size': 2}), None)
 
 
 def test_engram_config_allows_packed_sequences_without_losing_the_pipeline_guard(tmp_path):
@@ -609,14 +539,12 @@ def test_engram_config_allows_packed_sequences_without_losing_the_pipeline_guard
     config = _engram_config_for_validation(tmp_path)
     assert not config.variant_spec.supports_packed_sequences
 
-    config._validate_packed_sequences(
-        SimpleNamespace(pipeline_model_parallel_size=1), packed_sequences=True)
+    config._validate_packed_sequences(SimpleNamespace(pipeline_model_parallel_size=1), packed_sequences=True)
     # The temporary variant override must not leak into the hashing path.
     assert not config.variant_spec.supports_packed_sequences
 
     with pytest.raises(ValueError, match='pipeline_model_parallel_size > 2'):
-        config._validate_packed_sequences(
-            SimpleNamespace(pipeline_model_parallel_size=4), packed_sequences=True)
+        config._validate_packed_sequences(SimpleNamespace(pipeline_model_parallel_size=4), packed_sequences=True)
 
 
 def test_engram_hash_blocks_suffixes_after_excluded_token():
@@ -638,7 +566,7 @@ def test_engram_static_inference_cache_matches_full_sequence_hashing():
     module = engram_adapter.DeepseekV41Engram.__new__(engram_adapter.DeepseekV41Engram)
     torch.nn.Module.__init__(module)
     module.engram_config = SimpleNamespace(
-        excluded_token_ids=(99,),
+        excluded_token_ids=(99, ),
         max_ngram_order=3,
         num_hash_heads=1,
         hash_boundary_token_id=0,
@@ -684,8 +612,7 @@ def test_engram_packed_hashes_match_separately_hashed_documents():
     packed_row = torch.tensor([[5, 6, 7, 8, 9]])
     kwargs = _ngram_hash_kwargs()
 
-    packed = engram_adapter._build_ngram_hashes(
-        packed_row, cu_seqlens=torch.tensor([0, 2, 5]), **kwargs)
+    packed = engram_adapter._build_ngram_hashes(packed_row, cu_seqlens=torch.tensor([0, 2, 5]), **kwargs)
     separate = torch.cat(
         (
             engram_adapter._build_ngram_hashes(packed_row[:, :2], **kwargs),
@@ -718,8 +645,7 @@ def test_engram_rejects_cu_seqlens_that_does_not_cover_the_row():
 def _bare_engram(context_parallel_size=1, sequence_parallel=False):
     module = engram_adapter.DeepseekV41Engram.__new__(engram_adapter.DeepseekV41Engram)
     torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(
-        context_parallel_size=context_parallel_size, sequence_parallel=sequence_parallel)
+    module.config = SimpleNamespace(context_parallel_size=context_parallel_size, sequence_parallel=sequence_parallel)
     return module
 
 
@@ -767,8 +693,7 @@ def test_contiguous_cp_reconstruct_inverts_the_matching_split(monkeypatch):
         global_ids,
     )
     # The default zigzag layout must not be applied to a contiguous shard.
-    assert not torch.equal(
-        megatron_utils.reconstruct_tensor_cp(shard, None, dim=1), global_ids)
+    assert not torch.equal(megatron_utils.reconstruct_tensor_cp(shard, None, dim=1), global_ids)
 
 
 def test_engram_gathers_cp_sharded_input_ids_but_leaves_full_ones_alone(monkeypatch):
@@ -788,8 +713,7 @@ def test_engram_gathers_cp_sharded_input_ids_but_leaves_full_ones_alone(monkeypa
     module = _bare_engram(cp_size)
 
     shard = full_ids[:, cp_rank * local_length:(cp_rank + 1) * local_length]
-    assert torch.equal(
-        module._gather_input_ids_for_context_parallel(shard, local_length), full_ids)
+    assert torch.equal(module._gather_input_ids_for_context_parallel(shard, local_length), full_ids)
     # Multimodal models keep input_ids whole and split the embeddings instead.
     assert module._gather_input_ids_for_context_parallel(full_ids, local_length) is full_ids
     with pytest.raises(ValueError, match='matches neither'):
@@ -820,7 +744,7 @@ def test_engram_layer_spec_uses_bridge_owned_module():
         submodules=TransformerLayerSubmodules(),
     )
     block_spec = SimpleNamespace(layer_specs=[layer_spec])
-    config = SimpleNamespace(layer_ids=(1,))
+    config = SimpleNamespace(layer_ids=(1, ))
 
     engram_adapter.adapt_deepseek_v41_layer_specs(block_spec, config)
 
@@ -892,23 +816,6 @@ def test_dspark_bridge_uses_tp_layout_and_official_endpoint_names():
     ]
 
 
-def test_dspark_word_embeddings_resolver_prefers_base_then_dedicated():
-    resolver = DeepseekV41GPTModel._dspark_word_embeddings
-    model = DeepseekV41GPTModel.__new__(DeepseekV41GPTModel)
-    torch.nn.Module.__init__(model)
-    # Neither the base embedding nor a dedicated DSpark embedding is present.
-    with pytest.raises(RuntimeError):
-        resolver(model)
-    # A PP>1 last stage falls back to the dedicated DSpark embedding.
-    dedicated = object()
-    model.dspark_word_embeddings = dedicated
-    assert resolver(model) is dedicated
-    # When the base embedding is colocated it always takes priority.
-    base = object()
-    model.embedding = SimpleNamespace(word_embeddings=base)
-    assert resolver(model) is base
-
-
 def test_dspark_bridge_loads_dedicated_embedding_with_padding_and_tp_shard():
     bridge = DeepseekV41Bridge.__new__(DeepseekV41Bridge)
     bridge.hf_embed_key = 'model.embed.weight'
@@ -939,7 +846,8 @@ def test_engram_flat_fp8_table_is_dequantized_into_local_prime_shards():
     tables = [_Table(5, 1, 4, 4), _Table(7, 4, 7, 4)]
     engram = SimpleNamespace(
         embedding=SimpleNamespace(tables=tables),
-        layer_number=2,
+        # HF layer 1 -> doubled-space attention layer_number ``2 * 1 + 1``.
+        layer_number=3,
     )
     bridge = DeepseekV41Bridge.__new__(DeepseekV41Bridge)
     bridge.config = SimpleNamespace(engram_num_embeddings=[12], engram_layer_ids=[1])
@@ -978,6 +886,7 @@ def test_engram_flat_fp8_table_is_dequantized_into_local_prime_shards():
 
 
 def test_engram_dense_weights_are_dequantized_and_split_like_official_wkv():
+
     class _Lazy:
 
         def __init__(self, tensor):
@@ -991,8 +900,7 @@ def test_engram_dense_weights_are_dequantized_and_split_like_official_wkv():
         num_streams=num_streams,
         hidden_size=hidden_size,
         engram_config=SimpleNamespace(total_memory_dim=memory_dim),
-        key_projection=SimpleNamespace(
-            weight=torch.nn.Parameter(torch.empty(num_streams * hidden_size, memory_dim))),
+        key_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.empty(num_streams * hidden_size, memory_dim))),
         value_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.empty(hidden_size, memory_dim))),
         query_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.empty(num_streams * hidden_size))),
         key_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.empty(num_streams * hidden_size))),

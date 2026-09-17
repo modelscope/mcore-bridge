@@ -1,10 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""DeepSeek-V4.1-Flash (text backbone) bridge for megatron-core.
+"""DeepSeek-V4.1-Flash bridge for megatron-core.
 
-Wires the V4.1 *language* model (composite HF ``model_type='deepseek_v41'`` with
-text sub-config ``deepseek_v41_text``) into mcore-bridge. V4.1 reuses DeepSeek-V4's
-DSv4 hybrid MLA + hyper-connection stack but swaps the sparse-attention core to
-CSA2 (selected by ``config.dsv4_version == 'v4.1'``). Differences vs V4/CSA:
+Wires the V4.1 model (composite HF ``model_type='deepseek_v41'`` with text sub-config
+``deepseek_v41_text``) into mcore-bridge. V4.1 reuses DeepSeek-V4's DSv4 hybrid MLA +
+hyper-connection stack but swaps the sparse-attention core to CSA2 (selected by
+``config.dsv4_version == 'v4.1'``). Differences vs V4/CSA:
 
   * Compressor (``CSA2Compressor``): no absolute-position embedding (``ape``); the
     gate projection (``linear_wgate``) exists only on ratio-2 layers.
@@ -14,50 +14,54 @@ CSA2 (selected by ``config.dsv4_version == 'v4.1'``). Differences vs V4/CSA:
     ``hc_head_*`` params; per-layer ``hc_attn_*``/``hc_ffn_*`` are mapped by the
     base ``GPTBridge``.
 
-The text integration also attaches the native trainable Engram modules and
-loads their EP-local table rows directly from the official flat FP8 tensors.
-Vision, MTP and DSpark are integrated separately.
+The backbone is megatron-core's native ``HybridModel``, which splits every HF layer into an
+attention-only and an MLP-only hybrid layer. That split is what makes pipeline parallelism
+work: a plain ``TransformerBlock`` cannot carry the hyper-connection payload across PP
+stages. :func:`derive_hybrid_layer_config` re-expands the HF-space layer config into the
+doubled hybrid space, and :class:`DeepseekV41Bridge` fans each HF layer out onto its two
+hybrid layers.
 
-The V4.1 loader deliberately selects megatron-core's native TransformerBlock,
-whose forward owns the per-call CSA2State and SinglePassMHCState lifecycle. Other
-mcore-bridge models keep the custom TransformerBlock path.
+The text integration also attaches the native trainable Engram modules -- loading their
+EP-local table rows directly from the official flat FP8 tensors -- and the DSpark (``mtp.*``)
+draft stack. Vision is wired in :class:`DeepseekV41MultimodalModel`.
+
+Requires a megatron-core that ships ``megatron.core.models.hybrid``; without it V4.1 is not
+registered at all (see ``_HYBRID_MODEL_AVAILABLE``).
 """
 import copy
 import os
-from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
+from typing import List, Optional, Sequence, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import transformer_engine
-from megatron.core import parallel_state
+from megatron.core import mpu, parallel_state
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock as McoreTransformerBlock
 from torch import nn
-from typing import Optional
+from tqdm import tqdm
 
 from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (
-    adapt_deepseek_v41_layer_specs,
-    allow_engram_inference,
     build_deepseek_v41_engram_config,
+    DeepseekV41Engram,
+    DeepseekV41TransformerLayer,
     has_native_engram,
 )
+from mcore_bridge.utils import is_master
 
 from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
-from .deepseek_v4 import (
-    _apply_mla_rope,
-    DeepseekV4Bridge,
-    DeepseekV4GPTModel,
-    DeepseekV4Loader,
-    DSv4HybridSelfAttention,
-)
+from ..rope import get_rope_inv_freq
+from .deepseek_v4 import _apply_mla_rope, DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention
 
 try:
     from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2Compressor as McoreCSA2Compressor
@@ -65,6 +69,19 @@ try:
 except ImportError:
     McoreCSA2Compressor = object
     McoreCSA2Indexer = object
+
+try:
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
+    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_dsv4_stack_spec
+
+    from ..hybrid_model import HybridModel
+
+    _HYBRID_MODEL_AVAILABLE = True
+except ImportError as error:
+    if not (error.name or '').startswith('megatron.core.models.hybrid'):
+        raise
+    HybridModel = hybrid_dsv4_stack_spec = HyperConnectionHybridLayer = None
+    _HYBRID_MODEL_AVAILABLE = False
 
 
 def _duplicated_linear_kwargs(config):
@@ -110,8 +127,8 @@ class DeepseekV41DSparkCoreAttention(MegatronModule):
         if config.num_attention_heads % world_size:
             raise ValueError('DSpark attention heads must be divisible by tensor parallel size.')
         device = 'cpu' if config.use_cpu_initialization else torch.cuda.current_device()
-        self.attn_sink = mark_keep_in_fp32(nn.Parameter(
-            torch.zeros(config.num_attention_heads // world_size, dtype=torch.float32, device=device)))
+        self.attn_sink = mark_keep_in_fp32(
+            nn.Parameter(torch.zeros(config.num_attention_heads // world_size, dtype=torch.float32, device=device)))
 
 
 class CSA2Indexer(McoreCSA2Indexer):
@@ -127,7 +144,7 @@ class CSA2Indexer(McoreCSA2Indexer):
             linear_kwargs = _duplicated_linear_kwargs(config)
             with transformer_engine.pytorch.fp8_model_init(enabled=False):
                 self.linear_weights_proj = build_module(submodules.linear_weights_proj, config.hidden_size,
-                                                         self.n_heads, **linear_kwargs)
+                                                        self.n_heads, **linear_kwargs)
                 if self.owns_k:
                     self.linear_wk = build_module(submodules.linear_wk, config.v_head_dim, self.head_dim,
                                                   **linear_kwargs)
@@ -171,8 +188,7 @@ class DeepseekV41DSparkAttention(DSv4HybridSelfAttention):
             self.q_head_dim,
         )
         pos_dim = self.config.qk_pos_emb_head_dim
-        query_no_pe, query_pos_emb = torch.split(
-            query, [query.shape[-1] - pos_dim, pos_dim], dim=-1)
+        query_no_pe, query_pos_emb = torch.split(query, [query.shape[-1] - pos_dim, pos_dim], dim=-1)
         query_pos_emb = _apply_mla_rope(
             query_pos_emb,
             rotary_pos_emb,
@@ -202,22 +218,19 @@ class DeepseekV41DSparkAttention(DSv4HybridSelfAttention):
             cache_slots = torch.arange(batch_size, dtype=torch.long, device=device)
         else:
             cache_slots = cache_slots.to(device=device, dtype=torch.long)
-        if cache_slots.shape != (batch_size,):
-            raise ValueError(
-                f'DSpark cache slots must be [b={batch_size}], got {tuple(cache_slots.shape)}.')
+        if cache_slots.shape != (batch_size, ):
+            raise ValueError(f'DSpark cache slots must be [b={batch_size}], got {tuple(cache_slots.shape)}.')
         start_positions = torch.as_tensor(start_pos, dtype=torch.long, device=device)
         if start_positions.ndim == 0:
             start_positions = start_positions.expand(batch_size)
-        if start_positions.shape != (batch_size,):
-            raise ValueError(
-                f'DSpark start positions must be scalar or [b={batch_size}], got '
-                f'{tuple(start_positions.shape)}.')
+        if start_positions.shape != (batch_size, ):
+            raise ValueError(f'DSpark start positions must be scalar or [b={batch_size}], got '
+                             f'{tuple(start_positions.shape)}.')
         return start_positions, cache_slots
 
     def _write_main_cache(self, main_kv, start_pos, cache_slots=None):
         main_kv = main_kv.squeeze(-2)
-        start_positions, cache_slots = self._normalize_cache_inputs(
-            main_kv, start_pos, cache_slots)
+        start_positions, cache_slots = self._normalize_cache_inputs(main_kv, start_pos, cache_slots)
         cache = self._ensure_cache(
             int(cache_slots.max().item()) + 1,
             main_kv.shape[-1],
@@ -266,7 +279,7 @@ class DeepseekV41DSparkAttention(DSv4HybridSelfAttention):
             scores = scores.masked_fill(invalid[:, None, None, :], float('-inf'))
         sink = self.core_attention.attn_sink.view(1, -1, 1, 1)
         probabilities = torch.softmax(
-            torch.cat((scores, sink.expand(scores.shape[:-1] + (1,))), dim=-1),
+            torch.cat((scores, sink.expand(scores.shape[:-1] + (1, ))), dim=-1),
             dim=-1,
             dtype=torch.float32,
         )[..., :-1]
@@ -318,8 +331,7 @@ class DeepseekV41DSparkAttention(DSv4HybridSelfAttention):
             raise ValueError('DSpark attention requires main and draft rotary embeddings.')
 
         main_kv = self._project_kv(dspark_main_hidden, main_rotary)
-        main_window, valid_main = self._write_main_cache(
-            main_kv, start_pos, dspark_cache_slots)
+        main_window, valid_main = self._write_main_cache(main_kv, start_pos, dspark_cache_slots)
         main_window = main_window.unsqueeze(-2)
         query = self._project_query(hidden_states, draft_rotary)
         draft_kv = self._project_kv(hidden_states, draft_rotary)
@@ -327,8 +339,7 @@ class DeepseekV41DSparkAttention(DSv4HybridSelfAttention):
         output = self._latent_attention(query, key_value, valid_main)
 
         pos_dim = self.config.qk_pos_emb_head_dim
-        output_no_pe, output_pos_emb = torch.split(
-            output, [output.shape[-1] - pos_dim, pos_dim], dim=-1)
+        output_no_pe, output_pos_emb = torch.split(output, [output.shape[-1] - pos_dim, pos_dim], dim=-1)
         output_pos_emb = _apply_mla_rope(
             output_pos_emb,
             draft_rotary,
@@ -379,9 +390,8 @@ class DeepseekV41PatchEmbed(nn.Module):
 
     def forward(self, patches: torch.Tensor):
         if patches.ndim not in (2, 4):
-            raise ValueError(
-                'DeepSeek-V4.1 pixel_values must be [num_patches, 3, patch, patch] '
-                f'or flattened [num_patches, 3 * patch ** 2], got {tuple(patches.shape)}.')
+            raise ValueError('DeepSeek-V4.1 pixel_values must be [num_patches, 3, patch, patch] '
+                             f'or flattened [num_patches, 3 * patch ** 2], got {tuple(patches.shape)}.')
         return self.proj(patches.flatten(1))
 
 
@@ -398,10 +408,7 @@ class DeepseekV41VisionAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
         num_tokens = x.shape[0]
-        q, k, v = (
-            tensor.view(num_tokens, self.num_heads, self.head_dim)
-            for tensor in self.wqkv(x).chunk(3, dim=-1)
-        )
+        q, k, v = (tensor.view(num_tokens, self.num_heads, self.head_dim) for tensor in self.wqkv(x).chunk(3, dim=-1))
         q = _apply_vision_rotary(q, cos, sin)
         k = _apply_vision_rotary(k, cos, sin)
         output = F.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
@@ -451,8 +458,7 @@ class DeepseekV41VisionTransformer(nn.Module):
 
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int):
         if patches.shape[0] != n_h * n_w:
-            raise ValueError(
-                f'Image grid {n_h}x{n_w} requires {n_h * n_w} patches, got {patches.shape[0]}.')
+            raise ValueError(f'Image grid {n_h}x{n_w} requires {n_h * n_w} patches, got {patches.shape[0]}.')
         x = self.patch_embed(patches)
         cos, sin = _vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta, x.device)
         for block in self.blocks:
@@ -539,7 +545,8 @@ class DeepseekV41Vision(nn.Module):
             outputs.append(self.aligner(self.vision(patches, n_h, n_w), n_h, n_w))
             patch_offset += patch_count
         if patch_offset != pixel_values.shape[0]:
-            raise ValueError(f'Image grids describe {patch_offset} patches, but pixel_values has {pixel_values.shape[0]}.')
+            raise ValueError(
+                f'Image grids describe {patch_offset} patches, but pixel_values has {pixel_values.shape[0]}.')
         if not outputs:
             return pixel_values.new_empty((0, self.image_start.numel()))
         return torch.cat(outputs, dim=0)
@@ -559,20 +566,19 @@ class DeepseekV41Vision(nn.Module):
         if image_grid_thw is None or token_types is None:
             raise ValueError('DeepSeek-V4.1 vision requires image_grid_thw and image_token_types/token_types.')
         if token_types.shape != kwargs['input_ids'].shape:
-            raise ValueError(
-                f'image token types shape {tuple(token_types.shape)} must match input_ids '
-                f'{tuple(kwargs["input_ids"].shape)}.')
+            raise ValueError(f'image token types shape {tuple(token_types.shape)} must match input_ids '
+                             f'{tuple(kwargs["input_ids"].shape)}.')
 
         image_mask = token_types >= 0
         input_image_mask = kwargs['input_ids'] == self.image_token_id
         if not torch.equal(image_mask.to(input_image_mask.device), input_image_mask):
-            raise ValueError('Every DeepSeek-V4.1 image-span position must carry image_token_id, and no text position may use it.')
+            raise ValueError(
+                'Every DeepSeek-V4.1 image-span position must carry image_token_id, and no text position may use it.')
         image_features = self.encode_images(pixel_values.to(self.vision.patch_embed.proj.weight), image_grid_thw)
         flat_types = token_types[image_mask].to(device=inputs_embeds.device)
         if int((flat_types == self.IMAGE).sum()) != image_features.shape[0]:
-            raise ValueError(
-                f'Image spans contain {int((flat_types == self.IMAGE).sum())} patch slots, '
-                f'but the aligner produced {image_features.shape[0]} rows.')
+            raise ValueError(f'Image spans contain {int((flat_types == self.IMAGE).sum())} patch slots, '
+                             f'but the aligner produced {image_features.shape[0]} rows.')
         replacements = inputs_embeds.new_empty((flat_types.numel(), inputs_embeds.shape[-1]))
         replacements[flat_types == self.IMAGE_START] = self.image_start.to(inputs_embeds.dtype)
         replacements[flat_types == self.IMAGE_END] = self.image_end.to(inputs_embeds.dtype)
@@ -584,318 +590,562 @@ class DeepseekV41Vision(nn.Module):
         return inputs_embeds.masked_scatter(expanded_mask, replacements)
 
 
-class DeepseekV41GPTModel(DeepseekV4GPTModel):
-    """V4.1 language model with opt-in DSpark target-layer capture.
+@dataclass
+class HybridLayerConfig:
+    """Per-layer config re-expanded from HF layer space into hybrid (2x) layer space.
 
-    DSpark consumes the attention inputs of its target layers. The official target
-    IDs are zero-based; Megatron layer numbers are one-based. Capturing is opt-in
-    so regular training does not retain three large activation graphs.
+    All source-layer / candidate fields are 0-based indices in the doubled hybrid space
+    (i.e. ``layer_number - 1`` as CSA2 reads them), where GPT layer ``i`` maps to hybrid
+    attention layer ``2 * i``.
     """
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._capture_dspark_hidden = False
-        self._dspark_hidden_states = {}
-        self._dspark_hook_handles = []
-        target_ids = tuple(self.config.dspark_target_layer_ids or ())
-        for layer in self.decoder.layers:
-            layer_id = layer.layer_number - 1
-            if layer_id not in target_ids:
-                continue
-            self._dspark_hook_handles.append(
-                layer.register_forward_pre_hook(self._make_dspark_capture_hook(layer_id), with_kwargs=True))
+    hybrid_layer_pattern: str
+    num_layers: int
+    csa_compress_ratios: List[int]
+    csa2_kv_source_layers: List[int]
+    csa2_index_source_layers: List[int]
+    csa2_candidate_source_layer: Optional[int]
 
-    @staticmethod
-    def _contract_dspark_target_hidden(hidden_states: torch.Tensor, num_streams: int):
-        if hidden_states.ndim != 3:
-            raise ValueError(f'DSpark target hidden states must be [s, b, n*h], got {tuple(hidden_states.shape)}.')
-        if hidden_states.shape[-1] % num_streams:
-            raise ValueError(
-                f'DSpark target hidden width {hidden_states.shape[-1]} is not divisible by {num_streams} streams.')
-        return hidden_states.unflatten(-1, (num_streams, -1)).mean(dim=-2)
 
-    def _make_dspark_capture_hook(self, layer_id):
+def _normalize_moe_layer_freq(moe_layer_freq: Union[int, Sequence[int], None], num_layers: int) -> List[int]:
+    """Return a length-``num_layers`` 0/1 list marking MoE layers.
 
-        def _capture(_module, args, kwargs):
-            if not self._capture_dspark_hidden:
-                return
-            hidden_states = kwargs.get('hidden_states')
-            if hidden_states is None and args:
-                hidden_states = args[0]
-            if hidden_states is None:
-                raise ValueError(f'Could not capture the attention input for DSpark target layer {layer_id}.')
-            self._dspark_hidden_states[layer_id] = self._contract_dspark_target_hidden(
-                hidden_states, self.config.num_residual_streams)
+    Mirrors megatron-core's own interpretation (moe_logging.py:660-664): an ``int`` N means
+    layer ``i`` is MoE iff ``i % N == 0``; a list is used verbatim. ``None`` (no experts)
+    means every layer is dense.
+    """
+    if moe_layer_freq is None:
+        return [0] * num_layers
+    if isinstance(moe_layer_freq, int):
+        return [1 if i % moe_layer_freq == 0 else 0 for i in range(num_layers)]
+    freq = list(moe_layer_freq)
+    if len(freq) != num_layers:
+        raise ValueError(f'moe_layer_freq length {len(freq)} does not match num_layers {num_layers}.')
+    return [1 if x else 0 for x in freq]
 
-        return _capture
 
-    @contextmanager
-    def capture_dspark_hidden_states(self):
-        if not self.config.dspark_target_layer_ids:
-            raise ValueError('DSpark target-layer capture requested, but DSpark is not configured.')
-        self._dspark_hidden_states = {}
-        self._capture_dspark_hidden = True
-        try:
-            yield
-        finally:
-            self._capture_dspark_hidden = False
+def derive_hybrid_layer_config(
+    num_layers: int,
+    csa_compress_ratios: Sequence[int],
+    moe_layer_freq: Union[int, Sequence[int], None],
+    csa2_kv_source_layers: Sequence[int] = (),
+    csa2_index_source_layers: Sequence[int] = (),
+    csa2_candidate_source_layer: Optional[int] = None,
+) -> HybridLayerConfig:
+    """Translate an HF-space V4.1 config into the doubled hybrid layer space.
 
-    def get_dspark_main_hidden(self, clear: bool = True):
-        target_ids = tuple(self.config.dspark_target_layer_ids or ())
-        missing = [layer_id for layer_id in target_ids if layer_id not in self._dspark_hidden_states]
-        if missing:
-            raise RuntimeError(
-                f'DSpark target layers {missing} were not captured on this pipeline rank. '
-                'The DSpark draft stack must be colocated with all target layers.')
-        result = torch.cat([self._dspark_hidden_states[layer_id] for layer_id in target_ids], dim=-1)
-        if clear:
-            self._dspark_hidden_states = {}
-        return result
+    Each HF transformer layer ``i`` (0-based) becomes two hybrid layers:
 
-    def forward(self, *args, **kwargs):
-        input_ids = kwargs.get('input_ids', args[0] if args else None)
-        inference_context = kwargs.get('inference_context') or kwargs.get('inference_params')
-        if inference_context is None and len(args) > 5:
-            inference_context = args[5]
-        extra_block_kwargs = kwargs.get('extra_block_kwargs')
-        if extra_block_kwargs is None and len(args) > 7:
-            extra_block_kwargs = args[7]
+    * hybrid index ``2*i`` -- attention-only, always the array-driven ``D`` symbol so it
+      reads its ratio from ``csa_compress_ratios[2*i]`` and stays numerically identical to
+      the GPT ``dsv4_hybrid`` attention layer (baking a fixed ratio via ``C``/``H``/``W``
+      would instead trip the ``compress_ratio != ratio`` guard in csa2.py:1280).
+    * hybrid index ``2*i + 1`` -- MLP-only, ``E`` if the layer is MoE else ``-``.
 
-        with allow_engram_inference(self.config, input_ids, extra_block_kwargs) as block_kwargs:
-            if len(args) > 7:
-                args = (*args[:7], block_kwargs, *args[8:])
-            else:
-                kwargs['extra_block_kwargs'] = block_kwargs
-            capture_dspark = (
-                hasattr(self, 'dspark')
-                and not self.training
-                and inference_context is not None
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
-            if not capture_dspark:
-                return super().forward(*args, **kwargs)
-            if inference_context.using_cuda_graph_this_step():
-                raise RuntimeError('DSpark speculative decoding does not support CUDA graph replay yet.')
-            with self.capture_dspark_hidden_states():
-                return super().forward(*args, **kwargs)
+    Because CSA2 indexes every per-layer array by ``layer_number - 1``, the compress ratios
+    and the kv/index/candidate source layers are re-expanded so a GPT source layer ``j``
+    lands on hybrid attention index ``2*j`` (MLP slots get ratio 0 and are never read).
+    """
+    if len(csa_compress_ratios) != num_layers:
+        raise ValueError(
+            f'csa_compress_ratios length {len(csa_compress_ratios)} does not match num_layers {num_layers}.')
+    moe_mask = _normalize_moe_layer_freq(moe_layer_freq, num_layers)
 
-    def _dspark_rotary_for_positions(self, position_ids: torch.Tensor):
-        if self.position_embedding_type != 'rope' or self.rotary_pos_emb is None:
-            raise RuntimeError('DSpark requires RoPE position embeddings.')
-        position_ids = position_ids.to(dtype=torch.long)
-        max_position = int(position_ids.max().item()) + 1
-        rotary_table = self.rotary_pos_emb(max_position)
-        if isinstance(rotary_table, dict):
-            rotary_table = rotary_table['main']
-        selected = rotary_table.index_select(0, position_ids.reshape(-1))
-        # Drop the table's singleton batch dimension. The requested position tensor
-        # supplies the batch axes for packed main tokens or the parallel draft block.
-        return selected.reshape(*position_ids.shape, *rotary_table.shape[2:])
+    pattern_chars: List[str] = []
+    hybrid_ratios: List[int] = []
+    for i in range(num_layers):
+        # attention-only layer (array-driven DSv4 attention)
+        pattern_chars.append('D')
+        hybrid_ratios.append(int(csa_compress_ratios[i]))
+        # MLP-only layer
+        pattern_chars.append('E' if moe_mask[i] else '-')
+        hybrid_ratios.append(0)
 
-    def _dspark_word_embeddings(self):
-        """Return the token embedding DSpark uses to embed its draft seed.
+    def _remap(layers: Sequence[int]) -> List[int]:
+        return [2 * int(j) for j in layers]
 
-        On a single stage (or a standard-MTP stage) the base input embedding is
-        colocated and reused. On a PP>1 last stage with untied embeddings the base
-        model has no ``embedding``; a dedicated replicated DSpark embedding built
-        in ``build_model`` and loaded from ``model.embed_tokens.weight`` is used.
+    return HybridLayerConfig(
+        hybrid_layer_pattern=''.join(pattern_chars),
+        num_layers=2 * num_layers,
+        csa_compress_ratios=hybrid_ratios,
+        csa2_kv_source_layers=_remap(csa2_kv_source_layers),
+        csa2_index_source_layers=_remap(csa2_index_source_layers),
+        csa2_candidate_source_layer=(None if csa2_candidate_source_layer is None else 2
+                                     * int(csa2_candidate_source_layer)),
+    )
+
+
+if _HYBRID_MODEL_AVAILABLE:
+
+    class DeepseekV41HyperConnectionHybridLayer(HyperConnectionHybridLayer):
+        """Hyper-connection wrapper that applies Engram on the n-stream residual, matching GPT.
+
+        The GPT single-pass path (``HyperConnectionTransformerLayer._forward_attention``, upstream
+        transformer_layer.py) applies Engram to the *n-stream* residual (width
+        ``num_residual_streams * hidden_size``) **before** the self-attention hyper-connection
+        aggregates it to a single stream::
+
+            hidden_states = self._maybe_apply_engram(hidden_states, input_ids)   # n-stream, 20480
+            hidden_states, ... = self.self_attention_hyper_connection(hidden_states, ...)  # -> 1 stream
+
+        HybridStack inverts that order: :meth:`HyperConnectionHybridLayer.forward` aggregates first
+        (``self.hyper_connection(hidden_states)``) and runs the inner layer on the single aggregated
+        stream, and its eager fast path (``_call_inner_transformer_layer_without_local_bda``, taken
+        for the attention-only 'D' layer) calls ``_forward_self_attention_output_with_bias``
+        directly, which skips ``_maybe_apply_engram`` entirely. So the base wrapper either drops
+        Engram (fast path) or -- if the fast path is declined -- applies it on the aggregated
+        *single*-stream tensor, which is both the wrong width (``hidden_size`` vs.
+        ``num_streams * hidden_size``) and the wrong point in the residual.
+
+        We therefore apply Engram here, on the incoming n-stream ``hidden_states``, before
+        delegating to the base wrapper forward (aggregation + fast-path attention), so the Engram
+        contribution lands on the pre-aggregation streams. The inner ``DeepseekV41TransformerLayer`` keeps its
+        ``engram`` module only so the bridge can load/export its weights; the base fast path never
+        calls it, so there is no double add. Non-Engram layers keep the base wrapper untouched (this
+        subclass is only swapped onto Engram-carrying wrappers, see
+        :meth:`DeepseekV41Loader._rewrap_engram_hyper_connection_layers`).
+
+        The fast path is also invoked by the CUDA-graph capture body, which is out of scope for this
+        change (plan: no CUDA Graph).
         """
-        if hasattr(self, 'embedding'):
-            return self.embedding.word_embeddings
-        dspark_embedding = getattr(self, 'dspark_word_embeddings', None)
-        if dspark_embedding is None:
-            raise RuntimeError(
-                'DSpark requires an input word embedding on its pipeline stage, but neither '
-                'the base embedding nor a dedicated DSpark embedding is present.')
-        return dspark_embedding
 
-    def forward_dspark(
-        self,
-        main_hidden,
-        input_ids,
-        *,
-        start_pos,
-        rotary_pos_emb,
-        main_rotary_pos_emb,
-        inference_context=None,
-        temperature=0.0,
-        sample_fn=None,
-        cache_slots=None,
-        prefill_only=None,
-    ):
-        if not hasattr(self, 'dspark'):
-            raise RuntimeError('DSpark is not available on this pipeline stage.')
-        if not hasattr(self, 'output_layer'):
-            raise RuntimeError('DSpark requires the output head on its pipeline stage.')
-        return self.dspark(
-            main_hidden,
-            input_ids,
-            self._dspark_word_embeddings(),
-            self.output_layer,
-            start_pos=start_pos,
-            rotary_pos_emb=rotary_pos_emb,
-            main_rotary_pos_emb=main_rotary_pos_emb,
-            inference_context=inference_context,
-            temperature=temperature,
-            sample_fn=sample_fn,
-            cache_slots=cache_slots,
-            prefill_only=prefill_only,
-        )
+        def forward(self,
+                    hidden_states,
+                    attention_mask=None,
+                    inference_context=None,
+                    rotary_pos_emb=None,
+                    sequence_len_offset=None,
+                    packed_seq_params=None,
+                    padding_mask=None,
+                    input_ids=None,
+                    mhc_recompute_manager=None,
+                    mhc_state=None,
+                    **layer_kwargs):
+            engram = getattr(self.inner_layer, 'engram', None)
+            if engram is not None:
+                if input_ids is None:
+                    raise ValueError('DeepSeek-V4.1 hybrid Engram requires input token IDs on the layer forward.')
+                # ``Engram.forward`` reads the THD / inference context off the module itself
+                # (mirrors ``_DeepseekV41EngramLayerMixin._forward_attention``), so stash it for
+                # the duration of this call and add the n-stream Engram delta like
+                # ``TransformerLayer._maybe_apply_engram``.
+                previous_ctx = getattr(engram, '_bridge_inference_context', None)
+                previous_pack = getattr(engram, '_bridge_packed_seq_params', None)
+                engram._bridge_inference_context = inference_context
+                engram._bridge_packed_seq_params = packed_seq_params
+                try:
+                    hidden_states = hidden_states + engram(hidden_states, input_ids, inference_context)
+                finally:
+                    engram._bridge_inference_context = previous_ctx
+                    engram._bridge_packed_seq_params = previous_pack
+            return super().forward(
+                hidden_states,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                sequence_len_offset=sequence_len_offset,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+                mhc_recompute_manager=mhc_recompute_manager,
+                **({
+                    'mhc_state': mhc_state
+                } if mhc_state is not None else {}),
+                **layer_kwargs,
+            )
 
-    def compute_dspark_speculative_tokens(
-        self,
-        next_token_ids,
-        accepted_token_counts,
-        last_accepted_seq_indices,
-        num_speculative_tokens,
-        inference_context,
-        sample_fn,
-    ):
-        """Commit verified target states and produce one parallel DSpark draft block."""
-        if inference_context.using_cuda_graph_this_step():
-            raise RuntimeError('DSpark speculative decoding does not support CUDA graph replay yet.')
-        if num_speculative_tokens > self.config.dspark_block_size:
-            raise ValueError(
-                f'Requested {num_speculative_tokens} speculative tokens, but DSpark block size is '
-                f'{self.config.dspark_block_size}.')
+    class DeepseekV41HybridStackModel(HybridModel):
+        """``HybridModel`` that splits PP / VPP stages on complete attention+FFN blocks.
 
-        main_hidden = self.get_dspark_main_hidden()
-        if self.config.sequence_parallel and parallel_state.get_tensor_model_parallel_world_size() > 1:
-            main_hidden = gather_from_sequence_parallel_region(main_hidden, group=self.tp_group)
-        if main_hidden.ndim != 3 or main_hidden.shape[1] != 1:
-            raise RuntimeError(
-                'DSpark dynamic inference expects packed target states [tokens, 1, targets*h], '
-                f'got {tuple(main_hidden.shape)}.')
+        Upstream ``select_pipeline_segment`` (called inside ``HybridModel.__init__``,
+        hybrid_model.py:265) handles the split, but for a pattern *without* ``|`` separators it
+        (a) refuses VPP outright and (b) slices the ``2 * num_layers`` sublayers evenly, which
+        cuts a ``D``/``E`` block across a stage boundary whenever ``2N // stages`` is odd. Either
+        breaks :class:`DeepseekV41Bridge`, whose 1-HF-layer -> 2-hybrid-layer fan-out
+        assumes the attention half (``2 * i``) and its MLP half (``2 * i + 1``) are co-resident.
 
-        active_count = inference_context.total_request_count - inference_context.paused_request_count
-        active_slice = slice(inference_context.paused_request_count, inference_context.total_request_count)
-        query_lengths = inference_context.request_query_lengths[active_slice].to(dtype=torch.long)
-        active_token_count = int(query_lengths.sum().item())
-        if main_hidden.shape[0] != active_token_count:
-            raise RuntimeError(
-                f'DSpark captured {main_hidden.shape[0]} target rows for {active_token_count} active tokens.')
+        Mirroring GLM-5.3 (``Glm5NextHybridModel``), we pre-segment the *main* pattern on block
+        boundaries into ``|``-delimited, PP*VPP-ordered stages before it reaches upstream, and
+        assert after build that this rank holds whole blocks -- failing loudly instead of
+        mis-mapping weights. The MTP suffix is still appended by the base resolver, so a
+        segmented main becomes ``seg0|seg1|.../mtp``.
+        """
 
-        device = main_hidden.device
-        request_ids = inference_context.request_ids[active_slice].to(device=device, dtype=torch.long)
-        live_request_ids = inference_context.request_ids[:inference_context.total_request_count].to(
-            device=device, dtype=torch.long)
-        cache_slots = self.dspark.resolve_cache_slots(request_ids, live_request_ids)
-        token_positions = inference_context.token_to_position_in_request[:active_token_count].to(
-            device=device, dtype=torch.long)
-        accepted_token_counts = accepted_token_counts[:active_count].to(device='cpu', dtype=torch.long)
+        # This backbone is text-only, but ``deepseek_v41`` is a multimodal model_type, so the
+        # trainer's ``is_multimodal`` path reads ``model.visual`` (expecting ``None`` for text).
+        # Expose it so that guard short-circuits; the real vision tower arrives with
+        # :class:`DeepseekV41MultimodalModel`.
+        visual = None
 
-        offset = 0
-        for request_index, query_length in enumerate(query_lengths.tolist()):
-            if request_index < inference_context.num_decode_requests:
-                accepted_length = min(query_length, int(accepted_token_counts[request_index].item()) + 1)
-            else:
-                accepted_length = query_length
-            if accepted_length:
-                token_slice = slice(offset, offset + accepted_length)
-                positions = token_positions[token_slice]
-                if positions.numel() > 1 and not torch.all(positions[1:] == positions[:-1] + 1):
-                    raise RuntimeError('DSpark cache updates require contiguous per-request token positions.')
-                self.dspark.update_main_cache(
-                    main_hidden[token_slice],
-                    self._dspark_rotary_for_positions(positions),
-                    start_pos=positions[0],
-                    cache_slots=cache_slots[request_index:request_index + 1],
-                    inference_context=inference_context,
-                )
-            offset += query_length
+        # ``MultimodalGPTModel.forward`` (the multimodal wrapper) reads ``language_model.extra_forward_keys``
+        # to forward a whitelist of extra kwargs into the decoder. ``McoreHybridModel`` has no such
+        # attribute (it lives on the mcore-bridge ``GPTModel``, default ``[]``); expose the same
+        # empty default so the wrapper can treat this backbone like any mcore-bridge ``GPTModel``.
+        extra_forward_keys: List[str] = []
 
-        last_indices = last_accepted_seq_indices[:active_count].to(device=device, dtype=torch.long)
-        last_hidden = main_hidden.index_select(0, last_indices).transpose(0, 1).contiguous()
-        main_positions = token_positions.index_select(0, last_indices)
-        draft_positions = main_positions.unsqueeze(0) + 1 + torch.arange(
-            self.config.dspark_block_size, device=device).unsqueeze(1)
-        output_ids, _, _ = self.forward_dspark(
-            last_hidden,
-            next_token_ids[:active_count],
-            start_pos=main_positions,
-            rotary_pos_emb=self._dspark_rotary_for_positions(draft_positions),
-            main_rotary_pos_emb=self._dspark_rotary_for_positions(main_positions),
-            inference_context=inference_context,
-            sample_fn=sample_fn,
-            cache_slots=cache_slots,
-            prefill_only=False,
-        )
-        return output_ids[:, 1:num_speculative_tokens + 1].transpose(0, 1).contiguous()
+        @staticmethod
+        def _segment_main_pattern(config) -> Optional[str]:
+            pattern = config.hybrid_layer_pattern
+            if getattr(config, 'pipeline_model_parallel_layout', None) is not None:
+                raise ValueError('DeepSeek-V4.1 hybrid splits pipeline stages by hybrid_layer_pattern, so '
+                                 'pipeline_model_parallel_layout does not apply; use '
+                                 'num_layers_in_first_pipeline_stage / num_layers_in_last_pipeline_stage for an '
+                                 'uneven split.')
+            # An explicit layout is respected as-is; upstream + the post-build guard validate it.
+            if (not pattern or '|' in pattern or config.num_layers_in_first_pipeline_stage is not None
+                    or config.num_layers_in_last_pipeline_stage is not None):
+                return pattern
+            stages = config.pipeline_model_parallel_size
+            if config.virtual_pipeline_model_parallel_size:
+                stages *= config.virtual_pipeline_model_parallel_size
+            if stages <= 1:
+                return pattern
+            blocks, extra = divmod(len(pattern) // 2, stages)
+            if blocks == 0:
+                raise ValueError('DeepSeek-V4.1 hybrid needs at least one attention+FFN block per pipeline stage, '
+                                 f'but {len(pattern) // 2} blocks cannot cover {stages} stages; lower '
+                                 'pipeline_model_parallel_size / virtual_pipeline_model_parallel_size.')
+            # Consecutive segments map to (vp0,pp0),(vp0,pp1),... matching upstream's
+            # segment_index = vp_stage * pp_size + pp_rank (hybrid_layer_allocation.py:478).
+            segments, offset = [], 0
+            for stage in range(stages):
+                count = 2 * (blocks + int(stage < extra))
+                segments.append(pattern[offset:offset + count])
+                offset += count
+            return '|'.join(segments)
 
+        @staticmethod
+        def _resolve_hybrid_layer_pattern(config) -> Optional[str]:
+            segmented = DeepseekV41HybridStackModel._segment_main_pattern(config)
+            if segmented == config.hybrid_layer_pattern:
+                return HybridModel._resolve_hybrid_layer_pattern(config)
+            seg_config = copy.copy(config)
+            seg_config.hybrid_layer_pattern = segmented
+            return HybridModel._resolve_hybrid_layer_pattern(seg_config)
 
-class DeepseekV41MultimodalGPTModel(MultimodalGPTModel):
-    language_model_cls = DeepseekV41GPTModel
+        def __init__(self, config, transformer_layer_spec, pre_process=True, post_process=True, vp_stage=None):
+            super().__init__(config, transformer_layer_spec, pre_process, post_process, vp_stage)
+            # A stage holding a partial block would break the HF-layer fan-out in the bridge.
+            layers = getattr(self.decoder, 'layers', None) or []
+            if layers:
+                offset = layers[0].layer_number - 1
+                count = len(layers)
+                if offset % 2 or count % 2:
+                    raise ValueError('DeepSeek-V4.1 hybrid pipeline stage boundaries must fall on complete '
+                                     f'attention+FFN blocks, but this stage starts at sublayer {offset} and holds '
+                                     f'{count} sublayers (both must be even, since one block is two sublayers). '
+                                     'Leave num_layers_in_first_pipeline_stage / num_layers_in_last_pipeline_stage '
+                                     'unset for an even block-aligned split, or pass even values.')
+            # ``HybridModel.forward`` builds no model-level RoPE for ``multi_latent_attention`` and
+            # hard-sets ``rotary_pos_emb=None`` when calling the decoder. The reused DSv4 attention
+            # (shared with V4) instead expects the decoupled ``{'main', 'compress'}`` dict
+            # that ``DeepseekV4GPTModel`` builds. Build the same two RoPE tables here and inject the
+            # dict into the decoder via a forward pre-hook, keeping the attention numerically
+            # identical to the GPTModel baseline. ``get_rotary_seq_len`` reads ``decoder.input_tensor``
+            # when the local ``hidden_states`` is ``None``, so this also covers PP intermediate/last
+            # stages.
+            self._dsv4_position_ids = None
+            self._build_dsv4_rotary_tables()
+            self.decoder.register_forward_pre_hook(self._inject_dsv4_rotary_pos_emb, with_kwargs=True)
 
-    @property
-    def vocab_size(self):
-        return self.language_model.vocab_size
+        def _build_dsv4_rotary_tables(self):
+            """Build the MLA decoupled-RoPE ``main``/``compress`` tables (mirrors
+            ``mcore_bridge.model.gpt_model.GPTModel`` MLA setup + ``DeepseekV4GPTModel._set_inv_freq``)."""
+            self.rotary_pos_emb = RotaryEmbedding(
+                kv_channels=self.config.qk_pos_emb_head_dim,
+                rotary_percent=1,
+                rotary_interleaved=self.config.rotary_interleaved,
+                rotary_base=self.config.rotary_base,
+                use_cpu_initialization=self.config.use_cpu_initialization,
+            )
+            rope_scaling = self.config.rope_scaling
+            self.config.rope_scaling = rope_scaling['main']
+            new_inv_freq, attention_scaling = get_rope_inv_freq(self.config)
+            self.rotary_pos_emb.inv_freq = new_inv_freq.to(self.rotary_pos_emb.inv_freq.device)
+            self.config.attention_scaling = attention_scaling
+            # compress
+            self.compress_rotary_pos_emb = copy.copy(self.rotary_pos_emb)
+            self.config.rope_scaling = rope_scaling['compress']
+            new_inv_freq, attention_scaling = get_rope_inv_freq(self.config)
+            self.compress_rotary_pos_emb.inv_freq = new_inv_freq
+            self.config.compress_attention_scaling = attention_scaling
+            self.config.rope_scaling = rope_scaling
 
-    def forward_with_dspark_hidden(self, *args, **kwargs):
-        with self.language_model.capture_dspark_hidden_states():
-            output = self.forward(*args, **kwargs)
-        return output, self.language_model.get_dspark_main_hidden()
+        def _dsv4_rotary_pos_emb(self, transformer_input, packed_seq_params, inference_context=None):
+            """Return the ``{'main', 'compress'}`` RoPE dict the DSv4 attention indexes by
+            ``rope_layer_type`` (mirrors ``DeepseekV4GPTModel._get_rotary_pos_emb`` plus the
+            packed pre-indexing ``GPTModel.forward`` does).
 
-    def forward_dspark(self, *args, **kwargs):
-        return self.language_model.forward_dspark(*args, **kwargs)
+            The DSv4 attention consumes *per-token* frequencies row-aligned with the hidden states
+            (see ``_apply_mla_rope``), not a position->frequency table. For one sequence per row the
+            table is already row-aligned, but under ``thd`` packing a row holds several sequences
+            whose positions restart, so the table (sized by the longest sequence) must be indexed by
+            ``position_ids`` here -- exactly what the GPT path does in ``GPTModel.forward``. Under CP
+            ``position_ids`` arrives already split with the hidden states' partition mode, so the
+            indexed frequencies come out rank-local while keeping absolute positions.
+            """
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(inference_context, self.decoder, transformer_input,
+                                                                    self.config, packed_seq_params)
+            packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+            rotary_pos_emb = {
+                'main': self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq),
+                'compress': self.compress_rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq),
+            }
+            if packed_seq and not self.config.apply_rope_fusion:
+                position_ids = self._dsv4_position_ids
+                if position_ids is None:
+                    raise ValueError('DeepSeek-V4.1 hybrid needs position_ids on every pipeline '
+                                     'stage to pre-index the MLA rotary table under sequence '
+                                     'packing.')
+                assert position_ids.shape[0] == 1, f'position_ids.shape: {position_ids.shape}'
+                rotary_pos_emb = {k: v[position_ids[0]] for k, v in rotary_pos_emb.items()}
+            return rotary_pos_emb
 
-    def compute_dspark_speculative_tokens(self, *args, **kwargs):
-        return self.language_model.compute_dspark_speculative_tokens(*args, **kwargs)
+        def _inject_dsv4_rotary_pos_emb(self, module, args, kwargs):
+            if kwargs.get('rotary_pos_emb') is not None:
+                return None
+            transformer_input = kwargs.get('hidden_states')
+            if transformer_input is None and args:
+                transformer_input = args[0]
+            kwargs['rotary_pos_emb'] = self._dsv4_rotary_pos_emb(transformer_input, kwargs.get('packed_seq_params'),
+                                                                 kwargs.get('inference_context'))
+            return args, kwargs
 
+        # Visual kwargs are injected into the embeddings by the multimodal wrapper and then
+        # cleared before the language model runs; the base HybridModel.forward never accepts them.
+        # This backbone is text-only, so strip them here. For a text batch
+        # ``DeepseekV41Vision.get_inputs_embeds`` is a numeric no-op (``_zero_parameter_dependency``
+        # adds ``0 * vision_params``), so dropping them changes nothing numerically.
+        _visual_forward_keys = ('pixel_values', 'image_grid_thw', 'image_token_types', 'token_types')
 
-def _deepseek_v41_use_hybrid(config) -> bool:
-    """Whether to build DeepSeek-V4.1 on the ``HybridModel`` (PP-capable) path.
+        def forward(self, *args, **kwargs):
+            # The multimodal wrapper (``MultimodalGPTModel.forward``) always funnels the
+            # decoder's extra kwargs through ``extra_block_kwargs`` -- the mcore-bridge ``GPTModel``
+            # calling convention. Upstream ``HybridModel.forward`` has no such parameter (it threads
+            # ``input_ids`` into the decoder itself, hybrid_model.py), so unpack the container here
+            # and let the visual-key strip below drop anything the text backbone does not consume.
+            extra_block_kwargs = kwargs.pop('extra_block_kwargs', None)
+            if extra_block_kwargs:
+                kwargs.update(extra_block_kwargs)
+            if kwargs.get('pixel_values') is not None:
+                raise NotImplementedError('The DeepSeek-V4.1 hybrid backbone is text-only; multimodal inputs must go '
+                                          'through DeepseekV41MultimodalModel.')
+            for key in self._visual_forward_keys:
+                kwargs.pop(key, None)
+            # Upstream ``HybridModel.forward`` never threads position_ids into the decoder, so stash
+            # it for the rotary pre-hook (see :meth:`_dsv4_rotary_pos_emb`).
+            position_ids = kwargs.get('position_ids')
+            if position_ids is None and len(args) > 1:
+                position_ids = args[1]
+            self._dsv4_position_ids = position_ids
+            try:
+                return super().forward(*args, **kwargs)
+            finally:
+                self._dsv4_position_ids = None
 
-    The ``HybridModel`` path is now the default (plan step B5): B1-B4 validated it against the
-    ``GPTModel`` golden baseline (iter-1 loss/grad within the bf16/MoE non-determinism band and a
-    clean weight key ledger), and it is the only path that supports pipeline parallelism, so it is
-    selected for every layout. The ``deepseek_v41_hybrid`` config flag (settable via
-    ``--megatron_extra_kwargs``) overrides this: ``False`` drops back to the ``GPTModel`` golden
-    baseline (kept as a regression path; note upstream refuses ``GPTModel`` at ``PP>1``), ``True``
-    is redundant but still forces hybrid.
-    """
-    forced = getattr(config, 'deepseek_v41_hybrid', None)
-    if forced is not None:
-        return bool(forced)
-    return True
+    class DeepseekV41MultimodalModel(MultimodalGPTModel):
+        """Multimodal wrapper hosting the ``HybridModel`` backbone.
+
+        ``MultimodalGPTModel`` consumes its ``language_model`` through a backbone-agnostic
+        interface -- ``embedding(input_ids, position_ids)`` / ``vp_stage`` /
+        ``share_embeddings_and_output_weights`` / ``extra_forward_keys`` / ``set_input_tensor`` /
+        ``get_input_tensor`` / ``shared_embedding_or_output_weight`` plus the standard forward
+        signature -- all of which :class:`DeepseekV41HybridStackModel` provides
+        (``extra_forward_keys`` is added on it for exactly this). The vision tower, image-embed
+        injection (``_patch_word_embeddings``) and the vision/aligner weight bridging
+        (``MultimodalGPTBridge._convert_pre_process``) are inherited unchanged.
+
+        The wrapper injects image embeddings into the embedding output and clears the visual
+        kwargs before the language model runs, so the hybrid backbone only ever sees a text batch
+        (its ``forward`` strips ``_visual_forward_keys`` as a defensive backstop).
+        """
+
+        language_model_cls = DeepseekV41HybridStackModel
+
+        @property
+        def vocab_size(self):
+            return self.language_model.vocab_size
+else:
+    DeepseekV41HyperConnectionHybridLayer = None
+    DeepseekV41HybridStackModel = None
+    DeepseekV41MultimodalModel = None
 
 
 class DeepseekV41Loader(DeepseekV4Loader):
-    model_cls = DeepseekV41MultimodalGPTModel
-    # Native V4.1 forward owns CSA2State + SinglePassMHCState. Using it only for
-    # this loader avoids changing the custom bridge block used by V4/DSpark/MTP.
+    """Build DeepSeek-V4.1 on megatron-core's native ``HybridModel``.
+
+    Extends the V4 loader's MLA/CSA2 knowledge with the V4.1 Engram config resolution and
+    rewrites the layer config into the doubled hybrid layer space (see
+    :func:`derive_hybrid_layer_config`); the derivation works on a config copy so the caller's
+    config is never mutated.
+
+    On top of the text backbone it attaches the DSpark (``mtp.*``) draft stack (in
+    :meth:`build_model`, mapped in :meth:`DeepseekV41Bridge._convert_additional_layers`).
+    Autoregressive MTP (``mtp_num_layers`` / ``MultiTokenPredictionBlock``) does not apply to
+    V4.1 -- its ``mtp.*`` checkpoint keys *are* DSpark -- so it stays disabled here. The backbone
+    is wrapped in :class:`DeepseekV41MultimodalModel` for the vision tower + image-embed
+    injection.
+    """
+
+    # ``HybridModel`` builds its own stack, so leave megatron-core's TransformerBlock
+    # unpatched (``register.py`` would otherwise swap in mcore-bridge's variant).
     transformer_block = McoreTransformerBlock
 
-    def __new__(cls, config=None, *args, **kwargs):
-        # Auto-route to the HybridModel loader on the PP path (or when forced); the subclass
-        # instantiates itself directly, so the ``cls is`` guard prevents re-dispatch. ``config``
-        # is optional so ``__new__(cls)`` (used by tests to skip __init__) keeps working.
-        if cls is DeepseekV41Loader and config is not None and _deepseek_v41_use_hybrid(config):
-            from .deepseek_v41_hybrid import DeepseekV41HybridLoader
-            if DeepseekV41HybridLoader is not None:
-                return super().__new__(DeepseekV41HybridLoader)
-        return super().__new__(cls)
+    model_cls = DeepseekV41MultimodalModel
 
     def _engram_placement_layer_ids(self, hf_layer_ids):
-        """Map 0-based HF Engram layer IDs to 1-based ``TransformerLayer`` placement numbers.
+        """On HybridStack, HF layer ``e`` becomes the attention-only 'D' layer at hybrid index
+        ``2 * e`` (0-based) -- 1-based ``layer_number`` ``2 * e + 1``. Engram is placed there
+        (never on the MLP-only 'E'/'-' layer), so ``TransformerLayer``'s
+        ``layer_number in engram_config.layer_ids`` gate builds it on the right hybrid layers.
+        ``hash_layer_ids`` stays 0-based HF so the tokenizer artifact / hash multipliers are
+        looked up unchanged."""
+        return tuple(2 * layer_id + 1 for layer_id in hf_layer_ids)
 
-        On the GPT stack HF layer ``e`` is one ``TransformerLayer`` numbered ``e + 1``. The
-        HybridStack loader overrides this because there each HF layer becomes two hybrid layers.
+    def _build_hybrid_config(self):
+        # Shallow copy + per-field reassignment (mirrors ``get_dspark_layer_spec``); every field
+        # written below is replaced by a fresh object, so the original config is never mutated.
+        cfg = copy.copy(self.config)
+        derived = derive_hybrid_layer_config(
+            self.config.num_layers,
+            list(self.config.csa_compress_ratios),
+            self.config.moe_layer_freq,
+            csa2_kv_source_layers=self.config.csa2_kv_source_layers or [],
+            csa2_index_source_layers=self.config.csa2_index_source_layers or [],
+            csa2_candidate_source_layer=self.config.csa2_candidate_source_layer,
+        )
+        cfg.num_layers = derived.num_layers
+        cfg.hybrid_layer_pattern = derived.hybrid_layer_pattern
+        cfg.csa_compress_ratios = derived.csa_compress_ratios
+        cfg.csa2_kv_source_layers = derived.csa2_kv_source_layers
+        cfg.csa2_index_source_layers = derived.csa2_index_source_layers
+        cfg.csa2_candidate_source_layer = derived.csa2_candidate_source_layer
+        cfg.is_hybrid_model = True
+        # HybridStack picks E/- from the pattern; keep moe_layer_freq consistent with the doubled
+        # space so any layer-count validation that reads it still agrees with num_layers.
+        cfg.moe_layer_freq = [1 if symbol == 'E' else 0 for symbol in derived.hybrid_layer_pattern]
+        # Autoregressive MTP does not apply to V4.1: the parser never sets ``mtp_num_layers``
+        # (it maps ``num_nextn_predict_layers`` to ``dspark_num_layers`` instead), and the
+        # ``mtp.*`` checkpoint keys are the DSpark draft stack (attached in ``build_model``).
+        # Keep it disabled so no ``MultiTokenPredictionBlock`` is built.
+        cfg.mtp_num_layers = None
+        return cfg
+
+    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
+        # Build the spec from the *hybrid* config so the CSA2 attention sees the doubled-space
+        # csa arrays. ``build_model`` caches it on ``self._hybrid_config`` first.
+        spec = hybrid_dsv4_stack_spec(self._hybrid_config)
+        # Apply the fp8-parity module swaps on the array-driven 'D'
+        # attention layer (the only attention symbol V4.1 emits).
+        attn = spec.submodules.dsa_layer.submodules.self_attention
+        attn.module = DSv4HybridSelfAttention
+        core = attn.submodules.core_attention.submodules
+        if getattr(core, 'compressor', None) is not None:
+            core.compressor.module = CSA2Compressor
+        if getattr(core, 'indexer', None) is not None:
+            # CSA2 indexer is flat (no nested compressor).
+            core.indexer.module = CSA2Indexer
+        # Attach Engram to the 'D' (attention-only) layer spec. Because HybridStack shares one
+        # ``dsa_layer`` spec across every 'D' layer, per-layer placement is handled by
+        # ``TransformerLayer.__init__`` (only ``layer_number in engram_config.layer_ids`` builds
+        # it) rather than by editing per-layer specs.
+        engram_config = self._get_engram_config()
+        if engram_config is not None:
+            from megatron.core.transformer.spec_utils import ModuleSpec
+            dsa = spec.submodules.dsa_layer
+            # The inference-aware subclass adds the ``_forward_attention`` Engram hook.
+            dsa.module = DeepseekV41TransformerLayer
+            dsa.submodules.engram = ModuleSpec(module=DeepseekV41Engram, params={'engram_config': engram_config})
+        # HybridStack exposes MoE via ``moe_layer`` (symbol 'E') instead of GPT's ``layer_specs``,
+        # so ``ModelLoader._replace_router`` never sees it. Swap the stock ``McoreTopKRouter`` for
+        # the project ``TopKRouter`` here too, otherwise the MoE ``router`` has no ``expert_bias_vl``
+        # buffer and the V4.1 bridge fails to load ``gate.bias_vl`` (mirrors ``_replace_router``).
+        self._replace_hybrid_router(spec)
+        return spec
+
+    @staticmethod
+    def _replace_hybrid_router(spec):
+        from functools import partial
+
+        from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
+
+        from ..modules import TopKRouter
+        moe_layer = getattr(spec.submodules, 'moe_layer', None)
+        mlp_spec = getattr(getattr(moe_layer, 'submodules', None), 'mlp', None)
+        # ``get_moe_module_spec_for_backend`` hands back a ``functools.partial(MoELayer, ...)``
+        # here (not a plain ``ModuleSpec``), so read its ``submodules`` from ``keywords`` -- same
+        # dual handling as ``ModelLoader._replace_router``.
+        if isinstance(mlp_spec, partial):
+            mlp_submodules = mlp_spec.keywords.get('submodules')
+        else:
+            mlp_submodules = getattr(mlp_spec, 'submodules', None)
+        if getattr(mlp_submodules, 'router', None) is McoreTopKRouter:
+            mlp_submodules.router = TopKRouter
+
+    def _rewrap_engram_hyper_connection_layers(self, model):
+        """Retrofit Engram-carrying ``HyperConnectionHybridLayer`` wrappers with the V4.1
+        subclass that declines the fast path (see
+        :class:`DeepseekV41HyperConnectionHybridLayer`).
+
+        HybridStack hard-codes ``HyperConnectionHybridLayer`` (hybrid_block.py:1120-1121) with no
+        spec hook, so the swap is done in place after build. ``DeepseekV41HyperConnectionHybridLayer``
+        only overrides one method and adds no state, making the ``__class__`` reassignment safe.
+        Only wrappers whose inner layer actually built an Engram module (``layer_number in
+        engram_config.layer_ids``) are touched; every other layer keeps the base fast path and
+        stays numerically identical to a plain hybrid stack.
         """
-        return tuple(layer_id + 1 for layer_id in hf_layer_ids)
+        if not self.config.enable_hyper_connections or DeepseekV41HyperConnectionHybridLayer is None:
+            return
+        decoder = getattr(model, 'decoder', None)
+        for layer in getattr(decoder, 'layers', []) or []:
+            inner = getattr(layer, 'inner_layer', None)
+            if (isinstance(layer, HyperConnectionHybridLayer) and inner is not None
+                    and getattr(inner, 'engram', None) is not None):
+                layer.__class__ = DeepseekV41HyperConnectionHybridLayer
+
+    def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
+        """Build the multimodal wrapper around ``HybridModel``, skipping ``ModelLoader.build_model``'s
+        GPT layer-spec post-processing (MLA / router / TransformerLayer substitution): a
+        ``HybridStack`` spec exposes per-symbol submodules instead, and the DSv4 attention swap is
+        done in ``get_transformer_layer_spec`` above.
+
+        ``model`` is :class:`DeepseekV41MultimodalModel` (vision tower + wrapper); the hybrid
+        text backbone -- which owns the decoder / MoE / Engram layers the fix-ups below touch --
+        is nested under ``model.language_model``, so they target that."""
+        self._hybrid_config = self._build_hybrid_config()
+        model = self.model_cls(
+            config=self._hybrid_config,
+            transformer_layer_spec=self.get_transformer_layer_spec(vp_stage=vp_stage),
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+        )
+        language_model = getattr(model, 'language_model', model)
+        self._rewrap_engram_hyper_connection_layers(language_model)
+        self._set_linear_is_expert(language_model)
+        # DSpark: the ``mtp.*`` draft stack is backbone-agnostic (plain experimental-attention
+        # layers), so :meth:`_attach_dspark` builds it unchanged and attaches it to the hybrid text
+        # backbone (``language_model.dspark``). Inference-time target-layer capture on HybridStack is
+        # not implemented (it is not exercised by training / weight round-trip); the stack only needs
+        # to exist so its parameters are loaded / saved via ``mtp.*``.
+        self._attach_dspark(language_model, post_process, vp_stage=vp_stage)
+        return model
 
     def _get_engram_config(self):
         hf_layer_ids = tuple(self.config.engram_layer_ids or ())
         if not hf_layer_ids:
             return None
         if not has_native_engram():
-            raise RuntimeError(
-                'DeepSeek-V4.1 Engram requires NVIDIA Megatron-LM Engram support. '
-                'The PR #7224 text-backbone baseline intentionally does not provide it; '
-                'install the official Engram extension or disable Engram explicitly.')
+            raise RuntimeError('DeepSeek-V4.1 Engram requires NVIDIA Megatron-LM Engram support. '
+                               'The PR #7224 text-backbone baseline intentionally does not provide it; '
+                               'install the official Engram extension or disable Engram explicitly.')
         required = (
-            'engram_num_embeddings', 'engram_max_ngram_size', 'engram_vocab_size',
-            'engram_n_heads', 'engram_head_dim', 'engram_pad_token_id',
+            'engram_num_embeddings',
+            'engram_max_ngram_size',
+            'engram_vocab_size',
+            'engram_n_heads',
+            'engram_head_dim',
+            'engram_pad_token_id',
         )
         missing = [name for name in required if getattr(self.config, name, None) is None]
         if missing:
@@ -908,16 +1158,14 @@ class DeepseekV41Loader(DeepseekV4Loader):
             if candidate and os.path.isfile(candidate):
                 tokenizer_map = candidate
         if not tokenizer_map:
-            raise ValueError(
-                'DeepSeek-V4.1 Engram requires engram_tokenizer_map. Generate it with '
-                'Megatron-LM/tools/engram/generate_tokenizer_map.py using the HF 0-based '
-                f'layer IDs {list(hf_layer_ids)}.'
-            )
+            raise ValueError('DeepSeek-V4.1 Engram requires engram_tokenizer_map. Generate it with '
+                             'Megatron-LM/tools/engram/generate_tokenizer_map.py using the HF 0-based '
+                             f'layer IDs {list(hf_layer_ids)}.')
 
         max_ngram_order = self.config.engram_max_ngram_size
         image_token_id = getattr(self.config.hf_config, 'image_token_id', None)
         engram_config = build_deepseek_v41_engram_config(
-            global_vocab_sizes=(self.config.engram_vocab_size,) * (max_ngram_order - 1),
+            global_vocab_sizes=(self.config.engram_vocab_size, ) * (max_ngram_order - 1),
             # TransformerLayer numbers are 1-based, while the official checkpoint and
             # tokenizer artifact use the original 0-based HF layer IDs.
             placement_layer_ids=self._engram_placement_layer_ids(hf_layer_ids),
@@ -929,24 +1177,19 @@ class DeepseekV41Loader(DeepseekV4Loader):
             hash_seed=0,
             boundary_token_id=self.config.engram_pad_token_id,
             tokenizer_map_path=tokenizer_map,
-            excluded_token_ids=(() if image_token_id is None else (image_token_id,)),
+            excluded_token_ids=(() if image_token_id is None else (image_token_id, )),
         )
         actual_rows = tuple(sum(engram_config.table_sizes(layer_id)) for layer_id in engram_config.layer_ids)
         expected_rows = tuple(self.config.engram_num_embeddings)
         if actual_rows != expected_rows:
-            raise ValueError(
-                'DeepSeek-V4.1 Engram table layout does not match engram_num_embeddings: '
-                f'computed {actual_rows}, checkpoint declares {expected_rows}.'
-            )
+            raise ValueError('DeepSeek-V4.1 Engram table layout does not match engram_num_embeddings: '
+                             f'computed {actual_rows}, checkpoint declares {expected_rows}.')
         if (self.config.engram_compressed_vocab_size is not None
                 and engram_config.tokenizer_remap.max().item() + 1 != self.config.engram_compressed_vocab_size):
-            raise ValueError(
-                'DeepSeek-V4.1 compressed tokenizer vocabulary mismatch: artifact has '
-                f'{engram_config.tokenizer_remap.max().item() + 1}, config declares '
-                f'{self.config.engram_compressed_vocab_size}.'
-            )
-        engram_config.validate_startup(
-            self.config, expected_tokenizer_vocab_size=self.config.padded_vocab_size)
+            raise ValueError('DeepSeek-V4.1 compressed tokenizer vocabulary mismatch: artifact has '
+                             f'{engram_config.tokenizer_remap.max().item() + 1}, config declares '
+                             f'{self.config.engram_compressed_vocab_size}.')
+        engram_config.validate_startup(self.config, expected_tokenizer_vocab_size=self.config.padded_vocab_size)
         return engram_config
 
     def get_dspark_layer_spec(self):
@@ -984,20 +1227,15 @@ class DeepseekV41Loader(DeepseekV4Loader):
         self._replace_router(SimpleNamespace(layer_specs=layer_specs))
         return dspark_config, layer_specs
 
-    def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):
-        model = super().build_model(pre_process, post_process, vp_stage)
-        self._attach_dspark(model.language_model, post_process, vp_stage=vp_stage)
-        return model
-
     def _attach_dspark(self, language_model, post_process, vp_stage: Optional[int] = None):
         """Build the DSpark (``mtp.*``) draft stack and attach it to ``language_model`` on the
         final pipeline stage.
 
         Backbone-agnostic: the draft layers are plain experimental-attention-variant
         ``TransformerLayer`` instances (see :meth:`get_dspark_layer_spec`), independent of whether
-        the main model is a ``GPTModel`` or ``HybridModel``. The GPT path passes
-        ``model.language_model``; the hybrid path (which has no ``language_model`` wrapper) passes
-        the ``HybridModel`` itself -- both expose ``pg_collection`` / ``vocab_size`` / ``config``.
+        the main model is a ``GPTModel`` or ``HybridModel``; the caller passes whichever object
+        owns the stack -- here the ``HybridModel`` backbone, which exposes ``pg_collection`` /
+        ``vocab_size`` / ``config`` all the same.
         The stack is never part of the training forward (capture is inference-only), so it only
         needs to exist here so its parameters are loaded / saved through the ``mtp.*`` bridge.
 
@@ -1018,8 +1256,7 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 layer_number=index + 1,
                 pg_collection=language_model.pg_collection,
                 vp_stage=vp_stage,
-            )
-            for index, layer_spec in enumerate(dspark_layer_specs)
+            ) for index, layer_spec in enumerate(dspark_layer_specs)
         ]
         language_model.dspark = DeepseekV41DSparkStack(dspark_config, layers)
         self._set_linear_is_expert(language_model.dspark)
@@ -1046,45 +1283,269 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 tp_group=language_model.pg_collection.tp,
             )
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
-        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
-        for layer_spec in transformer_layer_spec.layer_specs:
-            layer_spec.submodules.self_attention.module = DSv4HybridSelfAttention
-            core_attention_submodules = layer_spec.submodules.self_attention.submodules.core_attention.submodules
-            if getattr(core_attention_submodules, 'compressor', None) is not None:
-                core_attention_submodules.compressor.module = CSA2Compressor
-            if getattr(core_attention_submodules, 'indexer', None) is not None:
-                # CSA2 indexer is flat (no nested compressor).
-                core_attention_submodules.indexer.module = CSA2Indexer
-        engram_config = self._get_engram_config()
-        if engram_config is not None:
-            transformer_layer_spec = adapt_deepseek_v41_layer_specs(transformer_layer_spec, engram_config)
-        return transformer_layer_spec
-
 
 class DeepseekV41Bridge(DeepseekV4Bridge):
+    """Weight bridge for the ``HybridModel`` backbone.
+
+    An HF layer owns both attention and MLP; on ``HybridModel`` it is split in two (see
+    :func:`derive_hybrid_layer_config`), so this bridge fans a single HF layer ``i`` out onto
+    two hybrid layers:
+
+    * hybrid layer ``2*i`` -- attention half: MLA / CSA2 state + ``attn_norm`` (+ Engram when
+      ``i in engram_layer_ids``) + the ``hc_attn_*`` hyper-connection channel.
+    * hybrid layer ``2*i + 1`` -- MLP half: MoE / dense state + ``ffn_norm`` + the ``hc_ffn_*``
+      hyper-connection channel.
+
+    When ``enable_hyper_connections`` is set each hybrid layer is wrapped in a
+    ``HyperConnectionHybridLayer`` whose real payload lives under ``inner_layer`` and which owns
+    a *single* ``hyper_connection`` module, so the HF ``hc_{attn,ffn}_*`` keys split across the
+    two wrappers.
+
+    ``self.config`` is seen in two layer spaces depending on direction: on load it is the
+    original HF-space config (``num_layers == N``, no ``hybrid_layer_pattern``); on export it is
+    the doubled hybrid megatron config used to build the model (``num_layers == 2 * N``,
+    ``hybrid_layer_pattern`` populated). :meth:`_convert` normalizes this so it always iterates
+    the decoder's ``2 * N`` hybrid layers.
+    """
+
     _ENGRAM_LOAD_CHUNK_ROWS = 65536
     additional_dim0_keys = DeepseekV4Bridge.additional_dim0_keys | {'embed', 'head'}
     additional_dim1_keys = DeepseekV4Bridge.additional_dim1_keys | {'main_proj'}
 
-    def __new__(cls, config=None, *args, **kwargs):
-        # Mirror the loader's routing so the bridge and the built model always agree on the path
-        # (this bridge is created in ``ModelConfig.__post_init__`` where PP size is already set).
-        # ``config`` is optional so ``__new__(cls)`` (used by tests to skip __init__) keeps working.
-        if cls is DeepseekV41Bridge and config is not None and _deepseek_v41_use_hybrid(config):
-            from .deepseek_v41_hybrid import DeepseekV41HybridBridge
-            if DeepseekV41HybridBridge is not None:
-                return super().__new__(DeepseekV41HybridBridge)
-        return super().__new__(cls)
+    @staticmethod
+    def _lm(mg_model):
+        """Resolve the language model. A bare HybridModel is text-only (no ``language_model``
+        wrapper); :class:`DeepseekV41MultimodalModel` nests it under a multimodal container."""
+        language_model = getattr(mg_model, 'language_model', None)
+        return mg_model if language_model is None else language_model
+
+    @staticmethod
+    def _num_hybrid_layers(config) -> int:
+        """Decoder layer count in the doubled hybrid space, regardless of which layer space
+        ``config`` is currently in.
+
+        The two conversion entrypoints hand :meth:`_convert` a config in *different* spaces:
+        load (``to_mcore=True``) passes the original HF-space config (``num_layers == N``, no
+        ``hybrid_layer_pattern``) whose built decoder holds ``2 * N`` layers; export
+        (``to_mcore=False``) passes the doubled hybrid megatron config used to build the model
+        (``num_layers == 2 * N`` with ``hybrid_layer_pattern`` populated). Discriminating by the
+        pattern makes both directions iterate exactly the decoder's layer count -- using the raw
+        ``2 * num_layers`` on export would over-count and dereference ``None`` layers past the
+        decoder end (see PP-availability window in :meth:`_convert`)."""
+        if getattr(config, 'hybrid_layer_pattern', None):
+            return config.num_layers
+        return 2 * config.num_layers
+
+    def _engram_hf_layer_id(self, engram):
+        # Engram lives on the doubled-space attention layer ``2 * hf_id + 1`` (see
+        # ``DeepseekV41Loader._engram_placement_layer_ids``), so map it back to HF space.
+        return (engram.layer_number - 1) // 2
+
+    def _set_word_embeddings(self, mg_model, hf_state_dict, to_mcore):
+        # The base ``MultimodalGPTBridge`` resolves the language model with a raw
+        # ``getattr(mg_model, 'language_model')``; route it through :meth:`_lm` so both the
+        # multimodal wrapper and a bare backbone resolve correctly.
+        self._set_state_dict(
+            self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        # Runs the vision/aligner + image_* block unconditionally instead of branching on *this*
+        # rank's ``mg_model.visual``. On export every pipeline stage runs ``_convert`` ->
+        # ``_convert_pre_process``, and this path issues the *same* pp-group collective sequence on
+        # all ranks: word-embeddings (routed through ``_lm`` by :meth:`_set_word_embeddings`), then
+        # the config-guarded vision/aligner block and the image_* markers, all driven via
+        # ``_set_module``/``_set_state_dict`` which stay in lockstep even where the submodule is
+        # ``None`` (see ``_set_module``'s ``src_rank`` all-reduce / ``_set_state_dict``'s ``state``
+        # all-reduce). A per-rank ``visual is not None`` guard would skip that whole block on
+        # non-first stages (where the wrapper built ``visual=None``), desynchronizing the
+        # collectives so the last stage's later per-layer ``has_model`` all-reduce reads a stale
+        # value -> ``next(mg_models)`` -> ``StopIteration``. On load only the first stage reaches
+        # this method (see ``_convert``'s ``is_pp_first_stage`` guard).
         result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
         target = hf_state_dict if to_mcore else result
         for name in ('image_start', 'image_end', 'image_newline'):
             self._set_state_dict(mg_model, f'visual.{name}', target, f'model.{name}', to_mcore)
         return result
+
+    def _convert_post_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        if to_mcore:
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+        else:
+            hf_state_dict = {}
+        lm_model = self._lm(mg_model)
+        if self.config.task_type != 'embedding':
+            if self.config.untie_embeddings_and_output_weights:
+                hf_lm_head_key = self.hf_lm_head_key
+                if self.config.task_type == 'seq_cls':
+                    hf_lm_head_key = self.hf_score_key
+                if not to_mcore or hf_lm_head_key in hf_state_dict:
+                    self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, hf_lm_head_key, to_mcore)
+            elif to_mcore and lm_model.output_layer.weight is not None:
+                self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, self.hf_embed_key, to_mcore)
+        self._set_final_layernorm(lm_model, hf_state_dict, to_mcore)
+        if to_mcore:
+            return {}
+        return self._add_prefix(hf_state_dict, hf_prefix)
+
+    def _set_final_layernorm(self, lm_model, hf_state_dict, to_mcore):
+        # HybridStack names its trailing norm ``final_norm`` (vs the GPT block's
+        # ``final_layernorm``). Like the GPT V4.1 bridge, single-pass mHC has no learned
+        # ``hc_head_*`` output head (only built when ``not mhc_single_pass``), so nothing else
+        # is mapped here.
+        self._set_state_dict(lm_model, 'decoder.final_norm.weight', hf_state_dict, self.hf_final_layernorm_key,
+                             to_mcore)
+
+    def _set_one_hyper_connection(self, hyper_connection, hf_state_dict, hf_key, to_mcore):
+        """Bridge a single ``HyperConnectionModule`` (one wrapper == one channel).
+
+        Same parameter layout as the GPT ``_set_hyper_connection`` per-channel body, but keyed
+        by an explicit ``hf_key`` ('attn' or 'ffn') because each hybrid wrapper owns exactly one
+        connection instead of the GPT layer's attention + FFN pair.
+        """
+        self._set_state_dict(hyper_connection, 'mapping_proj.weight', hf_state_dict, f'hc_{hf_key}_fn', to_mcore)
+        self._set_state_dict(hyper_connection, 'bias', hf_state_dict, f'hc_{hf_key}_base', to_mcore)
+        has_hyper_connection = hyper_connection is not None
+        has_hyper_connection = self._reduce_tensor_pp_group(has_hyper_connection, to_mcore)
+        # ``alpha_*`` bypass ``_set_state_dict``, so mirror the peft guard the GPT
+        # ``_set_hyper_connection`` applies -- these are frozen base weights and must stay out of
+        # ``adapter_model.safetensors``.
+        if has_hyper_connection and not self._peft_format:
+            if to_mcore:
+                alpha = hf_state_dict[f'hc_{hf_key}_scale'].load()
+                for i, alpha_suffix in enumerate(['pre', 'post', 'res']):
+                    getattr(hyper_connection, f'alpha_{alpha_suffix}').data[:] = alpha[i]
+            else:
+                alpha = None
+                if hyper_connection is not None:
+                    alpha = torch.concat(
+                        [getattr(hyper_connection, f'alpha_{suffix}') for suffix in ['pre', 'post', 'res']], dim=0)
+                hf_state_dict[f'hc_{hf_key}_scale'] = self._get_weight(alpha, 'alpha')[0]
+
+    def _set_hybrid_layer_state(self, mg_layer, hf_state_dict, hf_prefix: str, hybrid_idx: int, to_mcore: bool):
+        """Map HF layer ``hybrid_idx // 2`` onto one half of the hybrid pair.
+
+        Even ``hybrid_idx`` is the attention half, odd is the MLP half; both read/write the
+        same ``model.layers.{hf_idx}.`` prefix so the HF checkpoint stays single-layer-per-index.
+        """
+        hf_idx = hybrid_idx // 2
+        is_attn = (hybrid_idx % 2 == 0)
+        layer_prefix = f'{hf_prefix}{hf_idx}.'
+        local_state = self._remove_prefix(hf_state_dict, layer_prefix) if to_mcore else {}
+        # The wrapper carries the payload under ``inner_layer`` and the single hyper-connection
+        # under ``hyper_connection``; without mHC the layer is the payload itself.
+        inner = None if mg_layer is None else getattr(mg_layer, 'inner_layer', mg_layer)
+        hyper_connection = None if mg_layer is None else getattr(mg_layer, 'hyper_connection', None)
+        if is_attn:
+            local_state.update(self._set_layer_attn(inner, local_state, hf_idx, to_mcore))
+            if hf_idx in (self.config.engram_layer_ids or []):
+                # ``_get_layer_engram`` already unwraps ``inner_layer.engram``.
+                self._set_layer_engram(mg_layer, local_state, to_mcore)
+            if self.config.enable_hyper_connections:
+                self._set_one_hyper_connection(hyper_connection, local_state, 'attn', to_mcore)
+        else:
+            local_state.update(self._set_layer_mlp(inner, local_state, hf_idx, to_mcore))
+            if self.config.enable_hyper_connections:
+                self._set_one_hyper_connection(hyper_connection, local_state, 'ffn', to_mcore)
+        if to_mcore:
+            return {}
+        return self._add_prefix(local_state, layer_prefix)
+
+    def _convert_additional_layers(self, mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage):
+        """Map the DSpark (``mtp.*``) draft stack.
+
+        The draft layers are plain experimental-attention ``TransformerLayer`` instances --
+        backbone-agnostic -- so :meth:`_convert_dspark_stack` owns the mapping and this method
+        only locates the stack. It is attached to the text backbone (no ``language_model`` wrapper on
+        a bare model, so use :meth:`_lm`) and only
+        on the final pipeline stage. During export non-last stages use an empty structural proxy so
+        every PP rank executes the same collective sequence. MTP (``mtp_num_layers``) is skipped in
+        :meth:`_convert` and does not apply to V4.1."""
+        if not self.config.dspark_num_layers or (to_mcore and not is_pp_last_stage):
+            return
+        language_model = self._lm(mg_model)
+        dspark = getattr(language_model, 'dspark', None)
+        if dspark is None:
+            if to_mcore or is_pp_last_stage:
+                raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
+            dspark = SimpleNamespace(layers=[None] * self.config.dspark_num_layers)
+        yield from self._convert_dspark_stack(language_model, dspark, hf_state_dict, hf_prefix, to_mcore)
+
+    def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
+        """Backbone conversion with a 1->2 layer fan-out.
+
+        Mirrors :meth:`GPTBridge._convert` but iterates the doubled hybrid layer space
+        (``2 * num_layers``) and dispatches each hybrid layer to :meth:`_set_hybrid_layer_state`.
+        MTP is intentionally skipped: V4.1's ``mtp.*`` keys are DSpark, mapped separately.
+        """
+        self._pending_export_iter = None
+        if to_mcore:
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+            hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
+        else:
+            hf_state_dict = {}
+        mg_models = iter(mg_models)
+        mg_model = next(mg_models)
+        is_pp_first_stage = mpu.is_pipeline_first_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
+        is_pp_last_stage = mpu.is_pipeline_last_stage(ignore_virtual=False, vp_stage=mg_model.vp_stage)
+        if not to_mcore or is_pp_first_stage:
+            hf_state_dict.update(self._convert_pre_process(mg_model, hf_state_dict, '', to_mcore))
+        if to_mcore:
+            yield
+        else:
+            hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
+            yield from list(self._add_prefix(hf_state_dict, hf_prefix).items())
+            hf_state_dict = {}
+        # Total hybrid (attention + MLP) layer count in the doubled space; ``_num_hybrid_layers``
+        # normalizes the two layer spaces ``self.config`` may be in (see its docstring) so both
+        # load and export iterate exactly the decoder's layer count. HybridStack layer_number
+        # spans this same space (i + 1 + pp_offset), matching this loop's hybrid index so the
+        # PP-availability window below stays correct.
+        num_hybrid_layers = self._num_hybrid_layers(self.config)
+        layer_idx = 0
+        disable_tqdm = self._disable_tqdm or not is_master()
+        prog_bar = tqdm(range(num_hybrid_layers), dynamic_ncols=True, desc=tqdm_desc, disable=disable_tqdm)
+        while layer_idx < num_hybrid_layers:
+            lm_model = self._lm(mg_model)
+            if len(lm_model.decoder.layers) > 0:
+                start_idx = lm_model.decoder.layers[0].layer_number - 1
+                mg_layer_available = (start_idx <= layer_idx < lm_model.decoder.layers[-1].layer_number)
+            else:
+                mg_layer_available = False
+            if mg_layer_available:
+                mg_layer = lm_model.decoder.layers[layer_idx - start_idx]
+            else:
+                if to_mcore:
+                    layer_idx += 1
+                    prog_bar.update()
+                    continue
+                else:
+                    mg_layer = None
+            if not to_mcore and self.pp_size > 1:
+                has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device='cuda')
+                dist.all_reduce(has_model, group=self.pp_group)
+                if not has_model:
+                    mg_model = next(mg_models)  # compat vpp
+                    continue
+            res = self._set_hybrid_layer_state(mg_layer, hf_state_dict, f'{self.hf_layers_prefix}.', layer_idx,
+                                               to_mcore)
+            layer_idx += 1
+            prog_bar.update()
+            if to_mcore:
+                yield
+            else:
+                res = self._convert_hf_state_dict(res, to_mcore)
+                yield from self._drain_pending_export(hf_prefix)
+                yield from self._add_prefix(res, hf_prefix).items()
+                hf_state_dict = {}
+        prog_bar.close()
+        yield from self._convert_additional_layers(mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage)
+        if not to_mcore or is_pp_last_stage:
+            hf_state_dict.update(self._convert_post_process(mg_model, hf_state_dict, '', to_mcore))
+        if to_mcore:
+            yield
+        else:
+            hf_state_dict = self._convert_hf_state_dict(hf_state_dict, to_mcore)
+            yield from list(self._add_prefix(hf_state_dict, hf_prefix).items())
 
     def _set_router(self, mg_mlp, hf_state_dict, to_mcore, **kwargs):
         super()._set_router(mg_mlp, hf_state_dict, to_mcore, **kwargs)
@@ -1111,11 +1572,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         if scale is None:
             return weight
         if weight.ndim != 2 or scale.ndim != 2 or weight.shape[0] != scale.shape[0]:
-            raise ValueError(
-                f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
+            raise ValueError(f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
         if weight.shape[1] % scale.shape[1] != 0:
-            raise ValueError(
-                f'Engram weight width {weight.shape[1]} is not divisible by scale width {scale.shape[1]}.')
+            raise ValueError(f'Engram weight width {weight.shape[1]} is not divisible by scale width {scale.shape[1]}.')
         block_size = weight.shape[1] // scale.shape[1]
         return (weight.float().unflatten(-1, (-1, block_size)) * scale.float().unsqueeze(-1)).flatten(-2)
 
@@ -1136,20 +1595,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 table.weight.data[local_start:local_end].copy_(
                     rows.to(device=table.weight.device, dtype=table.weight.dtype))
         hf_layer_id = self._engram_hf_layer_id(engram)
-        expected_rows = self.config.engram_num_embeddings[
-            self.config.engram_layer_ids.index(hf_layer_id)]
+        expected_rows = self.config.engram_num_embeddings[self.config.engram_layer_ids.index(hf_layer_id)]
         if flat_offset != expected_rows:
-            raise ValueError(
-                f'Engram layer {hf_layer_id} expected {expected_rows} flat rows, '
-                f'but its prime tables contain {flat_offset}.')
-
-    def _engram_hf_layer_id(self, engram):
-        """Recover the 0-based HF layer ID from a built Engram's 1-based ``layer_number``.
-
-        On the GPT stack ``layer_number == hf_id + 1``. The HybridStack bridge overrides this
-        because its Engram sits on the doubled-space attention layer ``2 * hf_id + 1``.
-        """
-        return engram.layer_number - 1
+            raise ValueError(f'Engram layer {hf_layer_id} expected {expected_rows} flat rows, '
+                             f'but its prime tables contain {flat_offset}.')
 
     def _set_layer_engram(self, mg_layer, hf_state_dict, to_mcore):
         engram = self._get_layer_engram(mg_layer)
@@ -1165,14 +1614,12 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             key_rows = engram.num_streams * engram.hidden_size
             if tuple(wkv.shape) != (key_rows + engram.hidden_size, engram.engram_config.total_memory_dim):
                 raise ValueError(f'Unexpected DeepSeek-V4.1 Engram wkv shape: {tuple(wkv.shape)}.')
-            engram.key_projection.weight.data.copy_(
-                wkv[:key_rows].to(engram.key_projection.weight))
-            engram.value_projection.weight.data.copy_(
-                wkv[key_rows:].to(engram.value_projection.weight))
-            engram.query_norm.weight.data.copy_(
-                hf_state_dict['engram.q_weight'].load().reshape(-1).to(engram.query_norm.weight))
-            engram.key_norm.weight.data.copy_(
-                hf_state_dict['engram.k_weight'].load().reshape(-1).to(engram.key_norm.weight))
+            engram.key_projection.weight.data.copy_(wkv[:key_rows].to(engram.key_projection.weight))
+            engram.value_projection.weight.data.copy_(wkv[key_rows:].to(engram.value_projection.weight))
+            engram.query_norm.weight.data.copy_(hf_state_dict['engram.q_weight'].load().reshape(-1).to(
+                engram.query_norm.weight))
+            engram.key_norm.weight.data.copy_(hf_state_dict['engram.k_weight'].load().reshape(-1).to(
+                engram.key_norm.weight))
         elif not self._peft_format:
             if getattr(self, '_skip_unsupported_export', False):
                 # On-policy RL weight sync: Engram tables are frozen and already resident in the
@@ -1187,23 +1634,13 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 all_rows.append(table.weight.data.cpu())
             hf_state_dict['engram.embed.weight'] = torch.cat(all_rows, dim=0)
             # --- export key+value projections as combined wkv ---
-            key_w = engram.key_projection.weight.data.cpu()    # [stream_width, total_memory_dim]
-            val_w = engram.value_projection.weight.data.cpu()   # [hidden, total_memory_dim]
+            key_w = engram.key_projection.weight.data.cpu()  # [stream_width, total_memory_dim]
+            val_w = engram.value_projection.weight.data.cpu()  # [hidden, total_memory_dim]
             hf_state_dict['engram.wkv.weight'] = torch.cat([key_w, val_w], dim=0)
             # --- export norm weights as q_weight / k_weight ---
             num_streams = engram.num_streams
             hf_state_dict['engram.q_weight'] = engram.query_norm.weight.data.cpu().reshape(num_streams, -1)
             hf_state_dict['engram.k_weight'] = engram.key_norm.weight.data.cpu().reshape(num_streams, -1)
-
-    def _set_layer_state(self, mg_layer, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
-        layer_prefix = f'{hf_prefix}{layer_idx}.'
-        local_state = self._remove_prefix(hf_state_dict, layer_prefix) if to_mcore else {}
-        result = super()._set_layer_state(mg_layer, hf_state_dict, hf_prefix, layer_idx, to_mcore)
-        if layer_idx in (self.config.engram_layer_ids or []):
-            self._set_layer_engram(mg_layer, local_state, to_mcore)
-        if not to_mcore and local_state:
-            result.update(self._add_prefix(local_state, layer_prefix))
-        return result
 
     def _set_dspark_layer_state(self, mg_layer, hf_state_dict, layer_idx, to_mcore):
         stage_prefix = f'{self.hf_mtp_prefix}.{layer_idx}.'
@@ -1223,13 +1660,11 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         self._set_state_dict(dspark, 'input.main_proj.weight', first_state, 'main_proj.weight', to_mcore)
         self._set_state_dict(dspark, 'input.main_norm.weight', first_state, 'main_norm.weight', to_mcore)
         self._set_state_dict(dspark, 'output.norm.weight', last_state, 'norm.weight', to_mcore)
-        self._set_state_dict(
-            dspark, 'output.markov_head.embed.weight', last_state, 'markov_head.embed.weight', to_mcore)
-        self._set_state_dict(
-            dspark, 'output.markov_head.head.weight', last_state, 'markov_head.head.weight', to_mcore)
-        self._set_state_dict(
-            dspark, 'output.confidence_head.proj.weight', last_state,
-            'confidence_head.proj.weight', to_mcore)
+        self._set_state_dict(dspark, 'output.markov_head.embed.weight', last_state, 'markov_head.embed.weight',
+                             to_mcore)
+        self._set_state_dict(dspark, 'output.markov_head.head.weight', last_state, 'markov_head.head.weight', to_mcore)
+        self._set_state_dict(dspark, 'output.confidence_head.proj.weight', last_state, 'confidence_head.proj.weight',
+                             to_mcore)
         if to_mcore:
             return {}
         result = self._add_prefix(first_state, first_prefix)
@@ -1250,20 +1685,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             weight = weight.chunk(self.tp_size, dim=0)[self.tp_rank]
         embedding.weight.data.copy_(weight.to(device=embedding.weight.device, dtype=embedding.weight.dtype))
 
-    def _convert_additional_layers(self, mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage):
-        if not self.config.dspark_num_layers or (to_mcore and not is_pp_last_stage):
-            return
-        language_model = mg_model.language_model if self.is_multimodal else mg_model
-        dspark = getattr(language_model, 'dspark', None)
-        if dspark is None:
-            raise RuntimeError('DSpark weights require the draft stack on the final pipeline stage.')
-        yield from self._convert_dspark_stack(language_model, dspark, hf_state_dict, hf_prefix, to_mcore)
-
     def _convert_dspark_stack(self, language_model, dspark, hf_state_dict, hf_prefix, to_mcore):
         """Map the DSpark draft layers + endpoints between HF ``mtp.*`` keys and the megatron
-        stack. Backbone-agnostic (the draft layers are plain ``TransformerLayer`` instances), so
-        both the GPT and hybrid bridges reuse it; they differ only in how they locate ``dspark``
-        and guard the pipeline stage."""
+        stack. Backbone-agnostic (the draft layers are plain ``TransformerLayer`` instances); the
+        caller locates ``dspark`` and guards the pipeline stage."""
         # On a PP>1 last stage with untied embeddings, DSpark owns a dedicated input
         # embedding (see build_model). Load it from the same HF source as the base
         # first-stage embedding. On export the first stage already emits this tensor,
@@ -1345,18 +1770,14 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
         return hf_state_dict
 
-    def _set_final_layernorm(self, lm_model, hf_state_dict, to_mcore):
-        # V4.1 single-pass mHC has no learned hc_head_*; skip the V4 hc_head mapping
-        # and only handle the plain final layernorm (base GPTBridge behaviour).
-        super(DeepseekV4Bridge, self)._set_final_layernorm(lm_model, hf_state_dict, to_mcore)
 
-
-register_model(
-    ModelMeta(
-        ModelType.deepseek_v41,
-        ['deepseek_v41'],
-        bridge_cls=DeepseekV41Bridge,
-        visual_cls=DeepseekV41Vision,
-        loader=DeepseekV41Loader,
-        config_cls=MLAModelConfig,
-    ))
+if _HYBRID_MODEL_AVAILABLE:
+    register_model(
+        ModelMeta(
+            ModelType.deepseek_v41,
+            ['deepseek_v41'],
+            bridge_cls=DeepseekV41Bridge,
+            visual_cls=DeepseekV41Vision,
+            loader=DeepseekV41Loader,
+            config_cls=MLAModelConfig,
+        ))
