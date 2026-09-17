@@ -9,11 +9,13 @@ from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.models.gpt import gpt_model
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from packaging import version
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from mcore_bridge.bridge import GPTBridge
@@ -82,6 +84,10 @@ class ModelLoader:
         if self.model_cls is None:
             self.model_cls = MultimodalGPTModel if config.is_multimodal else GPTModel
 
+    @property
+    def use_transformer_engine(self):
+        return self.config.transformer_impl == 'transformer_engine'
+
     def _set_mlp_spec(self, layer_submodules, mlp_module, mlp_key='mlp'):
         mlp_spec = getattr(layer_submodules, mlp_key)
         if isinstance(mlp_spec, partial):
@@ -121,15 +127,22 @@ class ModelLoader:
         for i, layer_spec in enumerate(transformer_layer_spec.layer_specs):
             transformer_layer_spec.layer_specs[i] = deepcopy(layer_spec)
 
+    def _replace_unfused_attention(self, transformer_layer_spec):
+        if not is_torch_npu_available() or self.config.attention_backend.name != 'unfused':
+            return
+        for layer_spec in transformer_layer_spec.layer_specs:
+            layer_spec.submodules.self_attention.submodules.core_attention = DotProductAttention
+
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
         with self._patch_experimental_attention_variant():
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 self.config,
-                use_transformer_engine=True,
+                use_transformer_engine=self.use_transformer_engine,
                 normalization=self.config.normalization,
                 qk_l2_norm=self.config.qk_l2_norm,
                 vp_stage=vp_stage)
             self._deepcopy_layer_spec(transformer_layer_spec)
+            self._replace_unfused_attention(transformer_layer_spec)
         if self.config.experimental_attention_variant == 'dsa':
             for layer_spec in transformer_layer_spec.layer_specs:
                 self._replace_spec_dsa(layer_spec)
@@ -137,7 +150,7 @@ class ModelLoader:
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
         mtp_block_spec = get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
+            self.config, transformer_layer_spec, use_transformer_engine=self.use_transformer_engine, vp_stage=vp_stage)
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 layer_spec.module = MultiTokenPredictionLayer
