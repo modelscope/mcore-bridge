@@ -11,10 +11,12 @@ from safetensors.torch import save_file
 
 from mcore_bridge.config.parser import _convert_config
 from mcore_bridge.inference import DeepseekV41TextGenerationController
+from mcore_bridge.model.gpts import deepseek_v41 as deepseek_v41_module
 from mcore_bridge.model.gpts.deepseek_v41 import (
     DeepseekV41Aligner,
     DeepseekV41Bridge,
     DeepseekV41DSparkAttention,
+    DeepseekV41Loader,
     DeepseekV41Vision,
     DeepseekV41VisionTransformer,
 )
@@ -176,6 +178,79 @@ def test_dspark_tp_modules_construct_and_run_on_one_rank(tmp_path):
     assert output_ids.shape == (2, 4)
     assert logits.shape == (2, 3, 8)
     assert confidence.shape == (2, 3)
+
+
+def test_attach_dspark_freezes_the_draft_stack(tmp_path, monkeypatch):
+    """The draft stack has to be attached frozen.
+
+    It is deliberately kept out of the training forward -- it exists so the checkpoint's ``mtp.*``
+    weights have somewhere to be loaded into and saved from -- so none of its parameters can ever
+    hold anything but a zero gradient. Leaving them trainable costs more than the optimizer state and
+    gradient buffers it needlessly allocates: Adam's weight decay is decoupled from the gradient, so
+    every step still multiplies them by ``1 - lr * wd`` with nothing pushing back, and the weights the
+    stack exists to carry erode over a long run.
+    """
+    if dist.is_initialized() and dist.get_world_size() != 1:
+        pytest.skip('Single-rank DSpark construction test.')
+    if not dist.is_initialized():
+        dist.init_process_group(
+            'gloo',
+            init_method=f'file://{tmp_path}/dspark-freeze-init',
+            rank=0,
+            world_size=1,
+        )
+    if not mpu.model_parallel_is_initialized():
+        mpu.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=4,
+        num_attention_heads=1,
+        use_cpu_initialization=True,
+        params_dtype=torch.float32,
+    )
+    config.padded_vocab_size = 8
+    config.dspark_num_layers = 1
+    config.dspark_markov_rank = 2
+    config.dspark_target_layer_ids = [0]
+    config.dspark_block_size = 3
+    config.dspark_noise_token_id = 7
+    config.num_residual_streams = 2
+    config.mhc_single_pass = True
+
+    class _Layer(torch.nn.Module):
+        """Stands in for a draft TransformerLayer: one parameter, and an ``mlp`` to look for a router on."""
+
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(2, 2))
+            self.mlp = torch.nn.Module()
+
+    class _LanguageModel(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+            self.trainable = torch.nn.Parameter(torch.ones(2))
+            self.config = config
+            self.vocab_size = 8
+            self.pg_collection = SimpleNamespace(tp=None)
+
+    loader = DeepseekV41Loader.__new__(DeepseekV41Loader)
+    loader.config = config
+    monkeypatch.setattr(loader, 'get_dspark_layer_spec', lambda: (config, [object()]), raising=False)
+    monkeypatch.setattr(loader, '_set_linear_is_expert', lambda module: None, raising=False)
+    monkeypatch.setattr(deepseek_v41_module, 'build_module', lambda *args, **kwargs: _Layer())
+
+    language_model = _LanguageModel()
+    loader._attach_dspark(language_model, post_process=True)
+
+    trainable = [name for name, p in language_model.dspark.named_parameters() if p.requires_grad]
+    assert list(language_model.dspark.parameters()), 'the draft stack was attached with no parameters'
+    assert not trainable, trainable
+    # this ``language_model`` has no base ``embedding`` to seed drafts from, so the stack built its own
+    assert not language_model.dspark_word_embeddings.weight.requires_grad
+    # and nothing outside the draft stack was frozen along the way
+    assert language_model.trainable.requires_grad
 
 
 def test_dspark_attention_sink_and_ring_cache():

@@ -1201,8 +1201,12 @@ class DeepseekV41Loader(DeepseekV4Loader):
         dspark_config = copy.copy(self.config)
         dspark_config.hf_config = getattr(self.config.hf_config, 'text_config', self.config.hf_config)
         dspark_config.num_layers = self.config.dspark_num_layers
-        dspark_config.num_moe_experts = self.config.dspark_num_experts
-        dspark_config.moe_router_topk = self.config.dspark_router_topk
+        # A checkpoint may leave the draft stack's expert counts out, which means its draft layers are
+        # shaped like the backbone's MoE rather than carrying their own shape.
+        if self.config.dspark_num_experts is not None:
+            dspark_config.num_moe_experts = self.config.dspark_num_experts
+        if self.config.dspark_router_topk is not None:
+            dspark_config.moe_router_topk = self.config.dspark_router_topk
         dspark_config.moe_layer_freq = [1] * self.config.dspark_num_layers
         dspark_config.first_pipeline_num_layers = None
         dspark_config.last_pipeline_num_layers = None
@@ -1237,7 +1241,8 @@ class DeepseekV41Loader(DeepseekV4Loader):
         owns the stack -- here the ``HybridModel`` backbone, which exposes ``pg_collection`` /
         ``vocab_size`` / ``config`` all the same.
         The stack is never part of the training forward (capture is inference-only), so it only
-        needs to exist here so its parameters are loaded / saved through the ``mtp.*`` bridge.
+        needs to exist here so its parameters are loaded / saved through the ``mtp.*`` bridge -- which
+        is also why it is frozen at the end of this method.
 
         ``vp_stage`` must be threaded into ``build_module`` because the draft layers reuse the
         experimental-attention ``TransformerLayer``, whose ``__init__`` calls
@@ -1282,6 +1287,19 @@ class DeepseekV41Loader(DeepseekV4Loader):
                 config=language_model.config,
                 tp_group=language_model.pg_collection.tp,
             )
+        # Nothing here runs in the training forward, so none of these parameters can ever receive a
+        # gradient -- and leaving them trainable does more than waste the optimizer state and the
+        # gradient buffers. Adam's weight decay is decoupled from the gradient, so a parameter whose
+        # gradient stays zero is still multiplied by ``1 - lr * wd`` on every step with nothing to
+        # balance it, and the ``mtp.*`` weights loaded from the checkpoint would decay away over a
+        # long run (bf16 rounding only hides this until the drift crosses one ulp of the parameter;
+        # the fp32 main weights shrink from the first step). Freezing keeps them out of the optimizer
+        # altogether. The bridge reads and writes ``param.data`` directly, so the checkpoint still
+        # round-trips the draft stack unchanged -- which is the whole reason it is built here.
+        for module in (language_model.dspark, getattr(language_model, 'dspark_word_embeddings', None)):
+            if module is not None:
+                for param in module.parameters():
+                    param.requires_grad = False
 
 
 class DeepseekV41Bridge(DeepseekV4Bridge):
@@ -1698,7 +1716,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             yield
 
         original_num_experts = self.config.num_moe_experts
-        self.config.num_moe_experts = self.config.dspark_num_experts
+        # Mirrors get_dspark_layer_spec: without its own expert count the draft stack was built with the
+        # backbone's, so the weight mapping has to agree with what was built.
+        if self.config.dspark_num_experts is not None:
+            self.config.num_moe_experts = self.config.dspark_num_experts
         try:
             for layer_idx, layer in enumerate(dspark.layers):
                 result = self._set_dspark_layer_state(layer, hf_state_dict, layer_idx, to_mcore)

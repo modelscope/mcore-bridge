@@ -401,15 +401,19 @@ class ModelConfig(TransformerConfig):
             self.mtp_num_layers = 1
         else:
             self.mtp_unroll_steps = self.mtp_num_layers
-        if self.dspark_num_layers is not None or self.dspark_block_size:
+        # ``num_nextn_predict_layers`` counts the draft layers for both DeepSeek's standard MTP and
+        # V4.1's DSpark, so it alone cannot tell them apart: on a plain V3/V4 checkpoint it means MTP
+        # and there is no DSpark at all. ``dspark_block_size`` is what actually marks a DSpark
+        # checkpoint (V4.1-Flash and the V4 Vision experiment carry it; plain V4-Flash does not).
+        if not self.dspark_block_size:
+            self.dspark_num_layers = None
+        if self.dspark_block_size:
             required_dspark = {
                 'dspark_num_layers': self.dspark_num_layers,
                 'dspark_block_size': self.dspark_block_size,
                 'dspark_noise_token_id': self.dspark_noise_token_id,
                 'dspark_target_layer_ids': self.dspark_target_layer_ids,
                 'dspark_markov_rank': self.dspark_markov_rank,
-                'dspark_num_experts': self.dspark_num_experts,
-                'dspark_router_topk': self.dspark_router_topk,
             }
             missing_dspark = [name for name, value in required_dspark.items() if value is None]
             if missing_dspark:
@@ -424,8 +428,12 @@ class ModelConfig(TransformerConfig):
                 raise ValueError('DSpark target layer IDs must refer to decoder layers.')
             if self.dspark_noise_token_id < 0 or self.dspark_noise_token_id >= self.padded_vocab_size:
                 raise ValueError('DSpark noise token ID must be inside the padded vocabulary.')
-            if self.dspark_num_experts <= 0 or not 0 < self.dspark_router_topk <= self.dspark_num_experts:
-                raise ValueError('DSpark router top-k must be positive and no larger than its expert count.')
+            # The draft stack's own expert counts are optional -- a checkpoint that omits them (as the
+            # V4 Vision experiment does) means its draft layers reuse the backbone's MoE shape, which
+            # is where the builder falls back to.
+            if self.dspark_num_experts is not None and self.dspark_router_topk is not None:
+                if self.dspark_num_experts <= 0 or not 0 < self.dspark_router_topk <= self.dspark_num_experts:
+                    raise ValueError('DSpark router top-k must be positive and no larger than its expert count.')
         if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
             self.csa_compress_ratios += [0] * self.mtp_num_layers
         if self.multi_latent_attention:
