@@ -9,6 +9,15 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.register import get_mcore_model
 
+_TE_ATTN_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_te_attention_backend(monkeypatch):
+    """Keep Megatron's process-wide attention backend selection local to each test."""
+    for variable in _TE_ATTN_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+
 
 def _config(name):
     if name == 'qwen3_5':
@@ -114,6 +123,10 @@ def test_other_model_forward_backward(name):
         from mcore_bridge.model.gpts.deepseek_v4 import McoreDSv4HybridSelfAttention
         if McoreDSv4HybridSelfAttention is object:
             pytest.skip('the installed release has no DSv4; that existing dev dependency is not a new requirement')
+    elif name == 'nemotron_h':
+        from megatron.core.ssm.mamba_mixer import HAVE_MAMBA_SSM
+        if not HAVE_MAMBA_SSM:
+            pytest.skip('requires the optional mamba-ssm dependency')
     with _parallel_context():
         config = _config(name)
         model = get_mcore_model(config)[0].cuda().train()

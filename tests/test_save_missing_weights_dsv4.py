@@ -11,21 +11,40 @@ Two properties are checked:
   * `mtp.*` keys never appear twice under two different naming schemes, which is
     what would happen if Megatron also exported its own `model.mtp.*` weights.
 """
+import json
 import os
+import shutil
+import tempfile
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# The megatron entrypoint initializes torch.distributed via env:// rendezvous.
-os.environ.setdefault('RANK', '0')
-os.environ.setdefault('LOCAL_RANK', '0')
-os.environ.setdefault('WORLD_SIZE', '1')
-os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-os.environ.setdefault('MASTER_PORT', '29901')
+import pytest
+import torch
+from megatron.core import parallel_state
+from safetensors.torch import load_file, save_file
 
-import json  # noqa: E402
-import shutil  # noqa: E402
-import tempfile  # noqa: E402
-import torch  # noqa: E402
-from safetensors.torch import load_file, save_file  # noqa: E402
+_DIST_ENV_DEFAULTS = {
+    'RANK': '0',
+    'LOCAL_RANK': '0',
+    'WORLD_SIZE': '1',
+    'MASTER_ADDR': '127.0.0.1',
+    'MASTER_PORT': '29901',
+}
+_TE_ATTN_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_megatron_runtime(monkeypatch):
+    """Provide a clean single-rank runtime and release all process-wide Megatron state."""
+    for variable, value in _DIST_ENV_DEFAULTS.items():
+        if variable not in os.environ:
+            monkeypatch.setenv(variable, value)
+    for variable in _TE_ATTN_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+    yield
+    if parallel_state.model_parallel_is_initialized():
+        parallel_state.destroy_model_parallel()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
 
 MODEL_TYPE = 'deepseek_v4'
 TEMPLATE = 'deepseek_v4_flash'
@@ -302,6 +321,8 @@ def test_dsv4_no_duplicate_mtp_when_megatron_exports_it():
 
 
 if __name__ == '__main__':
+    for variable, value in _DIST_ENV_DEFAULTS.items():
+        os.environ.setdefault(variable, value)
     test_dsv4_mtp_weights_restored()
     test_dsv4_mtp_weights_dropped_by_default()
     test_dsv4_no_duplicate_mtp_when_megatron_exports_it()

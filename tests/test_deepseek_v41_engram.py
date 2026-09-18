@@ -111,19 +111,31 @@ def test_dspark_markov_head_returns_full_logits_and_embedding():
     torch.testing.assert_close(logits, torch.tensor([[1., 2., 11., 12.], [5., 6., 15., 16.]]))
 
 
-def test_dspark_tp_modules_construct_and_run_on_one_rank(tmp_path):
+@pytest.fixture
+def single_rank_model_parallel(tmp_path):
     if dist.is_initialized() and dist.get_world_size() != 1:
-        pytest.skip('Single-rank DSpark TP smoke test.')
-    if not dist.is_initialized():
-        dist.init_process_group(
-            'gloo',
-            init_method=f'file://{tmp_path}/dspark-dist-init',
-            rank=0,
-            world_size=1,
-        )
-    if not mpu.model_parallel_is_initialized():
-        mpu.initialize_model_parallel(tensor_model_parallel_size=1)
+        pytest.skip('Single-rank model-parallel test.')
+    created_process_group = not dist.is_initialized()
+    created_model_parallel = not mpu.model_parallel_is_initialized()
+    try:
+        if created_process_group:
+            dist.init_process_group(
+                'gloo',
+                init_method=f'file://{tmp_path}/single-rank-dist-init',
+                rank=0,
+                world_size=1,
+            )
+        if created_model_parallel:
+            mpu.initialize_model_parallel(tensor_model_parallel_size=1)
+        yield
+    finally:
+        if created_model_parallel and mpu.model_parallel_is_initialized():
+            mpu.destroy_model_parallel()
+        if created_process_group and dist.is_initialized():
+            dist.destroy_process_group()
 
+
+def test_dspark_tp_modules_construct_and_run_on_one_rank(single_rank_model_parallel):
     config = TransformerConfig(
         num_layers=1,
         hidden_size=4,
@@ -180,7 +192,7 @@ def test_dspark_tp_modules_construct_and_run_on_one_rank(tmp_path):
     assert confidence.shape == (2, 3)
 
 
-def test_attach_dspark_freezes_the_draft_stack(tmp_path, monkeypatch):
+def test_attach_dspark_freezes_the_draft_stack(single_rank_model_parallel, monkeypatch):
     """The draft stack has to be attached frozen.
 
     It is deliberately kept out of the training forward -- it exists so the checkpoint's ``mtp.*``
@@ -190,18 +202,6 @@ def test_attach_dspark_freezes_the_draft_stack(tmp_path, monkeypatch):
     every step still multiplies them by ``1 - lr * wd`` with nothing pushing back, and the weights the
     stack exists to carry erode over a long run.
     """
-    if dist.is_initialized() and dist.get_world_size() != 1:
-        pytest.skip('Single-rank DSpark construction test.')
-    if not dist.is_initialized():
-        dist.init_process_group(
-            'gloo',
-            init_method=f'file://{tmp_path}/dspark-freeze-init',
-            rank=0,
-            world_size=1,
-        )
-    if not mpu.model_parallel_is_initialized():
-        mpu.initialize_model_parallel(tensor_model_parallel_size=1)
-
     config = TransformerConfig(
         num_layers=1,
         hidden_size=4,
