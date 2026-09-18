@@ -111,6 +111,9 @@ class QSAIndexer(nn.Module):
             dtype=config.params_dtype,
             sequence_parallel=config.sequence_parallel)
         setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
+        # QSA selection is non-differentiable and always runs without autograd.
+        # Keep its pretrained parameters out of optimizer groups and DDP buckets.
+        self.requires_grad_(False)
 
     def forward(self, *args, **kwargs):
         raise RuntimeError('QSAIndexer selects via selection_as_mask / selection_as_token_indices / '
