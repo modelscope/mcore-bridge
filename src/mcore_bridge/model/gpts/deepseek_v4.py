@@ -552,6 +552,12 @@ class DeepseekV4Bridge(GPTBridge):
     hf_post_attention_layernorm_key = 'ffn_norm.weight'
     hf_expert_bias_key = 'gate.bias'
 
+    def _normalize_missing_weight_key(self, key: str) -> str:
+        # Native checkpoints use `mtp.*`, while Megatron exports the same stack as
+        # `model.mtp.*`. Treat them as one identity so save_missing_weights never
+        # writes both namespaces into the same checkpoint.
+        return key[len('model.'):] if key.startswith('model.mtp.') else key
+
     def _set_o_group_proj_grouped(self, mg_attn, hf_state_dict, to_mcore):
         """Handle GroupedLinear state dict for linear_o_group_proj in fp8 mode.
 

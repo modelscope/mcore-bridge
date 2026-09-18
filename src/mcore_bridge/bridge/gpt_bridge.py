@@ -2163,6 +2163,10 @@ class GPTBridge:
         saver.finalize()
         dist.barrier()  # Ensure all weights are saved completely
 
+    def _normalize_missing_weight_key(self, key: str) -> str:
+        """Return the identity used to detect aliases while restoring source-only weights."""
+        return key
+
     def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
         """Copy tensors present in the source checkpoint but absent from the exported ones.
 
@@ -2179,7 +2183,9 @@ class GPTBridge:
             return
         with SafetensorLazyLoader(source_model_dir) as loader:
             state_dict = loader.get_state_dict()
-            missing_keys = sorted(set(state_dict.keys()) - saved_keys)
+            saved_identities = {self._normalize_missing_weight_key(key) for key in saved_keys}
+            missing_keys = sorted(
+                key for key in state_dict if self._normalize_missing_weight_key(key) not in saved_identities)
             if not missing_keys:
                 return
             logger.info(f'Restoring {len(missing_keys)} weights from the source checkpoint '

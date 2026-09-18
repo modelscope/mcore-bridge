@@ -796,7 +796,7 @@ def test_engram_gathers_cp_sharded_input_ids_but_leaves_full_ones_alone(monkeypa
 
 
 def test_engram_cp_local_sequence_length_undoes_the_inner_sp_split(monkeypatch):
-    monkeypatch.setattr(engram_adapter, 'get_pg_size', lambda group: 2)
+    monkeypatch.setattr(engram_adapter, 'get_pg_size', lambda group: 2, raising=False)
     hidden_states = torch.zeros(4, 1, 8)
 
     assert _bare_engram(2)._cp_local_sequence_length(hidden_states) == 4
