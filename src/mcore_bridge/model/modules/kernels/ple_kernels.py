@@ -477,13 +477,19 @@ if HAVE_TRITON:
                     DIL=dilation,
                     BLOCK_W=BW)
 
+            # The convolution backward has consumed the recomputed norm output.
+            del normed
+
             # norm_conv backward: dwc on host, dx via kernel (fp32).
             x_hat = (gated.view(T, n, C) * rstdc.unsqueeze(-1)).view(T, W)
             dwc = (dnormed * x_hat).sum(dim=0).to(wc.dtype)
+            del x_hat
             dgated_norm = torch.empty(T, W, dtype=torch.float32, device=dev)
             if T > 0:
                 _ple_norm_bwd_kernel[(T * n, )](gated, wc, rstdc, dnormed, dgated_norm, T, N=n, C=C, BLOCK_C=block_c)
             dgated += dgated_norm
+            # Release token-sized FP32 temporaries before gate gradient buffers.
+            del gated, dnormed, dgated_norm
 
             dkey = torch.empty_like(key)
             dquery = torch.empty_like(hc_state)

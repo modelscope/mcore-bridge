@@ -148,3 +148,21 @@ def test_rotate_half_matches_reference():
 
     x1, x2 = x[..., :4], x[..., 4:]
     torch.testing.assert_close(got, torch.cat((-x2, x1), dim=-1))
+
+
+@pytest.mark.parametrize('ties', [False, True])
+def test_qsa_unpacked_chunked_matches_single_chunk_bitwise(monkeypatch, ties):
+    import mcore_bridge.model.modules.qsa_indexer as qi
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    torch.manual_seed(37)
+    idx, cfg = _make_idx(compress_ratio=4, budget=32, device=device)
+    hidden = torch.randn(73, 2, cfg.hidden_size, device=device)
+    if ties:
+        hidden.zero_()
+    freqs = torch.randn(73, 1, 1, cfg.indexer_head_dim, device=device)
+    monkeypatch.setattr(qi, '_QSA_INDEX_SCORE_CHUNK_BYTES', 1 << 62)
+    expected = idx._score_and_topk_blocks(hidden, freqs)
+    monkeypatch.setattr(qi, '_QSA_INDEX_SCORE_CHUNK_BYTES', 1024)
+    actual = idx._score_and_topk_blocks(hidden, freqs)
+    for result, reference in zip(actual, expected):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)

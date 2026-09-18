@@ -4,7 +4,7 @@ import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
 
-# Byte budget for the transient score tile in select_token_indices_thd: the (token, block)
+# Byte budget for the transient score tile in packed and unpacked selection: the (token, block)
 # scoring is chunked over queries to avoid OOM from the full [T, n_heads, NB] fp32 tensor.
 # Tests monkeypatch this to compare one chunk (un-chunked reference) vs many chunks.
 _QSA_INDEX_SCORE_CHUNK_BYTES = 1024 * 1024 * 1024
@@ -180,18 +180,23 @@ class QSAIndexer(nn.Module):
         starts = torch.arange(max_blocks, device=device) * R
         block_keys = apply_rope(pooled, cos[:, starts], sin[:, starts])  # [b, nb, d]
 
-        # ---- score all (query, block) pairs ----
-        scores = torch.einsum('bqhd,bkd->bqhk', q.float(), block_keys.float())
-        scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)  # [b, s, nb]
-
-        # ---- restrict to blocks fully inside the causal prefix ----
-        n_blocks = (torch.arange(s, device=device) + 1) // R  # [s]
+        # Bound score workspace by queries, preserving all candidate blocks.
+        chunk_size = max(1, min(s, _QSA_INDEX_SCORE_CHUNK_BYTES // max(1, b * self.index_n_heads * max_blocks * 4)))
+        n_blocks = (torch.arange(s, device=device) + 1) // R
         block_ids = torch.arange(max_blocks, device=device)
-        scores = scores.masked_fill((block_ids[None, :] >= n_blocks[:, None])[None], float('-inf'))
-
         k = min(self.block_topk, max_blocks)
-        top_blocks = scores.topk(k, dim=-1).indices  # [b, s, k]
-        keep = top_blocks < n_blocks[None, :, None]  # drop the -inf padding slots
+        top_blocks = torch.empty((b, s, k), dtype=torch.long, device=device)
+        keep = torch.empty((b, s, k), dtype=torch.bool, device=device)
+        keys_float = block_keys.float()
+        for start in range(0, s, chunk_size):
+            end = min(start + chunk_size, s)
+            scores = torch.einsum('bqhd,bkd->bqhk', q[:, start:end].float(), keys_float)
+            scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)
+            scores = scores.masked_fill((block_ids[None, :] >= n_blocks[start:end, None])[None], float('-inf'))
+            selected = scores.topk(k, dim=-1).indices
+            top_blocks[:, start:end] = selected
+            keep[:, start:end] = selected < n_blocks[None, start:end, None]
+            del scores, selected
         return top_blocks, keep, n_blocks
 
     @torch.no_grad()

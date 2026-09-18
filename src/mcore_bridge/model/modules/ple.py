@@ -265,8 +265,10 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             # scalar `weight_scale`, so divide by the scale stashed during loading
             # and cast back to fp8. Without a known scale the values cannot be
             # represented as fp8 + scale; keep the current dtype and warn.
-            scale = getattr(self, '_ngram_weight_scale', None)
-            if scale is None:
+            # Updated BF16 parameters cannot be losslessly requantized with the
+            # original checkpoint scale. Only immutable host tables reuse it.
+            scale = getattr(self, '_ngram_weight_scale', None) if self.cpu_offload else None
+            if scale is None and self.cpu_offload:
                 get_logger().warning(f'`{self._NGRAM_SCALE_KEY}` was not seen during loading; exporting the PLE ngram '
                                      'embedding without re-quantizing to fp8.')
             # Reduce on GPU: NCCL has no CPU backend, and the host table is pinned
