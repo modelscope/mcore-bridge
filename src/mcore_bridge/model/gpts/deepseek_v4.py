@@ -215,7 +215,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            # Per-head query RMS norm is a V4-only step: V4.1 normalizes the query latent
+            # (``q_layernorm``) and feeds ``wq_b``'s output straight into RoPE, so applying it
+            # here would rescale every head to unit RMS and change the attention scores.
+            if self.config.dsv4_version == 'v4':
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
