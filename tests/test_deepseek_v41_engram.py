@@ -601,38 +601,6 @@ def test_engram_hash_blocks_suffixes_after_excluded_token():
     assert torch.equal(hashes, torch.tensor([[[5, 5]]]))
 
 
-def test_engram_static_inference_cache_matches_full_sequence_hashing():
-    module = engram_adapter.DeepseekV41Engram.__new__(engram_adapter.DeepseekV41Engram)
-    torch.nn.Module.__init__(module)
-    module.engram_config = SimpleNamespace(
-        excluded_token_ids=(99, ),
-        max_ngram_order=3,
-        num_hash_heads=1,
-        hash_boundary_token_id=0,
-        boundary_token_id=0,
-        num_tables=2,
-        variant_spec=SimpleNamespace(resets_windows_at_boundary_token=False),
-    )
-    module.tokenizer_remap = None
-    module.hash_multipliers = torch.tensor([11, 13, 15])
-    module.table_sizes = torch.tensor([997, 991])
-    full_hashes, full_live = module._build_hash_ids(torch.tensor([[1, 2, 3]]))
-    context = SimpleNamespace(
-        max_batch_size=1,
-        max_sequence_length=8,
-        batch_size_offset=0,
-        sequence_len_offset=0,
-        is_static_batching=lambda: True,
-    )
-
-    prefill_hashes, prefill_live = module._build_hash_ids(torch.tensor([[1, 2]]), context)
-    context.sequence_len_offset = 2
-    decode_hashes, decode_live = module._build_hash_ids(torch.tensor([[3]]), context)
-
-    assert torch.equal(torch.cat((prefill_hashes, decode_hashes), dim=1), full_hashes)
-    assert torch.equal(torch.cat((prefill_live, decode_live), dim=1), full_live)
-
-
 def _ngram_hash_kwargs():
     return dict(
         tokenizer_remap=None,
@@ -767,40 +735,6 @@ def test_engram_cp_local_sequence_length_undoes_the_inner_sp_split(monkeypatch):
     module = _bare_engram(2, sequence_parallel=True)
     module.tp_group = None
     assert module._cp_local_sequence_length(hidden_states) == 8
-
-
-def test_engram_layer_spec_uses_bridge_owned_module():
-    if not engram_adapter.has_native_engram():
-        pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
-    from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.core.transformer.transformer_layer import (
-        HyperConnectionTransformerLayer,
-        TransformerLayerSubmodules,
-    )
-
-    layer_spec = ModuleSpec(
-        module=HyperConnectionTransformerLayer,
-        submodules=TransformerLayerSubmodules(),
-    )
-    block_spec = SimpleNamespace(layer_specs=[layer_spec])
-    config = SimpleNamespace(layer_ids=(1, ))
-
-    engram_adapter.adapt_deepseek_v41_layer_specs(block_spec, config)
-
-    assert layer_spec.module is engram_adapter.DeepseekV41HyperConnectionTransformerLayer
-    assert layer_spec.submodules.engram.module is engram_adapter.DeepseekV41Engram
-
-
-def test_allow_engram_inference_preserves_input_ids_and_restores_flag():
-    config = SimpleNamespace(engram_enabled=True)
-    input_ids = torch.tensor([[1, 2]])
-
-    with engram_adapter.allow_engram_inference(config, input_ids, {'marker': 1}) as kwargs:
-        assert not config.engram_enabled
-        assert kwargs['marker'] == 1
-        assert kwargs['input_ids'] is input_ids
-
-    assert config.engram_enabled
 
 
 class _Table:

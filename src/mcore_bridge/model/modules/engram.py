@@ -2,7 +2,6 @@
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
 import dataclasses
-from contextlib import contextmanager
 
 import torch
 from torch import Tensor
@@ -248,103 +247,20 @@ class DeepseekV41Engram(Engram):
             live = live & (input_ids != token_id)
         return torch.where(live, input_ids, input_ids.new_full((), -1)), live
 
-    def _hash_windows(self, token_windows: Tensor) -> Tensor:
-        return _hash_token_windows(
-            token_windows,
+    def _build_hash_ids(self, input_ids: Tensor, cu_seqlens: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        masked_ids, live = self._mask_excluded_tokens(input_ids)
+        hashes = _build_ngram_hashes(
+            masked_ids,
             self.tokenizer_remap,
             self.hash_multipliers,
             self.table_sizes,
             self.engram_config.max_ngram_order,
             self.engram_config.num_hash_heads,
             self.engram_config.hash_boundary_token_id,
-            invalid_token_id=-1,
+            self.engram_config.variant_spec.resets_windows_at_boundary_token,
+            cu_seqlens=cu_seqlens,
         )
-
-    def _static_inference_hashes(self, input_ids: Tensor, context) -> tuple[Tensor, Tensor]:
-        batch_size, sequence_length = input_ids.shape
-        shape = (context.max_batch_size, context.max_sequence_length)
-        cache = getattr(context, 'engram_token_cache', None)
-        if cache is None or cache.device != input_ids.device or cache.shape != shape:
-            cache = input_ids.new_full(shape, self.engram_config.boundary_token_id)
-            context.engram_token_cache = cache
-
-        batch_start = context.batch_size_offset
-        batch_end = batch_start + batch_size
-        sequence_start = context.sequence_len_offset
-        sequence_end = sequence_start + sequence_length
-        if batch_end > shape[0] or sequence_end > shape[1]:
-            raise ValueError('Engram inference token cache is too small for the current batch/chunk.')
-        masked_ids, live = self._mask_excluded_tokens(input_ids)
-        cache[batch_start:batch_end, sequence_start:sequence_end] = masked_ids
-        shifts = torch.arange(
-            self.engram_config.max_ngram_order, device=input_ids.device, dtype=torch.long)
-        positions = torch.arange(
-            sequence_start, sequence_end, device=input_ids.device, dtype=torch.long).unsqueeze(-1) - shifts
-        gather_positions = positions.clamp_min(0).reshape(1, -1).expand(batch_size, -1)
-        windows = cache[batch_start:batch_end].gather(1, gather_positions).view(
-            batch_size, sequence_length, self.engram_config.max_ngram_order)
-        windows = torch.where(
-            positions.unsqueeze(0) >= 0,
-            windows,
-            windows.new_full((), self.engram_config.boundary_token_id),
-        )
-        return self._hash_windows(windows), live
-
-    def _dynamic_inference_hashes(self, input_ids: Tensor, context) -> tuple[Tensor, Tensor]:
-        if input_ids.shape[0] != 1:
-            raise ValueError('Dynamic Engram inference expects flattened input_ids with batch size 1.')
-        shape = (context.max_requests, context.max_sequence_length)
-        cache = getattr(context, 'engram_token_cache', None)
-        if cache is None or cache.device != input_ids.device or cache.shape != shape:
-            cache = input_ids.new_full(shape, self.engram_config.boundary_token_id)
-            context.engram_token_cache = cache
-
-        total_tokens = input_ids.shape[1]
-        active_tokens = min(int(context.active_token_count), total_tokens)
-        live = torch.zeros_like(input_ids, dtype=torch.bool)
-        hashes = input_ids.new_zeros((1, total_tokens, self.engram_config.num_tables), dtype=torch.long)
-        if active_tokens == 0:
-            return hashes, live
-        request_indices = context.gpu_view.token_to_request_idx[:active_tokens].long()
-        token_positions = context.gpu_view.token_to_position_in_request[:active_tokens].long()
-        if request_indices.min() < 0 or request_indices.max() >= shape[0]:
-            raise ValueError('Dynamic Engram inference received an out-of-range request index.')
-        if token_positions.min() < 0 or token_positions.max() >= shape[1]:
-            raise ValueError('Dynamic Engram inference received an out-of-range token position.')
-        masked_ids, active_live = self._mask_excluded_tokens(input_ids[:, :active_tokens])
-        cache[request_indices, token_positions] = masked_ids.squeeze(0)
-        shifts = torch.arange(
-            self.engram_config.max_ngram_order, device=input_ids.device, dtype=torch.long)
-        positions = token_positions.unsqueeze(-1) - shifts
-        windows = cache[request_indices.unsqueeze(-1).expand_as(positions), positions.clamp_min(0)]
-        windows = torch.where(
-            positions >= 0,
-            windows,
-            windows.new_full((), self.engram_config.boundary_token_id),
-        )
-        hashes[:, :active_tokens] = self._hash_windows(windows.unsqueeze(0))
-        live[:, :active_tokens] = active_live
         return hashes, live
-
-    def _build_hash_ids(self, input_ids: Tensor, inference_context=None,
-                        cu_seqlens: Tensor | None = None) -> tuple[Tensor, Tensor]:
-        masked_ids, live = self._mask_excluded_tokens(input_ids)
-        if inference_context is None:
-            hashes = _build_ngram_hashes(
-                masked_ids,
-                self.tokenizer_remap,
-                self.hash_multipliers,
-                self.table_sizes,
-                self.engram_config.max_ngram_order,
-                self.engram_config.num_hash_heads,
-                self.engram_config.hash_boundary_token_id,
-                self.engram_config.variant_spec.resets_windows_at_boundary_token,
-                cu_seqlens=cu_seqlens,
-            )
-            return hashes, live
-        if inference_context.is_static_batching():
-            return self._static_inference_hashes(input_ids, inference_context)
-        return self._dynamic_inference_hashes(input_ids, inference_context)
 
     def _cp_local_sequence_length(self, hidden_states: Tensor) -> int:
         """Length of this rank's CP slice, undoing the innermost SP split first."""
@@ -388,6 +304,10 @@ class DeepseekV41Engram(Engram):
     def forward(self, hidden_states: Tensor, input_ids: Tensor, inference_context=None) -> Tensor:
         if inference_context is None:
             inference_context = getattr(self, '_bridge_inference_context', None)
+        if inference_context is not None:
+            raise RuntimeError(
+                'DeepSeek-V4.1 Engram inference is not wired into this integration; rollout runs '
+                'through vLLM, so the Engram module supports the training forward only.')
         packed_seq_params = getattr(self, '_bridge_packed_seq_params', None)
         if hidden_states.ndim != 3:
             raise ValueError(f'Engram hidden_states must be [S,B,H], got {hidden_states.shape}.')
@@ -395,8 +315,6 @@ class DeepseekV41Engram(Engram):
         if hidden_states.shape[-1] != expected_hidden:
             raise ValueError(f'Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}.')
         context_parallel = self.config.context_parallel_size > 1
-        if context_parallel and inference_context is not None:
-            raise ValueError('Engram inference does not support context parallelism.')
 
         cu_seqlens = None
         if packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', None) == 'thd':
@@ -422,7 +340,7 @@ class DeepseekV41Engram(Engram):
             if context_parallel:
                 input_ids = self._gather_input_ids_for_context_parallel(
                     input_ids, self._cp_local_sequence_length(hidden_states))
-            hash_ids, live_tokens = self._build_hash_ids(input_ids, inference_context, cu_seqlens)
+            hash_ids, live_tokens = self._build_hash_ids(input_ids, cu_seqlens)
             live_tokens = live_tokens.unsqueeze(-1)
             # CP is the outer split and SP the inner one, so undo them in that order.
             hash_ids = self._slice_for_context_parallel(hash_ids)
@@ -482,39 +400,3 @@ if TransformerLayer is not None:
 else:
     DeepseekV41TransformerLayer = None
     DeepseekV41HyperConnectionTransformerLayer = None
-
-
-def adapt_deepseek_v41_layer_specs(transformer_layer_spec, engram_config):
-    """Attach the V4.1 Engram module and inference-aware layer subclasses."""
-    if not has_native_engram():
-        raise RuntimeError('The installed Megatron-Core does not provide Engram.')
-    from megatron.core.transformer.spec_utils import ModuleSpec
-
-    engram_spec = ModuleSpec(module=DeepseekV41Engram, params={'engram_config': engram_config})
-    for layer_spec in transformer_layer_spec.layer_specs:
-        if layer_spec.module is HyperConnectionTransformerLayer:
-            layer_spec.module = DeepseekV41HyperConnectionTransformerLayer
-        elif layer_spec.module is TransformerLayer:
-            layer_spec.module = DeepseekV41TransformerLayer
-        if not hasattr(layer_spec.submodules, 'engram'):
-            raise RuntimeError(
-                'The installed Engram extension does not expose TransformerLayerSubmodules.engram.')
-        layer_spec.submodules.engram = engram_spec
-    return transformer_layer_spec
-
-
-@contextmanager
-def allow_engram_inference(model_config, input_ids, extra_block_kwargs):
-    """Bypass PR #7231's inference guard while preserving input_ids propagation."""
-    if not getattr(model_config, 'engram_enabled', False):
-        yield extra_block_kwargs
-        return
-    if input_ids is None:
-        raise ValueError('Engram requires input token IDs on every pipeline stage.')
-    block_kwargs = dict(extra_block_kwargs or {})
-    block_kwargs['input_ids'] = input_ids
-    model_config.engram_enabled = False
-    try:
-        yield block_kwargs
-    finally:
-        model_config.engram_enabled = True
