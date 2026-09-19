@@ -309,7 +309,8 @@ class GPTModel(McoreGPTModel):
                 padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
             extra_block_kwargs['padding_mask'] = padding_mask.contiguous()
 
-        if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None):
+        if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None) \
+                or getattr(self.config, 'moe_router_enable_vl_bias', False):
             extra_block_kwargs['input_ids'] = input_ids
         if getattr(self.config, 'indexer_n_heads', None) is not None:
             extra_block_kwargs['position_ids'] = position_ids

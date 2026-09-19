@@ -31,6 +31,16 @@ class MultimodalGPTModel(MegatronModule):
                                                       **kwargs)
         self.vp_stage = self.language_model.vp_stage
         self.share_embeddings_and_output_weights = self.language_model.share_embeddings_and_output_weights
+        # Surface the language model's typed-pipeline payload interface on the wrapper. The PP
+        # schedulers locate it with ``get_attr_wrapped_model(chunk, 'pipeline_payload_factory')``,
+        # which only descends through ``.module`` wrappers and never reaches ``self.language_model``.
+        # Without this a HybridModel backbone that configures a custom cross-stage payload (e.g.
+        # DeepSeek-V4.1 CSA2 / single-pass mHC) is not recognised as typed, so both the 1F1B and the
+        # interleaved (VPP) schedules fall back to the shape-based ``P2PCommunicator`` -- which calls
+        # ``.size()`` on the payload object and crashes. Backbones without a payload (plain
+        # ``GPTModel``, GLM's HybridModel adapter) expose ``None`` here and keep the legacy path.
+        self.pipeline_payload_factory = getattr(self.language_model, 'pipeline_payload_factory', None)
+        self.pipeline_payload_spec = getattr(self.language_model, 'pipeline_payload_spec', None)
         self.model_meta = config.model_meta
         self.visual = None
         if pre_process and self.model_meta.visual_cls is not None:
@@ -59,7 +69,8 @@ class MultimodalGPTModel(MegatronModule):
                     kwargs.update(res)
                     res = inputs_embeds
             if self.config.context_parallel_size > 1:
-                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1)
+                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1,
+                                      cp_partition_mode=self.config.cp_partition_mode)
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 res = scatter_to_sequence_parallel_region(res, group=_self.tp_group)
@@ -87,14 +98,17 @@ class MultimodalGPTModel(MegatronModule):
         runtime_gather_output: Optional[bool] = None,
         **kwargs,
     ) -> torch.Tensor:
+        inference_context = kwargs.pop('inference_context', None)
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
+        cp_partition_mode = self.config.cp_partition_mode
         needs_split = cp_size > 1 and input_ids is not None and position_ids.shape[-1] * cp_size == input_ids.shape[-1]
         if decoder_input is not None:
             pass
         elif self.pre_process:
-            input_ids_ = input_ids if needs_split else reconstruct_tensor_cp(input_ids, packed_seq_params, dim=1)
+            input_ids_ = input_ids if needs_split else reconstruct_tensor_cp(
+                input_ids, packed_seq_params, dim=1, cp_partition_mode=cp_partition_mode)
             kwargs.update({'input_ids': input_ids_, 'packed_seq_params': packed_seq_params})
             with self._patch_word_embeddings(kwargs):
                 decoder_input = self.language_model.embedding(input_ids=input_ids_, position_ids=position_ids)
@@ -105,13 +119,15 @@ class MultimodalGPTModel(MegatronModule):
             kwargs = {}
         kwargs.update(extra_kwargs)
         if needs_split:
-            input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1)
+            input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1,
+                                        cp_partition_mode=cp_partition_mode)
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,
             attention_mask=attention_mask,
             decoder_input=decoder_input,
             labels=labels,
+            inference_context=inference_context,
             inference_params=inference_params,
             packed_seq_params=packed_seq_params,
             runtime_gather_output=runtime_gather_output,
