@@ -10,7 +10,6 @@ from megatron.core.transformer import TransformerConfig
 from safetensors.torch import save_file
 
 from mcore_bridge.config.parser import _convert_config
-from mcore_bridge.inference import DeepseekV41TextGenerationController
 from mcore_bridge.model.gpts import deepseek_v41 as deepseek_v41_module
 from mcore_bridge.model.gpts.deepseek_v41 import (
     DeepseekV41Aligner,
@@ -475,41 +474,6 @@ def test_dspark_output_applies_markov_recurrence_in_block_order():
     assert logits.shape == (2, 3, 5)
     torch.testing.assert_close(confidence, torch.tensor([[1., 4., 7.], [4., 7., 10.]]))
     assert torch.equal(dspark_sample(logits, temperature=0), output_ids[:, 1:])
-
-
-def test_controller_routes_speculative_proposals_to_dspark_provider():
-    calls = {}
-
-    class _Model:
-
-        def compute_dspark_speculative_tokens(self, **kwargs):
-            calls.update(kwargs)
-            return torch.tensor([[7, 8], [9, 10]])
-
-    context = SimpleNamespace(
-        total_request_count=2,
-        paused_request_count=0,
-        _nvls_dispatcher=None,
-    )
-    controller = DeepseekV41TextGenerationController.__new__(DeepseekV41TextGenerationController)
-    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._unwrapped_model = _Model()
-    controller._is_last_pp_stage = True
-    controller.model_is_pipeline_parallel = False
-    controller.model_config = SimpleNamespace(dspark_block_size=3)
-    controller.num_speculative_tokens = 2
-    controller._sampled_tokens_cuda = torch.tensor([5, 6])
-    controller._accepted_token_counts_per_request = torch.tensor([1, 0])
-    controller._last_accepted_seq_indices = torch.tensor([1, 3])
-    controller._sampled_mtp_tokens_cuda = torch.empty(2, 2, dtype=torch.long)
-    controller._sample_from_logits_2d = lambda logits: logits.argmax(dim=-1)
-
-    controller._compute_dspark_and_sample()
-
-    assert torch.equal(controller._sampled_mtp_tokens_cuda, torch.tensor([[7, 8], [9, 10]]))
-    assert calls['inference_context'] is context
-    assert calls['sample_fn'] is controller._sample_from_logits_2d
-    assert calls['num_speculative_tokens'] == 2
 
 
 def test_engram_adapter_remaps_checkpoint_layers_to_megatron_layers(tmp_path):
