@@ -78,7 +78,8 @@ def _qsa_bs_fwd_kernel(
     BK: tl.constexpr,
     BLK: tl.constexpr,
 ):
-    pid_t = tl.program_id(0)
+    # The selection bitmap exceeds 2 GiB at long context lengths.
+    pid_t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     kv_head = pid_h // GROUP
 
@@ -105,7 +106,7 @@ def _qsa_bs_fwd_kernel(
     # over the tile's queries; per-query exactness comes from the mask below.
     n_tiles = tl.load(KCNT + pid_t)
     for i in range(0, n_tiles):
-        kt = tl.load(KLIST + pid_t * stride_kl + i)
+        kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
         offs_k = kt * BK + tl.arange(0, BK)
         k_in = offs_k < T
 
@@ -193,7 +194,7 @@ def _qsa_bs_dq_kernel(
     BK: tl.constexpr,
     BLK: tl.constexpr,
 ):
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     kv_head = pid_h // GROUP
 
@@ -217,7 +218,7 @@ def _qsa_bs_dq_kernel(
     dq = tl.zeros((BQ, D), tl.float32)
     n_tiles = tl.load(KCNT + pid_t)
     for i in range(0, n_tiles):
-        kt = tl.load(KLIST + pid_t * stride_kl + i)
+        kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
         offs_k = kt * BK + tl.arange(0, BK)
         k_in = offs_k < T
 
@@ -298,7 +299,7 @@ def _qsa_bs_dkdv_kernel(
     from separate programs would have them overwrite each other (the gather kernel got away
     with it only because it used atomic_add).
     """
-    pid_k = tl.program_id(0)
+    pid_k = tl.program_id(0).to(tl.int64)
     kv_head = tl.program_id(1)
 
     offs_k = pid_k * BK + tl.arange(0, BK)
@@ -314,7 +315,7 @@ def _qsa_bs_dkdv_kernel(
 
     n_q = tl.load(QCNT + pid_k)
     for i in range(0, n_q):
-        qt = tl.load(QLIST + pid_k * stride_ql + i)
+        qt = tl.load(QLIST + pid_k * stride_ql + i).to(tl.int64)
         offs_q = qt * BQ + tl.arange(0, BQ)
         q_mask = offs_q < T
         lo = tl.load(LO + offs_q, mask=q_mask, other=0)
