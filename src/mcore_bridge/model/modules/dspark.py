@@ -6,7 +6,13 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.hyper_connection import SinglePassMHCState
+
+try:
+    from megatron.core.transformer.hyper_connection import SinglePassMHCState
+except ImportError:
+    # mHC (SinglePassMHCState) is a dev-only Megatron API; keep the import optional so the package
+    # loads on stable releases. Only the DeepSeek-V4.1 mHC path below dereferences it at runtime.
+    SinglePassMHCState = None
 from torch import nn
 from typing import Callable, Optional, Sequence
 

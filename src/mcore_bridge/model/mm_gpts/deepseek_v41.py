@@ -38,7 +38,15 @@ from dataclasses import dataclass
 from megatron.core import mpu, parallel_state
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
-from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.module import MegatronModule
+
+try:
+    from megatron.core.transformer.module import mark_keep_in_fp32
+except ImportError:
+    # dev-only Megatron helper; degrade to a no-op so this module imports on stable releases.
+    def mark_keep_in_fp32(tensor):
+        tensor.keep_in_fp32 = True
+        return tensor
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock as McoreTransformerBlock
 from torch import nn
@@ -56,7 +64,7 @@ from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
 from ..rope import get_rope_inv_freq
-from .deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
+from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
 
 try:
     from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2Compressor as McoreCSA2Compressor

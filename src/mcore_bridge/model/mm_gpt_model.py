@@ -73,7 +73,7 @@ class MultimodalGPTModel(MegatronModule):
                     res,
                     getattr(packed_seq_params, 'cu_seqlens_q', None),
                     1,
-                    cp_partition_mode=self.config.cp_partition_mode)
+                    cp_partition_mode=getattr(self.config, 'cp_partition_mode', 'zigzag'))
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 res = scatter_to_sequence_parallel_region(res, group=_self.tp_group)
@@ -105,7 +105,7 @@ class MultimodalGPTModel(MegatronModule):
         extra_kwargs = {k: kwargs[k] for k in self.language_model.extra_forward_keys}
         # Compatible with legacy mcore-bridge behavior.
         cp_size = self.config.context_parallel_size
-        cp_partition_mode = self.config.cp_partition_mode
+        cp_partition_mode = getattr(self.config, 'cp_partition_mode', 'zigzag')
         needs_split = cp_size > 1 and input_ids is not None and position_ids.shape[-1] * cp_size == input_ids.shape[-1]
         if decoder_input is not None:
             pass

@@ -144,7 +144,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # Attention heads [s, b, n*h]
         assert (hidden_states.ndim == 3), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
         if packed_seq_params is not None:
-            assert (packed_seq_params.local_cp_size
+            assert (getattr(packed_seq_params, 'local_cp_size', None)
                     is None), 'dynamic_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable dynamic_context_parallel.'
 
@@ -218,7 +218,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # Per-head query RMS norm is a V4-only step: V4.1 normalizes the query latent
             # (``q_layernorm``) and feeds ``wq_b``'s output straight into RoPE, so applying it
             # here would rescale every head to unit RMS and change the attention scores.
-            if self.config.dsv4_version == 'v4':
+            if getattr(self.config, 'dsv4_version', 'v4') == 'v4':
                 q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
@@ -282,7 +282,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             return query, key, value, boundary_kv
 
         if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
+            quantization = self.config.fp8 or getattr(self.config, 'fp4', None)
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_hidden is None:
                 query, key, value = self.qkv_up_checkpoint.checkpoint(qkv_up_proj_and_rope_apply, q_compressed,
@@ -342,7 +342,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
-        if use_thd_cp and packed_seq_params.cp_partition_mode != 'contiguous':
+        if use_thd_cp and getattr(packed_seq_params, 'cp_partition_mode', 'zigzag') != 'contiguous':
             raise ValueError('DSv4 THD CP requires a contiguous CP partition.')
 
         boundary_hidden = None

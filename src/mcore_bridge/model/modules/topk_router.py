@@ -28,9 +28,14 @@ class TopKRouter(McoreTopKRouter):
             else:
                 self.expert_bias_vl = None
 
-    def routing(self, logits, padding_mask=None, input_ids=None, packed_seq_params=None):
+    def routing(self, logits, *args, **kwargs):
+        # The base ``routing`` signature differs across Megatron releases (older versions take
+        # only ``logits``), so pass the extra arguments straight through instead of pinning them.
         if self.expert_bias_vl is None or self._mcore_has_native_vl_bias:
-            return super().routing(logits, padding_mask, input_ids, packed_seq_params)
+            return super().routing(logits, *args, **kwargs)
+        input_ids = kwargs.get('input_ids')
+        if input_ids is None and len(args) >= 2:
+            input_ids = args[1]
         if input_ids is None:
             raise ValueError('input_ids is required when VL expert bias is enabled.')
 
@@ -52,7 +57,7 @@ class TopKRouter(McoreTopKRouter):
             original_expert_bias.unsqueeze(0),
         )
         try:
-            return super().routing(logits, padding_mask, input_ids, packed_seq_params)
+            return super().routing(logits, *args, **kwargs)
         finally:
             self.expert_bias = original_expert_bias
 
