@@ -47,6 +47,8 @@ except ImportError:
     def mark_keep_in_fp32(tensor):
         tensor.keep_in_fp32 = True
         return tensor
+
+
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock as McoreTransformerBlock
 from torch import nn
@@ -61,10 +63,10 @@ from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41Tra
 from mcore_bridge.utils import is_master
 
 from ..constant import ModelType
+from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
 from ..rope import get_rope_inv_freq
-from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
 
 try:
     from megatron.core.transformer.experimental_attention_variant.csa2 import CSA2Compressor as McoreCSA2Compressor
