@@ -13,10 +13,9 @@ Two properties are checked:
 """
 import json
 import os
+import pytest
 import shutil
 import tempfile
-
-import pytest
 import torch
 from megatron.core import parallel_state
 from safetensors.torch import load_file, save_file

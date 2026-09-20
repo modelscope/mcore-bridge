@@ -1,10 +1,9 @@
 import copy
-from typing import Optional
-
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
+from typing import Optional
 
 
 class TopKRouter(McoreTopKRouter):
@@ -43,9 +42,8 @@ class TopKRouter(McoreTopKRouter):
                     and image_mask.shape[0] // self.config.tensor_model_parallel_size == seq_length):
                 image_mask = tensor_parallel.scatter_to_sequence_parallel_region(image_mask)
             else:
-                raise ValueError(
-                    'image token mask cannot be aligned with router logits: '
-                    f'input_ids={tuple(input_ids.shape)}, logits={tuple(logits.shape)}.')
+                raise ValueError('image token mask cannot be aligned with router logits: '
+                                 f'input_ids={tuple(input_ids.shape)}, logits={tuple(logits.shape)}.')
 
         original_expert_bias = self.expert_bias
         self.expert_bias = torch.where(

@@ -3,7 +3,11 @@
 
 Pure logic, no GPU / distributed init required.
 """
-from mcore_bridge.model.gpts.deepseek_v41 import HybridLayerConfig, derive_hybrid_layer_config
+import pytest  # noqa: E402
+
+from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HyperConnectionHybridLayer  # noqa: E402
+from mcore_bridge.model.gpts.deepseek_v41 import (HybridLayerConfig, HyperConnectionHybridLayer,
+                                                  derive_hybrid_layer_config)
 
 
 def test_tiny_all_moe_zero_ratio():
@@ -202,11 +206,6 @@ def test_num_hybrid_layers_normalizes_both_layer_spaces():
     assert DeepseekV41Bridge._num_hybrid_layers(SimpleNamespace(num_layers=3)) == 6
 
 
-import pytest  # noqa: E402
-
-from mcore_bridge.model.gpts.deepseek_v41 import (  # noqa: E402
-    DeepseekV41HyperConnectionHybridLayer, HyperConnectionHybridLayer)
-
 requires_hybrid = pytest.mark.skipif(
     DeepseekV41HyperConnectionHybridLayer is None, reason='megatron hybrid stack not importable')
 
@@ -217,10 +216,9 @@ def test_hc_wrapper_applies_engram_on_nstream_before_delegating():
     # the n-stream Engram delta to ``hidden_states`` BEFORE delegating to the base wrapper forward
     # (aggregation + fast-path attention), so the delta lands on the pre-aggregation streams.
     # A plain inner layer delegates unchanged with no Engram add.
+    import torch
     from types import SimpleNamespace
     from unittest.mock import patch
-
-    import torch
 
     # Engram-carrying layer: a constant unit delta is added, so the tensor handed to the base
     # forward is the input plus that delta.
@@ -248,10 +246,9 @@ def test_hc_wrapper_applies_engram_on_nstream_before_delegating():
 def test_hc_wrapper_requires_input_ids_for_engram_layer():
     # An Engram layer cannot run without token IDs (needed for the n-gram hash), so forward
     # raises rather than silently dropping the Engram contribution.
-    from types import SimpleNamespace
-
     import pytest
     import torch
+    from types import SimpleNamespace
 
     engram_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
     engram_layer.inner_layer = SimpleNamespace(engram=lambda *a, **k: 0)
@@ -358,6 +355,7 @@ def test_segment_main_pattern_respects_explicit_pipes_and_uneven_layout():
 @requires_hybrid
 def test_segment_main_pattern_raises_when_stage_gets_no_block():
     import pytest
+
     # 2 blocks cannot cover 4 stages.
     with pytest.raises(ValueError, match='at least one attention'):
         DeepseekV41HybridStackModel._segment_main_pattern(_seg_config('DEDE', pipeline_model_parallel_size=4))
@@ -381,8 +379,7 @@ def test_resolve_hybrid_layer_pattern_segments_then_defers_to_base():
         _seg_config('DEDEDEDE', pipeline_model_parallel_size=1)) == 'DEDEDEDE'
 
 
-from mcore_bridge.model.gpts.deepseek_v41 import (  # noqa: E402
-    DeepseekV41Bridge, DeepseekV41Loader)
+from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Bridge, DeepseekV41Loader  # noqa: E402
 
 # --- DSpark (``mtp.*``) draft stack -------------------------------------------------------------
 
@@ -481,7 +478,7 @@ def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
 def test_multimodal_wrapper_hosts_hybrid_backbone():
     # The wrapper is the stock multimodal model with the language-model class swapped for the
     # PP-capable hybrid backbone; everything else (vision tower, image-embed injection) is inherited.
-    from mcore_bridge.model.gpts.deepseek_v41 import (DeepseekV41HybridStackModel, DeepseekV41MultimodalModel)
+    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HybridStackModel, DeepseekV41MultimodalModel
     from mcore_bridge.model.mm_gpt_model import MultimodalGPTModel
     assert issubclass(DeepseekV41MultimodalModel, MultimodalGPTModel)
     assert DeepseekV41MultimodalModel.language_model_cls is DeepseekV41HybridStackModel

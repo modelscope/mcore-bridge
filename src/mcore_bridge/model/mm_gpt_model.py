@@ -69,8 +69,11 @@ class MultimodalGPTModel(MegatronModule):
                     kwargs.update(res)
                     res = inputs_embeds
             if self.config.context_parallel_size > 1:
-                res = split_cp_inputs(res, getattr(packed_seq_params, 'cu_seqlens_q', None), 1,
-                                      cp_partition_mode=self.config.cp_partition_mode)
+                res = split_cp_inputs(
+                    res,
+                    getattr(packed_seq_params, 'cu_seqlens_q', None),
+                    1,
+                    cp_partition_mode=self.config.cp_partition_mode)
             if reduce_scatter_embeddings:
                 res = res.transpose(0, 1).contiguous()
                 res = scatter_to_sequence_parallel_region(res, group=_self.tp_group)
@@ -119,8 +122,8 @@ class MultimodalGPTModel(MegatronModule):
             kwargs = {}
         kwargs.update(extra_kwargs)
         if needs_split:
-            input_ids = split_cp_inputs(input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1,
-                                        cp_partition_mode=cp_partition_mode)
+            input_ids = split_cp_inputs(
+                input_ids, getattr(packed_seq_params, 'cu_seqlens_q', None), dim=1, cp_partition_mode=cp_partition_mode)
         return self.language_model(
             input_ids=input_ids,
             position_ids=position_ids,

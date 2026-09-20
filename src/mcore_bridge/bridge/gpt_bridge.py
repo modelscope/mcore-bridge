@@ -1937,8 +1937,7 @@ class GPTBridge:
                     res = self._convert_hf_state_dict(res, to_mcore)
                     yield from list(self._add_prefix(res, hf_prefix).items())
                     hf_state_dict = {}
-        yield from self._convert_additional_layers(
-            mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage)
+        yield from self._convert_additional_layers(mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage)
         if not to_mcore or is_pp_last_stage:
             hf_state_dict.update(self._convert_post_process(mg_model, hf_state_dict, '', to_mcore))
         if to_mcore:

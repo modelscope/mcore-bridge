@@ -2,7 +2,6 @@
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
 import dataclasses
-
 import torch
 from torch import Tensor
 
@@ -12,15 +11,9 @@ try:
     from megatron.core import mpu
     from megatron.core.models.engram.config import EngramConfig
     from megatron.core.models.engram.engram import Engram
-    from megatron.core.models.engram.hashing import (
-        compress_token_ids,
-        shift_right_reset_at_eos,
-        slice_hashes_for_sequence_parallel,
-    )
-    from megatron.core.transformer.transformer_layer import (
-        HyperConnectionTransformerLayer,
-        TransformerLayer,
-    )
+    from megatron.core.models.engram.hashing import (compress_token_ids, shift_right_reset_at_eos,
+                                                     slice_hashes_for_sequence_parallel)
+    from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer, TransformerLayer
     from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
 except ImportError:
     EngramConfig = None
@@ -96,8 +89,7 @@ if EngramConfig is not None:
             if sequence_length is not None:
                 # The SP checks compare against a rank-local slice, which CP shortens first.
                 sequence_length = sequence_length // context_parallel_size
-            super()._validate_parallelism(
-                _RelaxedParallelismView(transformer_config), sequence_length)
+            super()._validate_parallelism(_RelaxedParallelismView(transformer_config), sequence_length)
 
         def _validate_packed_sequences(self, transformer_config, packed_sequences):
             # DeepseekV41Engram restarts its n-gram windows at every cu_seqlens document
@@ -105,8 +97,7 @@ if EngramConfig is not None:
             # variant advertises resets_windows_at_boundary_token=False. Keep the remaining
             # packed checks (pipeline stages, padding alignment) from super().
             variant_spec = self.variant_spec
-            self.variant_spec = dataclasses.replace(
-                variant_spec, resets_windows_at_boundary_token=True)
+            self.variant_spec = dataclasses.replace(variant_spec, resets_windows_at_boundary_token=True)
             try:
                 super()._validate_packed_sequences(transformer_config, packed_sequences)
             finally:
@@ -118,9 +109,8 @@ else:
 def build_deepseek_v41_engram_config(**kwargs):
     """Build the DeepSeek adapter over NVIDIA's official Engram configuration."""
     if DeepseekV41EngramConfig is None:
-        raise RuntimeError(
-            'DeepSeek-V4.1 Engram requires NVIDIA Megatron-LM Engram support. '
-            'Install the official Engram extension or disable Engram.')
+        raise RuntimeError('DeepSeek-V4.1 Engram requires NVIDIA Megatron-LM Engram support. '
+                           'Install the official Engram extension or disable Engram.')
     return DeepseekV41EngramConfig(**kwargs)
 
 
@@ -135,9 +125,8 @@ def _hash_token_windows(
     invalid_token_id: int | None = None,
 ) -> Tensor:
     if token_windows.ndim != 3 or token_windows.shape[-1] != max_ngram_order:
-        raise ValueError(
-            'Engram token windows must have shape [batch, sequence, max_ngram_order], '
-            f'got {token_windows.shape}.')
+        raise ValueError('Engram token windows must have shape [batch, sequence, max_ngram_order], '
+                         f'got {token_windows.shape}.')
     tokens = token_windows.to(torch.int64)
     compressed = tokens if tokenizer_remap is None else compress_token_ids(tokens, tokenizer_remap)
     suffixes = []
@@ -172,9 +161,8 @@ def _positions_in_segment(cu_seqlens: Tensor | None, sequence_length: int, devic
         return positions
     boundaries = cu_seqlens.reshape(-1).to(device=device, dtype=torch.int64)
     if int(boundaries[-1]) != sequence_length:
-        raise ValueError(
-            f'Engram cu_seqlens ends at {int(boundaries[-1])} but the hashed sequence has '
-            f'{sequence_length} tokens; cu_seqlens must describe the full packed row.')
+        raise ValueError(f'Engram cu_seqlens ends at {int(boundaries[-1])} but the hashed sequence has '
+                         f'{sequence_length} tokens; cu_seqlens must describe the full packed row.')
     segment_index = torch.searchsorted(boundaries, positions, right=True) - 1
     return positions - boundaries[segment_index]
 
@@ -194,27 +182,19 @@ def _build_ngram_hashes(
     compressed = tokens if tokenizer_remap is None else compress_token_ids(tokens, tokenizer_remap)
     sequence_length = compressed.shape[1]
     if reset_at_boundary:
-        suffixes = [
-            shift_right_reset_at_eos(compressed, shift, boundary_token_id)
-            for shift in range(max_ngram_order)
-        ]
+        suffixes = [shift_right_reset_at_eos(compressed, shift, boundary_token_id) for shift in range(max_ngram_order)]
     else:
         # The DeepSeek variant carries no boundary token in the stream, so packed (THD) rows
         # need the document starts from cu_seqlens to keep n-grams inside one document. With
         # cu_seqlens=None this reduces exactly to padding the window at the row start.
         if cu_seqlens is not None and compressed.shape[0] != 1:
-            raise ValueError(
-                'Engram cu_seqlens-based window reset expects a single packed row, got '
-                f'batch size {compressed.shape[0]}.')
-        position_in_segment = _positions_in_segment(
-            cu_seqlens, sequence_length, compressed.device).unsqueeze(0)
+            raise ValueError('Engram cu_seqlens-based window reset expects a single packed row, got '
+                             f'batch size {compressed.shape[0]}.')
+        position_in_segment = _positions_in_segment(cu_seqlens, sequence_length, compressed.device).unsqueeze(0)
         suffixes = [compressed]
         for shift in range(1, max_ngram_order):
-            shifted = torch.nn.functional.pad(
-                compressed, (shift, 0), value=boundary_token_id)[:, :sequence_length]
-            suffixes.append(
-                torch.where(position_in_segment >= shift, shifted,
-                            shifted.new_full((), boundary_token_id)))
+            shifted = torch.nn.functional.pad(compressed, (shift, 0), value=boundary_token_id)[:, :sequence_length]
+            suffixes.append(torch.where(position_in_segment >= shift, shifted, shifted.new_full((), boundary_token_id)))
     return _hash_token_windows(
         torch.stack(suffixes, dim=-1),
         tokenizer_remap=None,
@@ -269,8 +249,7 @@ class DeepseekV41Engram(Engram):
             length *= get_pg_size(self.tp_group)
         return length
 
-    def _gather_input_ids_for_context_parallel(self, input_ids: Tensor,
-                                              local_sequence_length: int) -> Tensor:
+    def _gather_input_ids_for_context_parallel(self, input_ids: Tensor, local_sequence_length: int) -> Tensor:
         """Restore the full token sequence so every rank hashes identical n-gram windows.
 
         The data pipeline hands us either a CP-sharded copy of ``input_ids`` (swift
@@ -284,13 +263,11 @@ class DeepseekV41Engram(Engram):
         if present == local_sequence_length * cp_size:
             return input_ids
         if present != local_sequence_length:
-            raise ValueError(
-                f'Engram input_ids length {present} matches neither this CP rank slice '
-                f'({local_sequence_length}) nor the full sequence '
-                f'({local_sequence_length * cp_size}).')
+            raise ValueError(f'Engram input_ids length {present} matches neither this CP rank slice '
+                             f'({local_sequence_length}) nor the full sequence '
+                             f'({local_sequence_length * cp_size}).')
         shards = [torch.empty_like(input_ids) for _ in range(cp_size)]
-        torch.distributed.all_gather(
-            shards, input_ids.contiguous(), group=mpu.get_context_parallel_group())
+        torch.distributed.all_gather(shards, input_ids.contiguous(), group=mpu.get_context_parallel_group())
         # Contiguous partitioning gives rank r the block [r * local, (r + 1) * local), so
         # concatenating the gathered shards in rank order rebuilds the original token order.
         return torch.cat(shards, dim=1)
@@ -305,9 +282,8 @@ class DeepseekV41Engram(Engram):
         if inference_context is None:
             inference_context = getattr(self, '_bridge_inference_context', None)
         if inference_context is not None:
-            raise RuntimeError(
-                'DeepSeek-V4.1 Engram inference is not wired into this integration; rollout runs '
-                'through vLLM, so the Engram module supports the training forward only.')
+            raise RuntimeError('DeepSeek-V4.1 Engram inference is not wired into this integration; rollout runs '
+                               'through vLLM, so the Engram module supports the training forward only.')
         packed_seq_params = getattr(self, '_bridge_packed_seq_params', None)
         if hidden_states.ndim != 3:
             raise ValueError(f'Engram hidden_states must be [S,B,H], got {hidden_states.shape}.')
@@ -331,23 +307,22 @@ class DeepseekV41Engram(Engram):
             # zigzag layout would silently mis-align the hashes with the local hidden states.
             # Fail loud on every CP path -- packed (THD) and non-packed alike -- matching the
             # DSv4 THD CP forward.
-            raise ValueError(
-                "Engram with context parallelism requires cp_partition_mode='contiguous', "
-                'matching the DSv4 THD CP forward.')
+            raise ValueError("Engram with context parallelism requires cp_partition_mode='contiguous', "
+                             'matching the DSv4 THD CP forward.')
 
         nvtx_range_push('engram.hash')
         try:
             if context_parallel:
-                input_ids = self._gather_input_ids_for_context_parallel(
-                    input_ids, self._cp_local_sequence_length(hidden_states))
+                input_ids = self._gather_input_ids_for_context_parallel(input_ids,
+                                                                        self._cp_local_sequence_length(hidden_states))
             hash_ids, live_tokens = self._build_hash_ids(input_ids, cu_seqlens)
             live_tokens = live_tokens.unsqueeze(-1)
             # CP is the outer split and SP the inner one, so undo them in that order.
             hash_ids = self._slice_for_context_parallel(hash_ids)
             live_tokens = self._slice_for_context_parallel(live_tokens)
             hash_ids = slice_hashes_for_sequence_parallel(hash_ids, hidden_states.shape[0], self.tp_group)
-            live_tokens = slice_hashes_for_sequence_parallel(
-                live_tokens, hidden_states.shape[0], self.tp_group).squeeze(-1)
+            live_tokens = slice_hashes_for_sequence_parallel(live_tokens, hidden_states.shape[0],
+                                                             self.tp_group).squeeze(-1)
         finally:
             nvtx_range_pop('engram.hash')
 
@@ -356,8 +331,7 @@ class DeepseekV41Engram(Engram):
             memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop('engram.lookup')
-        streams = hidden_states.view(
-            hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)
+        streams = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)
         shared_value = self.value_projection(memory)
         key = self.key_norm(self.key_projection(memory)).view_as(streams)
         query = self.query_norm(hidden_states).view_as(streams)
@@ -393,9 +367,7 @@ if TransformerLayer is not None:
     class DeepseekV41TransformerLayer(_DeepseekV41EngramLayerMixin, TransformerLayer):
         pass
 
-
-    class DeepseekV41HyperConnectionTransformerLayer(
-            _DeepseekV41EngramLayerMixin, HyperConnectionTransformerLayer):
+    class DeepseekV41HyperConnectionTransformerLayer(_DeepseekV41EngramLayerMixin, HyperConnectionTransformerLayer):
         pass
 else:
     DeepseekV41TransformerLayer = None

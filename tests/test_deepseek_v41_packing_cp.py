@@ -7,14 +7,13 @@ tiny parameter set.  The CP case launches two local NCCL workers from pytest, so
 CPU or single-GPU jobs collect it safely and report a skip.
 """
 import itertools
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
+from types import SimpleNamespace
 
 from mcore_bridge.model.modules import engram as engram_adapter
 

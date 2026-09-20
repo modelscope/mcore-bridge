@@ -1,19 +1,14 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Tensor-parallel building blocks for DeepSeek-V4.1 DSpark."""
 import copy
-from dataclasses import dataclass
-from typing import Callable, Optional, Sequence
-
 import torch
 import torch.nn.functional as F
-from megatron.core.tensor_parallel.layers import (
-    ColumnParallelLinear,
-    RowParallelLinear,
-    VocabParallelEmbedding,
-)
+from dataclasses import dataclass
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear, VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.hyper_connection import SinglePassMHCState
 from torch import nn
+from typing import Callable, Optional, Sequence
 
 
 class DeepseekV41DSparkRMSNorm(nn.Module):
@@ -75,8 +70,7 @@ class DeepseekV41DSparkInput(nn.Module):
 
     def project_main_hidden(self, main_hidden: torch.Tensor):
         if main_hidden.ndim != 3:
-            raise ValueError(
-                f'DSpark main hidden states must be [s, b, targets*h], got {tuple(main_hidden.shape)}.')
+            raise ValueError(f'DSpark main hidden states must be [s, b, targets*h], got {tuple(main_hidden.shape)}.')
         if self.sequence_parallel:
             main_hidden = gather_from_sequence_parallel_region(main_hidden)
         main_x, _ = self.main_proj(main_hidden)
@@ -97,10 +91,9 @@ class DeepseekV41DSparkInput(nn.Module):
         hidden_states = embedding(draft_input_ids)
         expected = (self.block_size, input_ids.shape[0], self.hidden_size)
         if tuple(hidden_states.shape) != expected:
-            raise ValueError(
-                f'DSpark embedding must return {expected}, got {tuple(hidden_states.shape)}.')
-        hidden_states = hidden_states.unsqueeze(-2).expand(
-            *hidden_states.shape[:-1], self.num_streams, self.hidden_size)
+            raise ValueError(f'DSpark embedding must return {expected}, got {tuple(hidden_states.shape)}.')
+        hidden_states = hidden_states.unsqueeze(-2).expand(*hidden_states.shape[:-1], self.num_streams,
+                                                           self.hidden_size)
         hidden_states = hidden_states.reshape(
             self.block_size,
             input_ids.shape[0],
@@ -115,9 +108,8 @@ class DeepseekV41DSparkInput(nn.Module):
         embedding: Callable[[torch.Tensor], torch.Tensor],
     ):
         if input_ids.ndim != 1 or input_ids.shape[0] != main_hidden.shape[1]:
-            raise ValueError(
-                f'DSpark input_ids must be [b] matching main hidden batch {main_hidden.shape[1]}, '
-                f'got {tuple(input_ids.shape)}.')
+            raise ValueError(f'DSpark input_ids must be [b] matching main hidden batch {main_hidden.shape[1]}, '
+                             f'got {tuple(input_ids.shape)}.')
         main_x = self.project_main_hidden(main_hidden)
         hidden_states, draft_input_ids = self.build_draft_hidden(input_ids, embedding)
         return hidden_states, main_x, draft_input_ids
@@ -173,9 +165,8 @@ class DeepseekV41DSparkConfidenceHead(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, markov_embed: torch.Tensor):
         if hidden_states.shape[:-1] != markov_embed.shape[:-1]:
-            raise ValueError(
-                'DSpark confidence inputs must have matching leading dimensions, got '
-                f'{tuple(hidden_states.shape)} and {tuple(markov_embed.shape)}.')
+            raise ValueError('DSpark confidence inputs must have matching leading dimensions, got '
+                             f'{tuple(hidden_states.shape)} and {tuple(markov_embed.shape)}.')
         hidden_states = torch.cat((hidden_states, markov_embed), dim=-1)
         return F.linear(hidden_states.float(), self.proj.weight).squeeze(-1)
 
@@ -214,9 +205,8 @@ def verify_dspark_draft(
         raise ValueError('DSpark verification expects rank-2 token tensors.')
     block_size = draft_ids.shape[1] - 1
     if block_size <= 0 or target_ids.shape != (draft_ids.shape[0], block_size + 1):
-        raise ValueError(
-            f'Expected draft [b, K+1] and target [b, K+1], got '
-            f'{tuple(draft_ids.shape)} and {tuple(target_ids.shape)}.')
+        raise ValueError(f'Expected draft [b, K+1] and target [b, K+1], got '
+                         f'{tuple(draft_ids.shape)} and {tuple(target_ids.shape)}.')
     accepted_mask = draft_ids[:, 1:].eq(target_ids[:, :block_size])
     if confidence_threshold is not None:
         if confidence_logits is None or confidence_logits.shape != accepted_mask.shape:
@@ -245,7 +235,7 @@ class DeepseekV41DSparkState:
 
     def recompute_boundary_tensors(self):
         if self.main_rotary_pos_emb is None:
-            return (self.main_hidden,)
+            return (self.main_hidden, )
         return self.main_hidden, self.main_rotary_pos_emb
 
     def save_for_recompute(self):
@@ -288,13 +278,11 @@ class DeepseekV41DSparkOutput(nn.Module):
         sample_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     ):
         if hidden_states.ndim != 3 or hidden_states.shape[0] != self.block_size:
-            raise ValueError(
-                f'DSpark output hidden states must be [block={self.block_size}, b, h], '
-                f'got {tuple(hidden_states.shape)}.')
+            raise ValueError(f'DSpark output hidden states must be [block={self.block_size}, b, h], '
+                             f'got {tuple(hidden_states.shape)}.')
         if input_ids.ndim != 1 or input_ids.shape[0] != hidden_states.shape[1]:
-            raise ValueError(
-                f'DSpark output input_ids must be [b] matching hidden batch {hidden_states.shape[1]}, '
-                f'got {tuple(input_ids.shape)}.')
+            raise ValueError(f'DSpark output input_ids must be [b] matching hidden batch {hidden_states.shape[1]}, '
+                             f'got {tuple(input_ids.shape)}.')
 
         base_logits, _ = output_layer(self.norm(hidden_states), runtime_gather_output=True)
         output_ids = input_ids.new_empty((input_ids.shape[0], self.block_size + 1))
@@ -326,8 +314,7 @@ class DeepseekV41DSparkStack(nn.Module):
     def __init__(self, config, layers: Sequence[nn.Module]):
         super().__init__()
         if len(layers) != config.dspark_num_layers:
-            raise ValueError(
-                f'DSpark requires {config.dspark_num_layers} layers, got {len(layers)}.')
+            raise ValueError(f'DSpark requires {config.dspark_num_layers} layers, got {len(layers)}.')
         if not config.mhc_single_pass:
             raise ValueError('DeepSeek-V4.1 DSpark requires single-pass mHC.')
         self.config = config
@@ -349,8 +336,8 @@ class DeepseekV41DSparkStack(nn.Module):
         if live_request_ids is not None:
             live_ids = set(live_request_ids.detach().to(device='cpu', dtype=torch.long).tolist())
             self._request_cache_slots = {
-                request_id: slot for request_id, slot in self._request_cache_slots.items()
-                if request_id in live_ids
+                request_id: slot
+                for request_id, slot in self._request_cache_slots.items() if request_id in live_ids
             }
         occupied = set(self._request_cache_slots.values())
         for request_id in request_ids_cpu:
@@ -377,8 +364,7 @@ class DeepseekV41DSparkStack(nn.Module):
         for layer in self.layers:
             attention = layer.self_attention
             if not hasattr(attention, 'prefill_dspark'):
-                raise TypeError(
-                    f'{type(attention).__name__} does not implement prefill_dspark().')
+                raise TypeError(f'{type(attention).__name__} does not implement prefill_dspark().')
             attention.prefill_dspark(
                 main_hidden,
                 rotary_pos_emb=main_rotary_pos_emb,
@@ -426,8 +412,7 @@ class DeepseekV41DSparkStack(nn.Module):
         if prefill_only is None:
             prefill_only = bool(torch.as_tensor(start_pos).eq(0).all().item())
         if prefill_only:
-            self._seed_main_kv(
-                main_x, main_rotary_pos_emb, inference_context, cache_slots=cache_slots)
+            self._seed_main_kv(main_x, main_rotary_pos_emb, inference_context, cache_slots=cache_slots)
             return None
 
         mhc_state = SinglePassMHCState()
