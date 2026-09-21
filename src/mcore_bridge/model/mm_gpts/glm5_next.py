@@ -18,6 +18,7 @@ from .utils import HuggingFaceVit
 try:
     from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern, select_pipeline_segment
+    from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
     from megatron.core.transformer.module import mark_keep_in_fp32
     from megatron.core.transformer.multi_token_prediction import \
         MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer
@@ -145,6 +146,42 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
         mtp_config = copy.copy(config)
         mtp_config.enable_hyper_connections = False
         super().__init__(mtp_config, *args, **kwargs)
+
+    def _get_embeddings(self,
+                        input_ids,
+                        position_ids,
+                        embedding,
+                        hidden_states,
+                        packed_seq_params=None,
+                        padding_mask=None,
+                        sequence_roll_context=None,
+                        roll_depth=0):
+        # Decoder/MoE routing consumes the sequence-parallel shard, but MTP must roll the mask
+        # beside the unsharded input_ids. Reconstruct it only around the roll, then restore the
+        # shard expected by the nested HybridStack.
+        sequence_parallel_mask = (
+            padding_mask is not None and self.config.sequence_parallel and self.tp_group.size() > 1)
+        if sequence_parallel_mask:
+            padding_mask = gather_from_sequence_parallel_region(
+                padding_mask.transpose(0, 1).contiguous(),
+                tensor_parallel_output_grad=False,
+                group=self.tp_group,
+            ).transpose(0, 1).contiguous()
+
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = super()._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=packed_seq_params,
+            padding_mask=padding_mask,
+            sequence_roll_context=sequence_roll_context,
+            roll_depth=roll_depth,
+        )
+
+        if sequence_parallel_mask:
+            padding_mask = padding_mask.chunk(self.tp_group.size(), dim=-1)[self.tp_group.rank()].contiguous()
+        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
 
 class Glm5NextHybridModel(HybridModel):

@@ -106,7 +106,7 @@ def _tiny_qwen4exp_config():
     )
 
 
-def _mcore_config(hf_config, mtp=1, dtype=torch.bfloat16, tp=1, pp=1, ep=1):
+def _mcore_config(hf_config, mtp=1, dtype=torch.bfloat16, tp=1, pp=1, ep=1, recompute=False, shared=False):
     values = hf_to_mcore_config(hf_config)
     values['mcore_model_type'] = 'qwen4_exp'
     values['hf_config'] = hf_config
@@ -124,7 +124,10 @@ def _mcore_config(hf_config, mtp=1, dtype=torch.bfloat16, tp=1, pp=1, ep=1):
         expert_model_parallel_size=ep,
         expert_tensor_parallel_size=1,
         sequence_parallel=False,
-        recompute_granularity=None,
+        recompute_granularity='full' if recompute else None,
+        recompute_method='uniform' if recompute else None,
+        recompute_num_layers=1 if recompute else None,
+        mtp_shared_weights=shared,
     )
     if mtp:
         values.update(mtp_num_layers=mtp, mtp_loss_scaling_factor=0.1)
@@ -188,10 +191,10 @@ class _Lazy:
         return self.t
 
 
-def _build(mtp=1, seed=5, dtype=torch.bfloat16, tp=1, pp=1, ep=1):
+def _build(mtp=1, seed=5, dtype=torch.bfloat16, tp=1, pp=1, ep=1, recompute=False, shared=False):
     torch.manual_seed(seed)
     hf_config = _tiny_qwen4exp_config()
-    config = _mcore_config(hf_config, mtp=mtp, dtype=dtype, tp=tp, pp=pp, ep=ep)
+    config = _mcore_config(hf_config, mtp=mtp, dtype=dtype, tp=tp, pp=pp, ep=ep, recompute=recompute, shared=shared)
     model = get_mcore_model(config)[0].cuda()
     return model, config
 
@@ -281,6 +284,52 @@ def test_qwen4exp_mtp_forward_backward_flows_grads_to_head():
         for probe in ('layers.0.e_proj.weight', 'layers.0.h_proj.weight', 'layers.0.enorm.weight',
                       'layers.0.hnorm.weight', 'layers.0.hyper_connection_mixer.input_mix_weight_down.weight'):
             assert head[probe].grad is not None and torch.isfinite(head[probe].grad.float()).all()
+
+
+def test_mtp_inner_layer_kwargs_are_model_opt_in():
+    from mcore_bridge.model.modules.mtp_layer import MultiTokenPredictionLayer
+    layer = object.__new__(MultiTokenPredictionLayer)
+    assert layer._get_inner_layer_kwargs(None, None) == {}
+
+
+def test_qwen4exp_shared_mtp_recompute_restores_each_depth_ids(monkeypatch):
+    """Checkpoint recompute must replay each shared MTP depth with that depth's rolled IDs."""
+    from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+    monkeypatch.setattr(MTPLossLoggingHelper, 'tracker', {})
+    with _parallel_context():
+        model, config = _build(mtp=2, recompute=True, shared=True)
+        lm = _lm(model).train()
+        assert config.mtp_num_layers == 1 and config.mtp_unroll_steps == 2
+        assert len(lm.mtp.layers) == 1
+
+        calls = []
+        layer = lm.mtp.layers[0]
+        original = layer._proj_and_transformer_layer
+
+        def record_ids(*args, **kwargs):
+            calls.append((kwargs['input_ids'].detach().clone(), kwargs['position_ids'].detach().clone()))
+            return original(*args, **kwargs)
+
+        layer._proj_and_transformer_layer = record_ids
+        b, s = 1, 16
+        generator = torch.Generator(device='cuda').manual_seed(29)
+        input_ids = torch.randint(1, 500, (b, s), device='cuda', generator=generator)
+        position_ids = torch.arange(s, device='cuda').unsqueeze(0)
+        attention_mask = torch.triu(torch.ones(b, 1, s, s, device='cuda', dtype=torch.bool), diagonal=1)
+        labels = torch.randint(1, 500, (b, s), device='cuda', generator=generator)
+        loss_mask = torch.ones(b, s, device='cuda', dtype=torch.bool)
+
+        output = lm(input_ids, position_ids, attention_mask, labels=labels, loss_mask=loss_mask)
+        loss = output if output.dim() == 0 else output.float().mean()
+        loss.backward()
+
+        assert len(calls) == 4, f'expected two forwards and two recomputes, got {len(calls)}'
+        assert not torch.equal(calls[0][0], calls[1][0])
+        for field in range(2):
+            torch.testing.assert_close(calls[2][field], calls[1][field], atol=0, rtol=0)
+            torch.testing.assert_close(calls[3][field], calls[0][field], atol=0, rtol=0)
+        assert not hasattr(layer, '_mtp_input_ids')
+        assert not hasattr(layer, '_mtp_position_ids')
 
 
 def test_qwen4exp_mtp_pp2_forward_backward():

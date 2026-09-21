@@ -522,10 +522,19 @@ def test_glm5_mtp_layer_is_filtered_only_when_mtp_disabled():
     assert 'model.language_model.layers.45.input_layernorm.weight' in kept
 
 
-def _build_glm_mtp_model(mtp=1, moe=True, dtype=torch.float32, tp=1, pp=1, ep=1, cp=1, seed=5):
+def _build_glm_mtp_model(mtp=1, moe=True, dtype=torch.float32, tp=1, pp=1, ep=1, cp=1, sequence_parallel=False, seed=5):
     torch.manual_seed(seed)
-    hf_config = _tiny_glm_config(moe=moe, optimized_dsa=cp > 1)
-    config = _mcore_config(hf_config, tp=tp, pp=pp, ep=ep, cp=cp, dtype=dtype, mtp=mtp)
+    hf_config = _tiny_glm_config(moe=moe, optimized_dsa=cp > 1 or sequence_parallel)
+    config = _mcore_config(
+        hf_config,
+        tp=tp,
+        pp=pp,
+        ep=ep,
+        cp=cp,
+        sequence_parallel=sequence_parallel,
+        dtype=dtype,
+        mtp=mtp,
+    )
     model = get_mcore_model(config)[0].cuda()
     return model, config
 
@@ -616,6 +625,40 @@ def test_glm5_mtp_cp2_packed_forward_backward():
         position_ids = split_cp_inputs(position_ids, cu_seqlens, -1)
         labels = split_cp_inputs(labels, cu_seqlens, -1)
         loss_mask = split_cp_inputs(loss_mask, cu_seqlens, -1)
+
+        out = model(
+            input_ids,
+            position_ids,
+            None,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+        loss = out if out.dim() == 0 else out.float().mean()
+        assert torch.isfinite(loss).item()
+        loss.backward()
+        missing = [name for name, param in lm.mtp.named_parameters() if param.requires_grad and param.grad is None]
+        assert not missing, f'MTP params without grad: {missing}'
+
+
+def test_glm5_mtp_tp2_sequence_parallel_packed_forward_backward():
+    """MTP rolls a TP-full padding mask, then restores the SP shard used by its MoE router."""
+    if os.environ.get('GLM5_MTP_PARALLEL_TEST') != 'tp2_sp':
+        pytest.skip('run with GLM5_MTP_PARALLEL_TEST=tp2_sp torchrun --nproc-per-node=2')
+    pytest.importorskip('tilelang')
+    with _parallel_context(tp=2):
+        model, _ = _build_glm_mtp_model(
+            mtp=1,
+            dtype=torch.bfloat16,
+            tp=2,
+            sequence_parallel=True,
+        )
+        lm = _lm_of(model).train()
+        input_ids, position_ids, packed_seq_params = _packed_inputs([16])
+        packed_seq_params.seq_lens = torch.tensor([13], device='cuda', dtype=torch.int32)
+        labels = torch.randint(1, 128, input_ids.shape, device='cuda')
+        loss_mask = torch.ones_like(labels, dtype=torch.bool)
+        loss_mask[:, 13:] = False
 
         out = model(
             input_ids,

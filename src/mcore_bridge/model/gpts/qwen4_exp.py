@@ -371,25 +371,9 @@ class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
         # Contract the multi-stream [s, b, n*H] to [s, b, H] with Qwen4Exp's gated mixer (no final norm).
         return self.hyper_connection_mixer(hidden_states)
 
-    def _get_embeddings(self,
-                        input_ids,
-                        position_ids,
-                        embedding,
-                        hidden_states,
-                        packed_seq_params=None,
-                        decoder_input=None):
-        input_ids, position_ids, decoder_input, hidden_states = super()._get_embeddings(
-            input_ids, position_ids, embedding, hidden_states, packed_seq_params, decoder_input)
-        # Stash the rolled ids so _proj_and_transformer_layer can forward them to the inner
-        # Qwen4ExpMTPInnerLayer (its QSA indexer needs position_ids under packing/CP; PLE is absent).
-        self._mtp_input_ids = input_ids
-        self._mtp_position_ids = position_ids
-        return input_ids, position_ids, decoder_input, hidden_states
-
-    def _proj_and_transformer_layer(self, *args, **kwargs):
-        kwargs.setdefault('input_ids', getattr(self, '_mtp_input_ids', None))
-        kwargs.setdefault('position_ids', getattr(self, '_mtp_position_ids', None))
-        return super()._proj_and_transformer_layer(*args, **kwargs)
+    def _get_inner_layer_kwargs(self, input_ids, position_ids):
+        # Pass per-depth state through the checkpoint boundary instead of mutable module attributes.
+        return {'input_ids': input_ids, 'position_ids': position_ids}
 
 
 class Qwen4ExpBridge(Qwen3NextBridge):
