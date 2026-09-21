@@ -64,11 +64,11 @@ class _PLELayer(Qwen4ExpTextPLELayer):
 
 @pytest.mark.parametrize('tp_size', [1, 2, 8])
 @pytest.mark.parametrize('with_scale', [False, True])
-def test_export_updated_table(monkeypatch, tp_group, tp_size, with_scale):
+def test_export_updated_table(monkeypatch, tmp_path, tp_group, tp_size, with_scale):
     """Combine actual contributions from every simulated rank into HF shards."""
     total, dim, parts = 32, 4, 3
     full_weight = (torch.arange(total * dim).reshape(total, dim) % 13 - 6).to(torch.bfloat16)
-    expected = full_weight + 1
+    expected = full_weight + 0.0078125
     tp_group.size.return_value = tp_size
     contributions = [[] for _ in range(parts)]
     shard_index = 0
@@ -90,9 +90,9 @@ def test_export_updated_table(monkeypatch, tp_group, tp_size, with_scale):
         table = _Table(full_weight, tp_group, parts)
         if with_scale:
             table._ngram_weight_scale = torch.tensor(0.5)
-        # Stand in for a training update; values remain exactly representable in FP8.
+        # Preserve a small BF16 update that the original FP8 scale would round away.
         with torch.no_grad():
-            table.ngram_embedding.weight.add_(1)
+            table.ngram_embedding.weight.add_(0.0078125)
         shard_index = 0
         exported = {}
         table.export_table_to_hf(exported, prefix=prefix)
@@ -101,16 +101,29 @@ def test_export_updated_table(monkeypatch, tp_group, tp_size, with_scale):
             assert exported == {}
 
     weights = [exported[f'{prefix}ple.ple_embedding.ngram_embedding.shard_{i}.weight'] for i in range(parts)]
-    assert len(exported) == parts + int(with_scale)
+    assert len(exported) == parts
     assert [w.shape[0] for w in weights] == [11, 11, 10]
-    assert all(w.dtype == (torch.float8_e4m3fn if with_scale else torch.bfloat16) for w in weights)
+    assert all(w.dtype == torch.bfloat16 for w in weights)
     restored = torch.cat([w.float() for w in weights])
-    if with_scale:
-        scale = exported[f'{prefix}{table._NGRAM_SCALE_KEY}']
-        assert scale.shape == ()
-        assert scale.item() == 0.5
-        restored *= scale
     torch.testing.assert_close(restored, expected.float(), rtol=0, atol=0)
+
+    # Exercise the real missing-weight copy path against an FP8 source scale.
+    from safetensors.torch import save_file
+
+    import mcore_bridge.bridge.gpt_bridge as gb
+    from mcore_bridge.model.gpts.qwen4_exp import Qwen4ExpBridge
+
+    source = {'visual.weight': torch.ones(2)}
+    if with_scale:
+        source[f'{prefix}{table._NGRAM_SCALE_KEY}'] = torch.tensor(0.5)
+    save_file(source, str(tmp_path / 'model.safetensors'))
+    monkeypatch.setattr(gb, 'is_master', lambda: True)
+    bridge = object.__new__(Qwen4ExpBridge)
+    saver = Mock()
+    saver.add_tensor.side_effect = exported.__setitem__
+    bridge._save_missing_weights(saver, set(exported), str(tmp_path))
+    assert f'{prefix}{table._NGRAM_SCALE_KEY}' not in exported
+    torch.testing.assert_close(exported['visual.weight'], source['visual.weight'])
 
 
 @pytest.mark.parametrize('tp_size', [8, 2])

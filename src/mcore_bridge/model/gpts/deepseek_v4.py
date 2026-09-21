@@ -100,7 +100,15 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             '`pip install git+https://github.com/NVIDIA/Megatron-LM@dev`')
         with _patch_YarnRotaryEmbedding(config):
             super().__init__(config, *args, **kwargs)
-        self.layer_type = self.config.hf_config.layer_types[self.layer_number - 1]
+        # ``layer_types`` is an HF-space (length ``num_layers``) list. On the HybridStack the layer
+        # index space is doubled -- HF layer ``i`` becomes attention layer ``2*i`` (1-based
+        # ``layer_number`` ``2*i + 1``) and MLP layer ``2*i + 1`` -- so map the hybrid layer_number
+        # back to the HF index. On the GPT stack ``layer_number - 1`` is already the HF index.
+        if getattr(self.config, 'is_hybrid_model', False):
+            hf_layer_idx = (self.layer_number - 1) // 2
+        else:
+            hf_layer_idx = self.layer_number - 1
+        self.layer_type = self.config.hf_config.layer_types[hf_layer_idx]
         self.rope_layer_type = 'main' if self.layer_type == 'sliding_attention' else 'compress'
         if config.fp8_param:
             group_proj_in_size = self.query_projection_size // config.o_groups
@@ -136,7 +144,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         # Attention heads [s, b, n*h]
         assert (hidden_states.ndim == 3), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
         if packed_seq_params is not None:
-            assert (packed_seq_params.local_cp_size
+            assert (getattr(packed_seq_params, 'local_cp_size', None)
                     is None), 'dynamic_context_parallel is not supported with MLA yet and is planned for future. \
             Please disable dynamic_context_parallel.'
 
@@ -162,6 +170,12 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             # In Megatron-Core, the qkv shape is [t, 1, h, d].
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
+            # The KV latent (and any CP boundary rows) must drop the dummy batch axis too;
+            # otherwise linear_kv_proj emits [t, 1, 1, d] and the V4.1 CSA2 core attention
+            # rejects the layout (it requires key/value shaped [t, 1, d]).
+            kv_compressed = kv_compressed.squeeze(1)
+            if boundary_hidden is not None:
+                boundary_hidden = boundary_hidden.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -201,7 +215,11 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            q = _q_rms_norm(q, self.config.layernorm_epsilon)
+            # Per-head query RMS norm is a V4-only step: V4.1 normalizes the query latent
+            # (``q_layernorm``) and feeds ``wq_b``'s output straight into RoPE, so applying it
+            # here would rescale every head to unit RMS and change the attention scores.
+            if getattr(self.config, 'dsv4_version', 'v4') == 'v4':
+                q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             boundary_rows = 0
             if boundary_kv_compressed is not None:
@@ -264,7 +282,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             return query, key, value, boundary_kv
 
         if self.recompute_up_proj:
-            quantization = self.config.fp8 or self.config.fp4
+            quantization = self.config.fp8 or getattr(self.config, 'fp4', None)
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
             if boundary_hidden is None:
                 query, key, value = self.qkv_up_checkpoint.checkpoint(qkv_up_proj_and_rope_apply, q_compressed,
@@ -304,6 +322,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         sequence_len_offset=None,
         *,
         inference_params=None,
+        csa2_state=None,
     ):
         """Forward pass for DeepSeek-v4 Hybrid Attention"""
         rotary_pos_emb = rotary_pos_emb[self.rope_layer_type]
@@ -323,7 +342,7 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
         if cp_size > 1 and qkv_format != 'thd':
             raise ValueError("DSv4 Hybrid with CP requires qkv_format='thd'.")
         use_thd_cp = cp_size > 1 and qkv_format == 'thd'
-        if use_thd_cp and packed_seq_params.cp_partition_mode != 'contiguous':
+        if use_thd_cp and getattr(packed_seq_params, 'cp_partition_mode', 'zigzag') != 'contiguous':
             raise ValueError('DSv4 THD CP requires a contiguous CP partition.')
 
         boundary_hidden = None
@@ -382,6 +401,8 @@ class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
             if boundary_hidden is not None:
                 core_attn_kwargs['boundary_hidden'] = boundary_hidden
                 core_attn_kwargs['boundary_kv'] = boundary_kv
+            if csa2_state is not None:
+                core_attn_kwargs['csa2_state'] = csa2_state
             core_attn_out = self.core_attention(
                 query,
                 key,
@@ -530,6 +551,12 @@ class DeepseekV4Bridge(GPTBridge):
     hf_input_layernorm_key = 'attn_norm.weight'
     hf_post_attention_layernorm_key = 'ffn_norm.weight'
     hf_expert_bias_key = 'gate.bias'
+
+    def _normalize_missing_weight_key(self, key: str) -> str:
+        # Native checkpoints use `mtp.*`, while Megatron exports the same stack as
+        # `model.mtp.*`. Treat them as one identity so save_missing_weights never
+        # writes both namespaces into the same checkpoint.
+        return key[len('model.'):] if key.startswith('model.mtp.') else key
 
     def _set_o_group_proj_grouped(self, mg_attn, hf_state_dict, to_mcore):
         """Handle GroupedLinear state dict for linear_o_group_proj in fp8 mode.

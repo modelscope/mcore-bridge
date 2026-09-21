@@ -9,7 +9,7 @@ apply_patch()
 
 if TYPE_CHECKING:
     from .bridge import GPTBridge
-    from .config import ModelConfig, hf_to_mcore_config
+    from .config import MLAModelConfig, ModelConfig, hf_to_mcore_config
     from .model import get_mcore_model
     from .tuners import LoraParallelLinear
     from .utils import get_logger, set_random_seed, split_cp_inputs, unwrap_model
@@ -17,7 +17,7 @@ if TYPE_CHECKING:
 else:
     _import_structure = {
         'bridge': ['GPTBridge'],
-        'config': ['ModelConfig', 'hf_to_mcore_config'],
+        'config': ['MLAModelConfig', 'ModelConfig', 'hf_to_mcore_config'],
         'model': ['get_mcore_model'],
         'tuners': ['LoraParallelLinear'],
         'utils': ['get_logger', 'set_random_seed', 'split_cp_inputs', 'unwrap_model'],

@@ -46,6 +46,8 @@ class MLLMModelType:
 
     muse_glimmer = 'muse_glimmer'
 
+    deepseek_v41 = 'deepseek_v41'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass

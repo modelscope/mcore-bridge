@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """QSA sparse attention wrappers around the vendored tensor-core triton kernel.
 
-The kernel itself lives in ``qsa_block_sparse_attn.py``, vendored verbatim from
+The kernel itself lives in ``qsa_block_sparse_attn.py``, adapted from
 miles PR #2777 (commit 0f5dff4). This file owns only the glue mcore needs:
 sbhd<->thd flattening, context parallelism, and the ``core_attention`` shim.
 

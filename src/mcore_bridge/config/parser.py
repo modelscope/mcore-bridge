@@ -25,6 +25,7 @@ config_mapping = {
     'add_bias_linear': ['mlp_bias'],
     'kv_channels': ['head_dim'],
     'hf_model_type': ['model_type'],
+    'image_token_id': ['image_token_id'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
     'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size', 'moe_shared_expert_intermediate_size'],
@@ -85,11 +86,34 @@ config_mapping = {
     # deepseek_v4
     'csa_compress_ratios': ['compress_rates'],
     'csa_compress_rotary_base': ['compress_rope_theta'],
+    # deepseek_v41 / CSA2 source-layer routing
+    'csa2_kv_source_layers': ['kv_source_layer_ids'],
+    'csa2_index_source_layers': ['index_source_layer_ids'],
+    'csa2_candidate_source_layer': ['candidate_source_layer_id'],
+    'csa2_candidate_topk_blocks': ['candidate_topk_blocks'],
+    'csa2_candidate_block_size': ['candidate_block_size'],
     'o_groups': ['o_groups'],
     'o_lora_rank': ['o_lora_rank'],
     'num_residual_streams': ['hc_mult'],
     'mhc_sinkhorn_iterations': ['hc_sinkhorn_iters'],
     'moe_n_hash_layers': ['mlp_layer_types'],
+    'engram_layer_ids': ['engram_layer_ids'],
+    'engram_num_embeddings': ['engram_num_embeddings'],
+    'engram_max_ngram_size': ['engram_max_ngram_size'],
+    'engram_vocab_size': ['engram_vocab_size'],
+    'engram_n_heads': ['engram_n_heads'],
+    'engram_head_dim': ['engram_head_dim'],
+    'engram_pad_token_id': ['engram_pad_token_id'],
+    'engram_compressed_vocab_size': ['engram_compressed_vocab_size'],
+    'engram_tokenizer_map': ['engram_tokenizer_map'],
+    # DeepSeek-V4.1 DSpark is a parallel draft stack, not Megatron's autoregressive MTP.
+    'dspark_num_layers': ['num_nextn_predict_layers'],
+    'dspark_block_size': ['dspark_block_size'],
+    'dspark_noise_token_id': ['dspark_noise_token_id'],
+    'dspark_target_layer_ids': ['dspark_target_layer_ids'],
+    'dspark_markov_rank': ['dspark_markov_rank'],
+    'dspark_num_experts': ['dspark_n_routed_experts'],
+    'dspark_router_topk': ['dspark_num_experts_per_tok', 'dspark_n_activated_experts'],
     'activation_func_clamp_value': ['swiglu_limit'],
     # nemotron_h / mamba2
     'mamba_num_heads': ['mamba_num_heads'],
@@ -191,8 +215,10 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.pop('ffn_hidden_size', None)
         if llm_model_type in {'qwen2_moe', 'qwen3_next'} or hf_model_type == 'qwen3_5_moe':
             res['moe_shared_expert_gate'] = True
-    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1', 'deepseek_v4'
-                          } or hf_model_type == 'kimi_vl':
+    if llm_model_type in {
+            'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1', 'deepseek_v4',
+            'deepseek_v41_text'
+    } or hf_model_type == 'kimi_vl':
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
@@ -210,6 +236,28 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             csa_compress_ratios = res.pop('csa_compress_ratios', None)
             res['csa_compress_ratios'] = [csa_compress_ratios.get(layer_type, 0) for layer_type in layer_types]
             res['moe_n_hash_layers'] = len([layer for layer in moe_n_hash_layers if layer == 'hash_moe'])
+        elif llm_model_type == 'deepseek_v41_text':
+            if 'v_head_dim' not in res:
+                res['v_head_dim'] = res['kv_channels']
+            res['experimental_attention_variant'] = 'dsv4_hybrid'
+            res['dsv4_version'] = 'v4.1'
+            # Native V4.1 uses unrotated indexer activations and no YaRN
+            # amplitude scaling (generic MLA defaults differ).
+            res['dsa_indexer_rotate_activation'] = False
+            res['mscale'] = 0.0
+            res['mscale_all_dim'] = 0.0
+            res['moe_router_enable_expert_bias'] = True
+            res['moe_router_enable_vl_bias'] = getattr(hf_config, 'vision_config', None) is not None
+            res['csa_window_size'] = window_size
+            res['enable_hyper_connections'] = True
+            res['mhc_single_pass'] = True
+            # CSA2 consumes raw 0/1/2 ratios; drop any trailing MTP entries.
+            res.pop('csa_compress_ratios', None)
+            text_config = getattr(hf_config, 'text_config', hf_config)
+            res['csa_compress_ratios'] = list(text_config.compress_ratios)[:res['num_layers']]
+            # V4.1 has no Hash-MoE bootstrap layers.
+            res['moe_n_hash_layers'] = 0
+            res['engram_enabled'] = bool(res.get('engram_layer_ids'))
     elif llm_model_type == 'hunyuan':
         # Since HunYuan’s attention applies RoPE before using q/k_layernorm,
         # which is incompatible with megatron-core, support is not provided here.

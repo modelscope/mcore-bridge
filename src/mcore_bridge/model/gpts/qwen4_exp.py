@@ -185,7 +185,7 @@ class Qwen4ExpLayer(TransformerLayer):
                                'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
                                f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
-            raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
+            raise RuntimeError(f'QSA sparse selection with context_parallel_size={cp_size} requires '
                                f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
                                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
@@ -394,6 +394,16 @@ class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
 
 class Qwen4ExpBridge(Qwen3NextBridge):
     hf_mixer_prefix = 'model.'
+
+    def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
+        # PLE export emits every shard. If it omits the scale, these are already
+        # dequantized parameters; copying the source FP8 scale would corrupt them.
+        accounted_keys = set(saved_keys)
+        suffix = 'ngram_embedding.shard_0.weight'
+        for key in saved_keys:
+            if key.endswith(f'ple.ple_embedding.{suffix}'):
+                accounted_keys.add(key[:-len(suffix)] + 'ngram_embedding.weight_scale')
+        super()._save_missing_weights(saver, accounted_keys, source_model_dir)
 
     def _get_hf_experts_attr(self, is_mtp: bool = False):
         # The checkpoint stores experts as packed per-layer tensors

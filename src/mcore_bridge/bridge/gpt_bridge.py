@@ -1756,7 +1756,11 @@ class GPTBridge:
             self._set_state_dict(hyper_connection, 'bias', hf_state_dict, f'hc_{hf_key}_base', to_mcore)
             has_hyper_connection = hyper_connection is not None
             has_hyper_connection = self._reduce_tensor_pp_group(has_hyper_connection, to_mcore)
-            if has_hyper_connection:
+            # ``alpha_*`` are frozen base parameters written outside ``_set_state_dict``, so they
+            # need the peft guard the mapping_proj/bias calls above get for free -- otherwise a
+            # LoRA export writes base weights into ``adapter_model.safetensors`` and a LoRA load
+            # demands a key the adapter does not carry. Same shape as the Engram export guard.
+            if has_hyper_connection and not self._peft_format:
                 if to_mcore:
                     alpha = hf_state_dict[f'hc_{hf_key}_scale'].load()
                     for i, alpha_suffix in enumerate(['pre', 'post', 'res']):
@@ -1844,6 +1848,10 @@ class GPTBridge:
         self._set_state_dict(lm_model, 'decoder.final_layernorm.weight', hf_state_dict, self.hf_final_layernorm_key,
                              to_mcore)
 
+    def _convert_additional_layers(self, mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage):
+        """Extension point for model-specific auxiliary stacks outside standard MTP."""
+        return ()
+
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = {}
         for k, v in hf_state_dict.items():
@@ -1929,6 +1937,7 @@ class GPTBridge:
                     res = self._convert_hf_state_dict(res, to_mcore)
                     yield from list(self._add_prefix(res, hf_prefix).items())
                     hf_state_dict = {}
+        yield from self._convert_additional_layers(mg_model, hf_state_dict, hf_prefix, to_mcore, is_pp_last_stage)
         if not to_mcore or is_pp_last_stage:
             hf_state_dict.update(self._convert_post_process(mg_model, hf_state_dict, '', to_mcore))
         if to_mcore:
@@ -2049,6 +2058,7 @@ class GPTBridge:
         tqdm_desc: str = 'Exporting: ',
         disable_tqdm: bool = True,
         _is_saving: bool = False,
+        skip_unsupported_export: bool = False,
     ):
         """Export Megatron model weights to safetensors (HuggingFace) format as a generator.
 
@@ -2066,6 +2076,11 @@ class GPTBridge:
             converter: Used to perform key-value conversion on the newly exported state_dict.
             tqdm_desc: Description text for the progress bar. Defaults to 'Exporting: '.
             disable_tqdm: Whether to disable the tqdm progress bar. Defaults to True.
+            skip_unsupported_export: When True, weights whose Megatron->HF export is not implemented
+                (e.g. DeepSeek-V4.1 Engram tables, which are frozen during on-policy RL and already
+                loaded in the rollout engine) are silently skipped instead of raising. Used by the RL
+                weight-sync path; the checkpoint-save path keeps the default (False) so a saved HF
+                checkpoint stays complete.
 
         Yields:
             Tuple[str, torch.Tensor]: Key-value pairs of parameter names and tensors.
@@ -2076,6 +2091,7 @@ class GPTBridge:
         self._adapter_name = adapter_name
         self._disable_tqdm = disable_tqdm
         self._is_saving = _is_saving
+        self._skip_unsupported_export = skip_unsupported_export
         self._peft_target_modules = set()
         self._peft_modules_to_save = set()
         self._fp8_skip_modules = set()
@@ -2146,6 +2162,10 @@ class GPTBridge:
         saver.finalize()
         dist.barrier()  # Ensure all weights are saved completely
 
+    def _normalize_missing_weight_key(self, key: str) -> str:
+        """Return the identity used to detect aliases while restoring source-only weights."""
+        return key
+
     def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
         """Copy tensors present in the source checkpoint but absent from the exported ones.
 
@@ -2162,7 +2182,9 @@ class GPTBridge:
             return
         with SafetensorLazyLoader(source_model_dir) as loader:
             state_dict = loader.get_state_dict()
-            missing_keys = sorted(set(state_dict.keys()) - saved_keys)
+            saved_identities = {self._normalize_missing_weight_key(key) for key in saved_keys}
+            missing_keys = sorted(
+                key for key in state_dict if self._normalize_missing_weight_key(key) not in saved_identities)
             if not missing_keys:
                 return
             logger.info(f'Restoring {len(missing_keys)} weights from the source checkpoint '
