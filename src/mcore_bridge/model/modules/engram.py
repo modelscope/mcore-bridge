@@ -52,6 +52,29 @@ class _RelaxedParallelismView:
         return getattr(self._transformer_config, name)
 
 
+class _RecomputeDeferredView:
+    """Read-only view that hides ``recompute_granularity`` from Engram's blanket reject.
+
+    Engram's own ``_validate_unsupported_features`` refuses any activation recomputation, a
+    guard that predates the V4.1 hybrid backbone. That backbone now owns the recompute policy
+    in ``TransformerConfig._validate_dsv41_config`` (full-layer replay through the HybridModel
+    state adapter, or the selective set ``{mhc, layernorm, mla_up_proj, moe_act, moe,
+    shared_experts}`` with ``mhc`` gated on single-pass Hybrid, and core-attn replay rejected)
+    and threads ``input_ids`` through ``_checkpointed_forward`` so the replayed Engram forward
+    still receives its tokens. Masking only the granularity lets the Engram validator keep every
+    other unsupported-feature check while deferring the recompute decision to that single source
+    of truth, without mutating the shared transformer config.
+    """
+
+    recompute_granularity = None
+
+    def __init__(self, transformer_config):
+        self._transformer_config = transformer_config
+
+    def __getattr__(self, name):
+        return getattr(self._transformer_config, name)
+
+
 if EngramConfig is not None:
 
     class DeepseekV41EngramConfig(EngramConfig):
@@ -102,6 +125,11 @@ if EngramConfig is not None:
                 super()._validate_packed_sequences(transformer_config, packed_sequences)
             finally:
                 self.variant_spec = variant_spec
+
+        def _validate_unsupported_features(self, transformer_config, use_fsdp):
+            # Defer the activation-recomputation decision to the V4.1 hybrid backbone (see
+            # _RecomputeDeferredView); keep every other Engram unsupported-feature check live.
+            super()._validate_unsupported_features(_RecomputeDeferredView(transformer_config), use_fsdp)
 else:
     DeepseekV41EngramConfig = None
 
