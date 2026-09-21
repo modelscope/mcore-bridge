@@ -830,18 +830,30 @@ index 9193f4e00a..70174144ba 100644
              assert q is not None and k is not None and weights is not None
              fused_output = dsa_kernels.run_fused_dsa_attention(
                  config=self.config,
-@@ -2581,7 +2741,19 @@ class DSAttention(MegatronModule):
+@@ -2581,7 +2741,31 @@ class DSAttention(MegatronModule):
              # ===================================
              # Get top-k indices
              # ===================================
 -            if fused_bounds is not None:
 +            if is_kpool:
 +                # cuDNN's token top-k does not implement pool compression; keep dev's subsequent
-+                # sparse attention path.
++                # sparse attention path. K was gathered to global sequence order above for CP;
++                # gather the per-token compression gates identically before pooling them together.
++                kpool_gate_score = self.indexer._kpool_gate_score
++                if cp_size > 1 and kpool_gate_score.size(0) in local_cp_kv_lens:
++                    if kv_reorder_idx is None:
++                        kv_reorder_idx = _build_kv_reorder_idx(kpool_gate_score.size(0))
++                    kpool_gate_score = gather_from_sequence_parallel_region(kpool_gate_score, group=cp_group)
++                    if kpool_gate_score.size(0) != kv_reorder_idx.numel():
++                        raise RuntimeError(
++                            "DSA gathered KPool gate length mismatch: "
++                            f"gate_seqlen={kpool_gate_score.size(0)}, expected={kv_reorder_idx.numel()}"
++                        )
++                    kpool_gate_score = kpool_gate_score.index_select(0, kv_reorder_idx)
 +                with torch.no_grad():
 +                    _, topk_indices = fused_qk_topk_kpool(
 +                        q, k, weights, self.index_topk, self.indexer.index_kpool,
-+                        self.indexer._kpool_gate_score, self.indexer.index_kpool_compress_ape,
++                        kpool_gate_score, self.indexer.index_kpool_compress_ape,
 +                        mask=float_mask, varlen_starts=varlen_starts, varlen_ends=varlen_ends,
 +                        key_positions=key_positions, cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
 +                        use_relu=self.config.dsa_indexer_scoring_relu,

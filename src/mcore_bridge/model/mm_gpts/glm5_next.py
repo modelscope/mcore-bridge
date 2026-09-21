@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import torch
 import torch.nn as nn
 from copy import deepcopy
@@ -15,8 +16,11 @@ from ..register import ModelLoader, ModelMeta, register_model
 from .utils import HuggingFaceVit
 
 try:
+    from megatron.core.models.hybrid.hybrid_block import HybridStack
     from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern, select_pipeline_segment
     from megatron.core.transformer.module import mark_keep_in_fp32
+    from megatron.core.transformer.multi_token_prediction import \
+        MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer
 
     from ..hybrid_model import HybridModel
 except ImportError:
@@ -24,7 +28,7 @@ except ImportError:
     # models.hybrid). The package must still import for every other model, so fall back to a base
     # that lets the class definitions below succeed; a GLM config is rejected before any of this is
     # used, by require_glm5_hybrid(), which names the missing dev patch.
-    HybridModel = object
+    HybridModel = HybridStack = McoreMultiTokenPredictionLayer = object
     parse_hybrid_pattern = select_pipeline_segment = mark_keep_in_fp32 = None
 
 logger = get_logger()
@@ -107,6 +111,42 @@ class Glm5NextHybridRMSNorm(Glm5NextRMSNorm):
         self.weight.sequence_parallel = config.sequence_parallel
 
 
+class Glm5NextHybridStack(HybridStack):
+    """Outer decoder stack that never hands the pre-contraction multi-stream tensor to MTP.
+
+    GLM-5.3's backbone runs mHC (4 residual streams) but its MTP head is non-mHC: it consumes the
+    mean-contracted single stream through a fused ``eh_proj`` (2H -> H), exactly like the HF/vLLM
+    draft model. Upstream ``HybridStack.forward`` returns ``(hidden_states, mhc_multistream)`` when
+    mHC + MTP are both active, and ``MultiTokenPredictionBlock.forward`` then feeds the multi-stream
+    to the MTP layer and re-applies ``_postprocess`` to its output -- which double-norms a non-mHC
+    MTP layer whose output is already single-stream and post-final-norm. Dropping the second element
+    keeps the block on its single-stream path, where the MTP layer output is used as-is.
+    """
+
+    def forward(self, *args, **kwargs):
+        out = super().forward(*args, **kwargs)
+        return out[0] if isinstance(out, tuple) else out
+
+
+class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
+    """GLM-5.3 MTP layer: a non-mHC ``eh_proj`` head over a plain DSA + MoE inner block.
+
+    The backbone sets ``enable_hyper_connections=True``, which would make Megatron build the mHC MTP
+    head (per-stream ``e_proj``/``h_proj`` plus an ``hc_head_*`` learned contraction) and wrap the
+    inner block's sublayers in hyper-connections. GLM's MTP checkpoint has none of those: it carries
+    a fused ``eh_proj``, plain ``enorm``/``hnorm``, a ``shared_head.norm`` final norm, and an inner
+    block with standard residuals. So the MTP subtree is built with hyper-connections disabled via a
+    shallow config copy that flips only that flag; the backbone keeps the real config. ``mhc_enabled``
+    (read once in ``__init__``) then follows the copy, selecting the ``eh_proj`` branch, and the
+    nested ``HybridStack`` skips hyper-connection wrapping for its DSA/MoE sublayers.
+    """
+
+    def __init__(self, config, *args, **kwargs):
+        mtp_config = copy.copy(config)
+        mtp_config.enable_hyper_connections = False
+        super().__init__(mtp_config, *args, **kwargs)
+
+
 class Glm5NextHybridModel(HybridModel):
     extra_forward_keys = ()
 
@@ -120,20 +160,29 @@ class Glm5NextHybridModel(HybridModel):
                              'num_layers_in_first_pipeline_stage / num_layers_in_last_pipeline_stage.')
         if ('|' in pattern or config.num_layers_in_first_pipeline_stage is not None
                 or config.num_layers_in_last_pipeline_stage is not None):
-            return pattern
-        stages = config.pipeline_model_parallel_size
-        if config.virtual_pipeline_model_parallel_size is not None:
-            stages *= config.virtual_pipeline_model_parallel_size
-        blocks, extra = divmod(len(mapping) // 2, stages)
-        if blocks == 0:
-            raise ValueError('The current model needs at least one attention+FFN block per pipeline stage; '
-                             'lower pipeline_model_parallel_size.')
-        segments, offset = [], 0
-        for stage in range(stages):
-            count = 2 * (blocks + int(stage < extra))
-            segments.append(pattern[offset:offset + count])
-            offset += count
-        return '|'.join(segments)
+            main = pattern
+        else:
+            stages = config.pipeline_model_parallel_size
+            if config.virtual_pipeline_model_parallel_size is not None:
+                stages *= config.virtual_pipeline_model_parallel_size
+            blocks, extra = divmod(len(mapping) // 2, stages)
+            if blocks == 0:
+                raise ValueError('The current model needs at least one attention+FFN block per pipeline stage; '
+                                 'lower pipeline_model_parallel_size.')
+            segments, offset = [], 0
+            for stage in range(stages):
+                count = 2 * (blocks + int(stage < extra))
+                segments.append(pattern[offset:offset + count])
+                offset += count
+            main = '|'.join(segments)
+        # Append the MTP segment (`<main>/<mtp>/<mtp>/...`, one per prediction depth). Megatron's
+        # parse_hybrid_pattern splits on '/' and keeps '|' inside the main pattern for PP boundaries;
+        # the MTP inner block (DSA + MoE, no hyper-connections) is described by mtp_hybrid_override_pattern.
+        mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
+        mtp_num_layers = getattr(config, 'mtp_num_layers', None)
+        if mtp_pattern and mtp_num_layers and '/' not in main:
+            main = main + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
+        return main
 
     def __init__(self, config, transformer_layer_spec, pre_process=True, post_process=True, vp_stage=None):
         # The PP boundaries have to be validated before super().__init__: an attention/FFN pair must
@@ -166,24 +215,36 @@ class Glm5NextHybridModel(HybridModel):
         for layer in self.decoder.layers:
             layer.hyper_connection.sinkhorn_eps = config.hc_eps
             layer.hyper_connection.compute_h_eps = config.hc_eps
-            if mapping[layer.layer_number - 1][2] == 'D':
-                # HF runs the KPool indexer under no_grad, so it must not be counted in DDP's
-                # grad-ready accounting.
-                layer.inner_layer.self_attention.core_attention.indexer.requires_grad_(False)
-            elif mapping[layer.layer_number - 1][2] == 'E':
-                # Experts reduce over expert-DP, and ETP can differ from attention TP even at EP=1.
-                # dev's TEGroupedLinear derives `allreduce` from EP alone and does not mark the ETP
-                # shard, which would miss expert grad reduction and norm sharding. Corrected here at
-                # the GLM boundary so other models keep their defaults.
-                for param in layer.inner_layer.mlp.experts.parameters():
-                    param.allreduce = False
-                    param.tensor_model_parallel = config.expert_tensor_parallel_size > 1
-                router = layer.inner_layer.mlp.router
-                if router.enable_expert_bias:
-                    # BF16 cannot accumulate large integer counts exactly, and PP changes the number
-                    # of micro-batches, which would change the router update.
-                    mark_keep_in_fp32(router.local_tokens_per_expert)
-                    mark_keep_in_fp32(router.expert_bias)
+            self._finalize_hybrid_sublayer(layer.inner_layer, mapping[layer.layer_number - 1][2], config)
+        # The MTP head's inner block is a nested HybridStack of raw (non-hyper-connected) sublayers
+        # following mtp_hybrid_override_pattern ('DE'); it needs the same DSA/MoE finalization.
+        mtp = getattr(self, 'mtp', None)
+        if mtp is not None:
+            mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', '') or ''
+            for mtp_layer in mtp.layers:
+                for symbol, sublayer in zip(mtp_pattern, mtp_layer.mtp_model_layer.layers):
+                    self._finalize_hybrid_sublayer(sublayer, symbol, config)
+
+    @staticmethod
+    def _finalize_hybrid_sublayer(sublayer, symbol, config):
+        if symbol == 'D':
+            # HF runs the KPool indexer under no_grad, so it must not be counted in DDP's
+            # grad-ready accounting.
+            sublayer.self_attention.core_attention.indexer.requires_grad_(False)
+        elif symbol == 'E':
+            # Experts reduce over expert-DP, and ETP can differ from attention TP even at EP=1.
+            # dev's TEGroupedLinear derives `allreduce` from EP alone and does not mark the ETP
+            # shard, which would miss expert grad reduction and norm sharding. Corrected here at
+            # the GLM boundary so other models keep their defaults.
+            for param in sublayer.mlp.experts.parameters():
+                param.allreduce = False
+                param.tensor_model_parallel = config.expert_tensor_parallel_size > 1
+            router = sublayer.mlp.router
+            if router.enable_expert_bias:
+                # BF16 cannot accumulate large integer counts exactly, and PP changes the number
+                # of micro-batches, which would change the router update.
+                mark_keep_in_fp32(router.local_tokens_per_expert)
+                mark_keep_in_fp32(router.expert_bias)
 
     def _get_packed_padding_mask(self, packed_seq_params, position_ids):
         # `seq_lens` is the logical length attached by swift's prepare_batch; it is not one of the
@@ -412,25 +473,80 @@ class Glm5NextBridge(MultimodalGPTBridge):
         return {} if to_mcore else self._add_prefix(hf_state_dict, layer_prefix)
 
     def _filter_mtp_layer(self, hf_state_dict):
-        """Drop the extra MTP-only decoder layer (index == num_layers) from a HF checkpoint."""
-        # TODO: MTP is not supported yet -- the loader rejects mtp_num_layers and the pattern resolver
-        # emits no MTP segment -- so the checkpoint's extra MTP layer has nowhere to go. Wire it up
-        # through mtp_hybrid_override_pattern / mtp_on_this_rank once that path is validated here.
+        """Drop the extra MTP-only decoder layer (index == num_hidden_layers) from a HF checkpoint.
+
+        Only used when MTP training is OFF: the checkpoint always ships the MTP head, but a run with
+        ``mtp_num_layers=0`` builds no MTP module, so those tensors would otherwise be reported as
+        unexpected. When MTP is ON they are consumed by ``_convert_mtp_layer`` instead.
+        """
         hf_num_layers = self.config.num_layers // 2
         layer_prefix = f'{self.hf_layers_prefix}.{hf_num_layers}.'
         prefixes = (layer_prefix, layer_prefix.removeprefix('model.'), f'layers.{hf_num_layers}.')
         ignored = [key for key in hf_state_dict if key.startswith(prefixes)]
         if ignored:
             logger.warning_once(
-                f'Ignoring {len(ignored)} MTP tensors under decoder layer {hf_num_layers}: the current model '
-                'builds exactly num_hidden_layers decoder layers and does not train MTP yet.')
+                f'Ignoring {len(ignored)} MTP tensors under decoder layer {hf_num_layers}: this run builds no '
+                'MTP module (mtp_num_layers=0). Pass --mtp_num_layers 1 to train the MTP head.')
             hf_state_dict = {key: value for key, value in hf_state_dict.items() if not key.startswith(prefixes)}
         return hf_state_dict
 
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
-        if to_mcore:
+        if to_mcore and not getattr(self.config, 'mtp_num_layers', None):
             hf_state_dict = self._filter_mtp_layer(hf_state_dict)
         return super()._convert_hf_state_dict(hf_state_dict, to_mcore)
+
+    def _convert_mtp_layer(self, lm_model, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
+        """Map GLM's MTP head, which lives at decoder-layer index ``num_hidden_layers``.
+
+        ``num_layers`` counts hybrid *sublayers* (two per HF block), so the MTP head's HF index is
+        ``num_layers // 2 + layer_idx`` and it shares the backbone's ``model.language_model.layers``
+        prefix -- neither the separate-prefix nor the ``+num_layers`` assumptions of the base
+        ``_convert_mtp_layer`` hold. The head is non-mHC: ``enorm``/``hnorm``/fused ``eh_proj`` plus a
+        ``shared_head.norm`` final norm, over a nested HybridStack whose raw sublayers are a DSA
+        attention block (``input_layernorm`` + ``self_attn``) and a MoE FFN block
+        (``pre_mlp_layernorm`` + ``mlp``), with no hyper-connection weights.
+        """
+        mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
+        hf_layer_idx = self.config.num_layers // 2 + layer_idx
+        layer_prefix = f'{self.hf_layers_prefix}.{hf_layer_idx}.'
+        if to_mcore:
+            origin_hf_state_dict = hf_state_dict
+            hf_state_dict = self._remove_prefix(hf_state_dict, layer_prefix)
+            if len(hf_state_dict) == 0:
+                logger.info(f'MTP layer {hf_layer_idx} safetensors weights not found, '
+                            'this part will be randomly initialized.')
+                for param in mtp_layer.parameters():
+                    if param.ndim == 2:
+                        mtp_layer.config.init_method(param.data)
+                return {}
+        else:
+            origin_hf_state_dict = {}
+            hf_state_dict = {}
+        # MTP head: enorm / hnorm / fused eh_proj (2H -> H) / final_layernorm (shared_head.norm).
+        for mg_key, hf_key in [('enorm.weight', 'enorm.weight'), ('hnorm.weight', 'hnorm.weight'),
+                               ('eh_proj.weight', 'eh_proj.weight'),
+                               ('final_layernorm.weight', 'shared_head.norm.weight')]:
+            self._set_state_dict(mtp_layer, mg_key, hf_state_dict, hf_key, to_mcore)
+        # eh_proj is kept in BF16 in the FP8 checkpoint (see modules_to_not_convert); never quantize it.
+        self._fp8_skip_modules.update({'eh_proj'})
+        # Inner block: nested HybridStack, sublayer 0 = DSA attention, sublayer 1 = MoE FFN.
+        inner = None if mtp_layer is None else mtp_layer.mtp_model_layer
+        attn_sub = None if inner is None else inner.layers[0]
+        ffn_sub = None if inner is None else inner.layers[1]
+        attn = None if attn_sub is None else attn_sub.self_attention
+        hf_state_dict.update(self._set_dsa_state(attn, hf_state_dict, to_mcore))
+        self._set_state_dict(attn_sub, 'input_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key, to_mcore)
+        mlp = None if ffn_sub is None else ffn_sub.mlp
+        hf_state_dict.update(
+            self._set_moe_state(mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', hf_layer_idx, to_mcore, is_mtp=True))
+        self._set_state_dict(ffn_sub, 'pre_mlp_layernorm.weight', hf_state_dict, self.hf_post_attention_layernorm_key,
+                             to_mcore)
+        if to_mcore:
+            hf_state_dict = {}
+        else:
+            hf_state_dict = self._add_prefix(hf_state_dict, layer_prefix)
+            hf_state_dict.update(origin_hf_state_dict)
+        return hf_state_dict
 
 
 class Glm5NextLoader(ModelLoader):
@@ -442,8 +558,6 @@ class Glm5NextLoader(ModelLoader):
 
         from ..modules import TopKRouter
         config = self.config
-        if config.mtp_num_layers:
-            raise NotImplementedError('The current model builds no MTP layers; use mtp_num_layers=0')
         if config.fp8 or config.fp4:
             raise NotImplementedError('The current model is validated for BF16/FP32 only; '
                                       'fp8/fp4 training is not supported')
@@ -461,6 +575,14 @@ class Glm5NextLoader(ModelLoader):
         config.mscale_all_dim = MLATransformerConfig.mscale_all_dim
         config.cache_mla_latents = MLATransformerConfig.cache_mla_latents
         config.enable_hyper_connections = True
+        # GLM-5.3-Flash's MTP head (decoder layer index num_hidden_layers) is a single DSA-attention +
+        # MoE-FFN block with plain residuals -- it carries no hyper-connection weights, unlike every
+        # backbone block. This describes that inner block for Megatron's hybrid MTP path and is only
+        # consumed when mtp_num_layers > 0. Set here rather than in the parser: it is a Megatron
+        # TransformerConfig field (not a ModelConfig one), so emitting it from the parser would make
+        # ModelConfig(**values) raise a bare TypeError on a Megatron that lacks it -- before
+        # __post_init__ could run require_glm5_hybrid() and name the actual fix.
+        config.mtp_hybrid_override_pattern = 'DE'
         config.mhc_norm_eps_inside_sqrt = config.mhc_keep_mappings_in_fp32 = True
         config.mhc_learned_output_contract = False
         config.kda_two_stage_gates = True
@@ -492,6 +614,19 @@ class Glm5NextLoader(ModelLoader):
         moe = spec.submodules.moe_layer.submodules
         moe.pre_mlp_layernorm = Glm5NextHybridRMSNorm
         moe.mlp.keywords['submodules'].router = TopKRouter
+        # Outer decoder stack drops the multi-stream tensor so MTP stays on its non-mHC path.
+        spec.module = Glm5NextHybridStack
+        # MTP head (built only when mtp_num_layers > 0): non-mHC eh_proj over a plain DSA + MoE inner
+        # block. Glm5NextMultiTokenPredictionLayer disables hyper-connections for the MTP subtree, so
+        # only eh_proj/enorm/hnorm/layer_norm are used; the GLM RMSNorm matches the checkpoint's plain
+        # (non zero-centered) enorm/hnorm/shared_head.norm.
+        mtp_block_spec = getattr(spec.submodules, 'mtp_block_spec', None)
+        if mtp_block_spec is not None:
+            mtp_layer_spec = mtp_block_spec.submodules.layer_specs[0]
+            mtp_layer_spec.module = Glm5NextMultiTokenPredictionLayer
+            mtp_sub = mtp_layer_spec.submodules
+            mtp_sub.enorm = mtp_sub.hnorm = mtp_sub.layer_norm = Glm5NextHybridRMSNorm
+            mtp_sub.eh_proj = TEColumnParallelLinear
         return spec
 
     def build_model(self, pre_process=True, post_process=True, vp_stage: Optional[int] = None):

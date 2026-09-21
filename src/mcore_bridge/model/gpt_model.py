@@ -177,6 +177,11 @@ class GPTModel(McoreGPTModel):
         if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:
             input_tensor = self.get_input_tensor()
             input_tensor, mtp_decoder_input = input_tensor.chunk(2, dim=0)
+            # Pipeline communication carries a single tensor, so models whose backbone keeps
+            # multiple hidden streams pad the H-wide embedding to the n*H transport width.
+            # The padding is transport-only and must not enter the MTP projection.
+            if mtp_decoder_input.shape[-1] != self.config.hidden_size:
+                mtp_decoder_input = mtp_decoder_input[..., :self.config.hidden_size].contiguous()
             self.set_input_tensor(input_tensor)
 
         rotary_pos_emb, rotary_pos_cos, rotary_pos_sin = self._get_rotary_pos_emb(
@@ -448,6 +453,16 @@ class GPTModel(McoreGPTModel):
         """
         if not self.post_process:
             if self.config.is_multimodal and self.config.mtp_num_layers:
+                # Pipeline P2P sends one tensor. Hyper-connection backbones can expose n*H
+                # hidden states while the embedding retained for MTP is only H wide, so pad
+                # the embedding for transport and slice it back in _preprocess on the next stage.
+                hidden_width = hidden_states.shape[-1]
+                decoder_width = decoder_input.shape[-1]
+                assert decoder_width <= hidden_width, (
+                    f'MTP pipeline transport requires decoder width <= hidden width, got '
+                    f'{decoder_width} and {hidden_width}.')
+                if decoder_width != hidden_width:
+                    decoder_input = F.pad(decoder_input, (0, hidden_width - decoder_width))
                 return torch.concat([hidden_states, decoder_input], dim=0)
             else:
                 return hidden_states

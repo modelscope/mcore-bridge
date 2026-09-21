@@ -17,6 +17,7 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextRMSNorm, _get_physical_cu_seqlens
 from mcore_bridge.model.register import get_mcore_model
+from mcore_bridge.utils import split_cp_inputs
 
 
 def _glm_config():
@@ -125,7 +126,7 @@ def _tiny_glm_config(moe=False, optimized_dsa=False):
     return config
 
 
-def _mcore_config(hf_config, tp=1, pp=1, ep=1, sequence_parallel=False, dtype=torch.float32):
+def _mcore_config(hf_config, tp=1, pp=1, ep=1, cp=1, sequence_parallel=False, dtype=torch.float32, mtp=0):
     values = hf_to_mcore_config(hf_config)
     # HF `glm5_next` resolves to the multimodal type; these are language-model-only fixtures.
     values['mcore_model_type'] = 'glm5_next'
@@ -142,8 +143,11 @@ def _mcore_config(hf_config, tp=1, pp=1, ep=1, sequence_parallel=False, dtype=to
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
         expert_tensor_parallel_size=1,
+        context_parallel_size=cp,
         sequence_parallel=sequence_parallel,
     )
+    if mtp:
+        values.update(mtp_num_layers=mtp, mtp_loss_scaling_factor=0.1)
     return ModelConfig(**values)
 
 
@@ -155,11 +159,11 @@ def _distributed_session():
 
 
 @contextmanager
-def _parallel_context(tp=1, pp=1, ep=1):
+def _parallel_context(tp=1, pp=1, ep=1, cp=1):
     if not torch.cuda.is_available():
         pytest.skip('CUDA is required')
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
-    expected_world_size = max(tp * pp, ep)
+    expected_world_size = tp * pp * cp * ep
     if world_size != expected_world_size:
         pytest.skip(f'requires world size {expected_world_size}')
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
@@ -176,12 +180,12 @@ def _parallel_context(tp=1, pp=1, ep=1):
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
         expert_tensor_parallel_size=1,
-        context_parallel_size=1,
+        context_parallel_size=cp,
     )
     from megatron.core.process_groups_config import ProcessGroupCollection
     pg = ProcessGroupCollection.use_mpu_process_groups()
     assert pg.tp.size() == tp and pg.pp.size() == pp and pg.ep.size() == ep
-    assert pg.cp.size() == parallel_state.get_context_parallel_world_size() == 1
+    assert pg.cp.size() == parallel_state.get_context_parallel_world_size() == cp
     model_parallel_cuda_manual_seed(123)
     try:
         yield
@@ -495,19 +499,137 @@ def test_glm5_uses_padded_boundaries_for_physical_thd_slices():
     assert _get_physical_cu_seqlens(None) is None
 
 
-def test_glm5_mtp_layer_is_filtered_for_full_and_stripped_prefixes():
+def test_glm5_mtp_layer_is_filtered_only_when_mtp_disabled():
     from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextBridge
 
-    bridge = object.__new__(Glm5NextBridge)
-    bridge.config = SimpleNamespace(num_layers=90)
     state = {
         'model.language_model.layers.44.input_layernorm.weight': 1,
         'model.language_model.layers.45.input_layernorm.weight': 2,
         'language_model.layers.45.mlp.down_proj.weight': 3,
         'layers.45.self_attn.q_proj.weight': 4,
     }
-    converted = bridge._convert_hf_state_dict(state, True)
+
+    # MTP off: the extra decoder layer (index num_hidden_layers) has nowhere to go -> filtered.
+    bridge = object.__new__(Glm5NextBridge)
+    bridge.config = SimpleNamespace(num_layers=90, mtp_num_layers=0)
+    converted = bridge._convert_hf_state_dict(dict(state), True)
     assert converted == {'model.language_model.layers.44.input_layernorm.weight': 1}
+
+    # MTP on: the layer-45 tensors are kept for _convert_mtp_layer.
+    bridge_mtp = object.__new__(Glm5NextBridge)
+    bridge_mtp.config = SimpleNamespace(num_layers=90, mtp_num_layers=1)
+    kept = bridge_mtp._convert_hf_state_dict(dict(state), True)
+    assert 'model.language_model.layers.45.input_layernorm.weight' in kept
+
+
+def _build_glm_mtp_model(mtp=1, moe=True, dtype=torch.float32, tp=1, pp=1, ep=1, cp=1, seed=5):
+    torch.manual_seed(seed)
+    hf_config = _tiny_glm_config(moe=moe, optimized_dsa=cp > 1)
+    config = _mcore_config(hf_config, tp=tp, pp=pp, ep=ep, cp=cp, dtype=dtype, mtp=mtp)
+    model = get_mcore_model(config)[0].cuda()
+    return model, config
+
+
+def _lm_of(model):
+    return model.language_model if hasattr(model, 'language_model') else model
+
+
+def test_glm5_mtp_builds_non_mhc_eh_proj_head():
+    """GLM's MTP head is non-mHC despite the mHC backbone: fused eh_proj, no hyper-connected inner block."""
+    with _parallel_context():
+        model, config = _build_glm_mtp_model(mtp=1)
+        lm = _lm_of(model)
+        assert config.mtp_hybrid_override_pattern == 'DE'
+        assert lm.mtp_process and len(lm.mtp.layers) == 1
+        mtp_layer = lm.mtp.layers[0]
+        assert type(mtp_layer).__name__ == 'Glm5NextMultiTokenPredictionLayer'
+        assert mtp_layer.mhc_enabled is False
+        assert mtp_layer.eh_proj is not None and mtp_layer.e_proj is None and mtp_layer.h_proj is None
+        inner = mtp_layer.mtp_model_layer
+        assert inner.is_mtp_layer and len(inner.layers) == 2
+        # No hyper-connection wrapping on the MTP inner sublayers (the checkpoint carries no hc_* there).
+        assert all(not hasattr(sub, 'hyper_connection') for sub in inner.layers)
+        # The outer decoder must be the stack that suppresses the multi-stream tensor.
+        assert type(lm.decoder).__name__ == 'Glm5NextHybridStack'
+
+
+def test_glm5_mtp_bridge_roundtrip_matches_checkpoint_layout():
+    """mcore -> hf export of the MTP head matches the real GLM-5.3-Flash key layout and re-imports bit-exactly."""
+    with _parallel_context():
+        model_a, config = _build_glm_mtp_model(mtp=1, seed=5)
+        exported = _export_to_hf(config, model_a)
+        hf_idx = config.num_layers // 2  # MTP head lives at decoder-layer index num_hidden_layers
+        p = f'model.language_model.layers.{hf_idx}.'
+        for key in ('enorm.weight', 'hnorm.weight', 'eh_proj.weight', 'shared_head.norm.weight',
+                    'input_layernorm.weight', 'post_attention_layernorm.weight', 'mlp.gate.weight',
+                    'mlp.gate.e_score_correction_bias', 'self_attn.q_a_proj.weight',
+                    'self_attn.kv_a_proj_with_mqa.weight', 'self_attn.indexer.wq_b.weight'):
+            assert p + key in exported, f'MTP export missing {p}{key}'
+
+        model_b, _ = _build_glm_mtp_model(mtp=1, seed=999)
+        lazy = {key: _LazyTensor(value) for key, value in exported.items()}
+        list(config.bridge._convert([model_b], lazy, '', True, 'Reloading test: '))
+        sd_a = _lm_of(model_a).mtp.state_dict()
+        sd_b = _lm_of(model_b).mtp.state_dict()
+        assert sd_a.keys() == sd_b.keys()
+        for key in sd_a:
+            torch.testing.assert_close(
+                sd_b[key].cpu(), sd_a[key].cpu(), atol=0, rtol=0, msg=lambda m, k=key: f'{k}: {m}')
+
+
+def test_glm5_mtp_forward_backward_flows_grads_to_head():
+    """The MTP loss path runs and every trainable MTP parameter receives a gradient.
+
+    BF16 (how GLM trains): the FP32 KDA backward routes through a TileLang kernel whose nvcc
+    toolchain is unrelated to MTP; BF16 uses the FLA/Triton chunk-KDA path.
+    """
+    with _parallel_context():
+        model, _ = _build_glm_mtp_model(mtp=1, dtype=torch.bfloat16)
+        lm = _lm_of(model).train()
+        input_ids, position_ids, attention_mask = _model_inputs(batch=2, sequence=8)
+        labels = torch.randint(1, 128, (2, 8), device='cuda')
+        loss_mask = torch.ones(2, 8, device='cuda')
+        out = lm(input_ids, position_ids, attention_mask, labels=labels, loss_mask=loss_mask)
+        loss = out if out.dim() == 0 else out.float().mean()
+        assert torch.isfinite(loss).item()
+        loss.backward()
+        nograd = [n for n, p in lm.mtp.named_parameters() if p.requires_grad and p.grad is None]
+        assert not nograd, f'MTP params without grad: {nograd}'
+        head = dict(lm.mtp.named_parameters())
+        for probe in ('layers.0.eh_proj.weight', 'layers.0.enorm.weight', 'layers.0.hnorm.weight',
+                      'layers.0.final_layernorm.weight'):
+            assert probe in head, f'MTP head missing {probe}'
+            assert head[probe].grad is not None and torch.isfinite(head[probe].grad.float()).all()
+
+
+def test_glm5_mtp_cp2_packed_forward_backward():
+    """KPool gates must follow the same CP gather/reorder as their indexer keys."""
+    if os.environ.get('GLM5_MTP_PARALLEL_TEST') != 'cp2':
+        pytest.skip('run with GLM5_MTP_PARALLEL_TEST=cp2 torchrun --nproc-per-node=2')
+    with _parallel_context(cp=2):
+        model, _ = _build_glm_mtp_model(mtp=1, dtype=torch.bfloat16, cp=2)
+        lm = _lm_of(model).train()
+        input_ids, position_ids, packed_seq_params = _packed_inputs([16])
+        labels = torch.randint(1, 128, input_ids.shape, device='cuda')
+        loss_mask = torch.ones_like(labels, dtype=torch.bool)
+        cu_seqlens = packed_seq_params.cu_seqlens_q
+        position_ids = split_cp_inputs(position_ids, cu_seqlens, -1)
+        labels = split_cp_inputs(labels, cu_seqlens, -1)
+        loss_mask = split_cp_inputs(loss_mask, cu_seqlens, -1)
+
+        out = model(
+            input_ids,
+            position_ids,
+            None,
+            labels=labels,
+            loss_mask=loss_mask,
+            packed_seq_params=packed_seq_params,
+        )
+        loss = out if out.dim() == 0 else out.float().mean()
+        assert torch.isfinite(loss).item()
+        loss.backward()
+        missing = [name for name, param in lm.mtp.named_parameters() if param.requires_grad and param.grad is None]
+        assert not missing, f'MTP params without grad: {missing}'
 
 
 def test_glm5_kda_head_sharding_matches_world8():

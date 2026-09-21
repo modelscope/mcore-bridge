@@ -60,6 +60,17 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 tp_group=self.tp_group,
             )
 
+    @property
+    def transformer_layer(self):
+        """The MTP inner transformer block, under whichever name the running Megatron registers it.
+
+        Megatron dev renamed the attribute to ``mtp_model_layer`` (and keys checkpoints as
+        ``transformer_layer`` for backward compat), while main still calls the module itself
+        ``transformer_layer``. mcore-bridge's forward below and ``GPTBridge._convert_mtp_layer``
+        reference ``.transformer_layer``, so resolve whichever exists.
+        """
+        return self._modules.get('mtp_model_layer', None) or self._modules.get('transformer_layer', None)
+
     def forward(
         self,
         input_ids: torch.Tensor,
