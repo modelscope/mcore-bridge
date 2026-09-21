@@ -1975,6 +1975,8 @@ class GPTBridge:
             origin_hf_state_dict = hf_state_dict
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
             if len(hf_state_dict) == 0:
+                if self._peft_format:
+                    return {}
                 logger.info(f'MTP Layer {mtp_layer.layer_number} safetensors weights not found, '
                             'this part will be randomly initialized.')
                 for param in mtp_layer.parameters():

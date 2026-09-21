@@ -550,6 +550,11 @@ class Glm5NextBridge(MultimodalGPTBridge):
             origin_hf_state_dict = hf_state_dict
             hf_state_dict = self._remove_prefix(hf_state_dict, layer_prefix)
             if len(hf_state_dict) == 0:
+                if self._peft_format:
+                    # A PEFT/adapter checkpoint carries no base MTP weights -- those came from the
+                    # base checkpoint the adapter sits on top of. Re-initializing here would wipe
+                    # the (frozen) base MTP head + inner HybridStack.
+                    return {}
                 logger.info(f'MTP layer {hf_layer_idx} safetensors weights not found, '
                             'this part will be randomly initialized.')
                 for param in mtp_layer.parameters():
@@ -601,6 +606,17 @@ class Glm5NextLoader(ModelLoader):
         if config.dsa_indexer_loss_coeff:
             raise NotImplementedError('The current model has no KPool indexer auxiliary loss; '
                                       'use dsa_indexer_loss_coeff=0')
+        if config.mtp_num_layers and ((config.mtp_unroll_steps or 1) > 1
+                                      or getattr(config, 'mtp_use_repeated_layer', False)):
+            # Only single-step MTP is wired for GLM's hybrid path. The hybrid pattern is built from
+            # mtp_num_layers, and the upstream execution/loss loop iterates mtp_num_layers and reads
+            # neither mtp_unroll_steps (World-1 shared-weights depth) nor mtp_use_repeated_layer, so a
+            # multi-step request would silently run one step; the weight converter would also index
+            # physical mtp.layers[depth] that a repeated build never creates.
+            raise NotImplementedError(
+                'GLM-5.3-Flash MTP is validated only for single-step (mtp_num_layers=1). Multi-step '
+                'MTP via mtp_shared_weights / mtp_use_repeated_layer / mtp_num_layers>1 is not yet '
+                'wired into the hybrid execution path; use mtp_num_layers=1.')
         if config.context_parallel_size > 1:
             if config.cp_comm_type != 'all_gather':
                 logger.warning_once("GLM5-Next under context parallelism requires cp_comm_type='all_gather'; "

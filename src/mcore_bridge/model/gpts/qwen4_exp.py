@@ -378,6 +378,7 @@ class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
 
 class Qwen4ExpBridge(Qwen3NextBridge):
     hf_mixer_prefix = 'model.'
+    additional_dim0_keys = {'e_proj', 'h_proj'}
 
     def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
         # PLE export emits every shard. If it omits the scale, these are already
@@ -642,8 +643,14 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         hf_prefix = f'{hf_prefix}{layer_idx}.'  # 'mtp.layers.0.'
         if to_mcore:
             origin_hf_state_dict = hf_state_dict
+            mtp_present = len(self._remove_prefix(origin_hf_state_dict, 'mtp.')) > 0
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
-            if len(hf_state_dict) == 0:
+            if not mtp_present:
+                if self._peft_format:
+                    # A PEFT/adapter checkpoint carries no base MTP weights -- those were already
+                    # loaded from the base checkpoint the adapter sits on top of. Re-initializing
+                    # here would wipe the (frozen) base MTP head + inner block.
+                    return {}
                 logger.info(f'MTP layer {layer_idx} safetensors weights not found, '
                             'this part will be randomly initialized.')
                 for param in mtp_layer.parameters():
@@ -743,6 +750,14 @@ class Qwen4ExpLoader(ModelLoader):
             layer_spec.module = Qwen4ExpLayer
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        if (self.config.mtp_num_layers or 0) > 1 and not self.config.mtp_shared_weights:
+            # HF exposes a single top-level `mtp.*` head; multiple independent heads would all map
+            # to the same `mtp.*` keys on export and overwrite each other (no lossless round-trip).
+            raise NotImplementedError(
+                'Qwen3.8-Flash-Next exposes a single top-level `mtp.*` head, so multiple independent '
+                'MTP heads (mtp_num_layers>1 without mtp_shared_weights) cannot round-trip through HF. '
+                'Use mtp_shared_weights=True to reuse one head across prediction depths, or '
+                'mtp_num_layers=1.')
         mtp_block_spec = get_gpt_mtp_block_spec(
             self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
         if mtp_block_spec is not None:
