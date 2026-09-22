@@ -49,6 +49,11 @@ def _materialize_rope(freqs: torch.Tensor, seq_len: int, dtype: torch.dtype, msc
     return cos, sin
 
 
+def _stable_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
+    order = torch.sort(scores, dim=-1, descending=True, stable=True).indices
+    return order[..., :k]
+
+
 class QSAIndexer(nn.Module):
     """QSA block selection: score compressed key blocks, keep the top-k per query.
 
@@ -196,7 +201,7 @@ class QSAIndexer(nn.Module):
             scores = torch.einsum('bqhd,bkd->bqhk', q[:, start:end].float(), keys_float)
             scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)
             scores = scores.masked_fill((block_ids[None, :] >= n_blocks[start:end, None])[None], float('-inf'))
-            selected = scores.topk(k, dim=-1).indices
+            selected = _stable_topk_indices(scores, k)
             top_blocks[:, start:end] = selected
             keep[:, start:end] = selected < n_blocks[None, start:end, None]
             del scores, selected
@@ -389,7 +394,7 @@ class QSAIndexer(nn.Module):
             valid_c = (block_doc[None, :] == td[:, None]) & \
                 (block_in_doc_idx[None, :] < q_nblocks[start:end, None])  # [c, NB]
             sc = sc.masked_fill(~valid_c, float('-inf'))
-            tb = sc.topk(k, dim=-1).indices  # [c, k] into [0, NB)
+            tb = _stable_topk_indices(sc, k)  # [c, k] into [0, NB)
             top_blocks[start:end] = tb
             keep[start:end] = valid_c.gather(1, tb)
         del sc, valid_c, tb
