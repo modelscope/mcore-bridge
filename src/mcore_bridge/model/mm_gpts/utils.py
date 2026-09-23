@@ -91,6 +91,24 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
         pixel_values_videos = inputs.get('pixel_values_videos')
         image_grid_thw = inputs.get('image_grid_thw')
         video_grid_thw = inputs.get('video_grid_thw')
+        token_types = inputs.get('mm_token_type_ids')
+        if token_types is not None:
+            if token_types.shape != input_ids.shape:
+                raise ValueError('mm_token_type_ids must match input_ids for vision embedding.')
+            token_types = token_types.to(device=input_ids.device)
+            torch._assert_async(((token_types == 0) | (token_types == 1) | (token_types == 2)).all(),
+                                'Unsupported vision modality type.')
+            for modality, name in ((1, 'image_token_id'), (2, 'video_token_id')):
+                token_id = getattr(hf_config, name, None)
+                if token_id is None:
+                    torch._assert_async((token_types != modality).all(), 'Unsupported vision modality.')
+                else:
+                    torch._assert_async(((token_types != modality) | (input_ids == token_id)).all(),
+                                        'Vision modality type disagrees with placeholder token id.')
+            if pixel_values is None:
+                torch._assert_async((token_types != 1).all(), 'Image placeholders require pixel_values.')
+            if pixel_values_videos is None:
+                torch._assert_async((token_types != 2).all(), 'Video placeholders require pixel_values_videos.')
         dtype = visual.dtype
         vision_config = HuggingFaceVit._get_vision_config(hf_config)
         if pixel_values is None and pixel_values_videos is None:  # plain-text
@@ -128,13 +146,21 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
                 video_embeds = mixed_embeds[image_tokens:]
 
             if image_embeds is not None:
-                image_mask = (input_ids == hf_config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                # Generated special tokens retain their text embedding. Only
+                # input placeholders carry a nonzero modality type.
+                image_positions = input_ids == hf_config.image_token_id if token_types is None else token_types == 1
+                torch._assert_async(image_positions.sum() == image_embeds.shape[0],
+                                    'Image placeholder and embedding counts differ.')
+                image_mask = image_positions.unsqueeze(-1).expand_as(inputs_embeds)
                 image_embeds = image_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 image_mask = image_mask.to(inputs_embeds.device)
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if video_embeds is not None:
-                video_mask = (input_ids == hf_config.video_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+                video_positions = input_ids == hf_config.video_token_id if token_types is None else token_types == 2
+                torch._assert_async(video_positions.sum() == video_embeds.shape[0],
+                                    'Video placeholder and embedding counts differ.')
+                video_mask = video_positions.unsqueeze(-1).expand_as(inputs_embeds)
                 video_embeds = video_embeds.to(inputs_embeds.device, inputs_embeds.dtype)
                 video_mask = video_mask.to(inputs_embeds.device)
                 inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
