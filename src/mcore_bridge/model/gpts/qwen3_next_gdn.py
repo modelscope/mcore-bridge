@@ -115,11 +115,8 @@ class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
 class Qwen3NextLoader(ModelLoader):
     gated_delta_net = GatedDeltaNet
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
-        layer_specs = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
-        for layer_spec in layer_specs.layer_specs:
+    def _replace_transformer_layer_specs(self, layer_specs):
+        for layer_spec in layer_specs:
             attn_module = layer_spec.submodules.self_attention.module
             if issubclass(attn_module, SelfAttention):
                 layer_spec.submodules.self_attention.module = GatedSelfAttention
@@ -128,7 +125,27 @@ class Qwen3NextLoader(ModelLoader):
                 if self.config.linear_decoupled_in_proj:
                     layer_spec.submodules.input_layernorm = TENorm
                     layer_spec.submodules.self_attention.submodules.in_proj = TEColumnParallelLinear
+
+    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+            get_transformer_block_with_experimental_attention_variant_spec
+        layer_specs = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
+        self._replace_transformer_layer_specs(layer_specs.layer_specs)
         return layer_specs
+
+    def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+            get_transformer_layer_with_experimental_attention_variant_spec
+        decoder_layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(self.config)
+        self._replace_transformer_layer_specs(decoder_layer_specs)
+
+        transformer_layer_spec = copy.deepcopy(transformer_layer_spec)
+        transformer_layer_spec.layer_specs = [decoder_layer_specs[-1]]
+        self._set_shared_expert_gate(transformer_layer_spec)
+        self._set_transformer_layer(transformer_layer_spec)
+        self._replace_mla_attention(transformer_layer_spec)
+        self._replace_router(transformer_layer_spec)
+        return super().get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)
 
     def build_model(
         self,
