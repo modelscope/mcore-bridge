@@ -42,6 +42,10 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             if replace_eh_proj:
                 submodules.eh_proj = eh_proj
         self.tp_group = getattr(self, 'tp_group', None)
+        if self.tp_group is None:
+            # mcore 0.16 doesn't set tp_group on the MTP layer. If it stays None, sharded_state_dict uses
+            # tp rank 0 on every TP rank and the replicated enorm/hnorm end up with two main replicas.
+            self.tp_group = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
         if not replace_eh_proj:
             return
         fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
