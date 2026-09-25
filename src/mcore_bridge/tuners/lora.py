@@ -16,6 +16,7 @@ from megatron.core.extensions.transformer_engine import (TEColumnParallelGrouped
                                                          TERowParallelGroupedLinear, TERowParallelLinear)
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.parallel_state import get_expert_tensor_parallel_world_size, get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
@@ -117,7 +118,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if use_dora:
             raise ValueError(f'{self.__class__.__name__} does not support DoRA yet, please set it to False')
 
-        self.is_parallel_a = isinstance(base_layer, (TERowParallelLinear, TERowParallelGroupedLinear))
+        self.is_parallel_a = isinstance(base_layer,
+                                        (TERowParallelLinear, TERowParallelGroupedLinear, RowParallelLinear))
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
@@ -165,6 +167,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
+        replicated_base = (
+            is_torch_npu_available() and isinstance(self.base_layer, TELinear)
+            and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
@@ -215,15 +220,18 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         **kwargs,
                     )
             else:
-                lora_a = TERowParallelLinear(
-                    input_size=in_features,
+                native_row = isinstance(self.base_layer, RowParallelLinear)
+                row_input_size = self.in_features if native_row or is_torch_npu_available() else in_features
+                row_linear_cls = RowParallelLinear if native_row else TERowParallelLinear
+                lora_a = row_linear_cls(
+                    input_size=row_input_size,
                     output_size=r,
                     bias=False,
-                    input_is_parallel=True,
+                    input_is_parallel=getattr(self.base_layer, 'input_is_parallel', True),
                     **kwargs,
                 )
                 lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
-                lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                lora_a.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
         else:
             if is_torch_npu_available():
                 out_features = self.out_features
@@ -262,14 +270,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
             else:
                 lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
-                lora_b = TEColumnParallelLinear(
-                    input_size=r,
-                    output_size=out_features,
-                    bias=lora_bias,
-                    gather_output=False,
-                    **kwargs,
-                )
-                lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                if replicated_base:
+                    # Match the base layer's replicated output.
+                    lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
+                else:
+                    lora_b = TEColumnParallelLinear(
+                        input_size=r,
+                        output_size=out_features,
+                        bias=lora_bias,
+                        gather_output=False,
+                        **kwargs,
+                    )
+                    lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode',
+                                                   None)  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
@@ -280,18 +293,14 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora.ub_overlap_ag_fprop = False
                 lora.ub_overlap_rs_dgrad = False
 
-        # With sequence parallelism the replicated (non-sharded) LoRA factor only sees this TP
-        # rank's sequence shard: for RowParallel targets lora_A reduce-scatters its output before
-        # lora_B, and for ColumnParallel targets lora_A consumes the sequence-sharded input. Its
-        # gradient must therefore be summed over the TP group. Megatron does this in
-        # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
-        # weights); without the flag each TP rank trains a different copy and export_weights
-        # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
+        # Sequence-parallel inputs need TP reduction for replicated LoRA weights.
+        # Both factors are replicated when the base layer is duplicated.
         if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
                 and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
-            replicated = lora_b if self.is_parallel_a else lora_a
-            for p in replicated.parameters():
-                p.sequence_parallel = True
+            replicated_factors = (lora_a, lora_b) if replicated_base else (lora_b if self.is_parallel_a else lora_a, )
+            for factor in replicated_factors:
+                for p in factor.parameters():
+                    p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
@@ -426,6 +435,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 else:
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
+            result, bias = self.base_layer(x, *args, **kwargs)
+        elif isinstance(self.base_layer, (ColumnParallelLinear, RowParallelLinear)):
+            # Native parallel linears return (output, bias).
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

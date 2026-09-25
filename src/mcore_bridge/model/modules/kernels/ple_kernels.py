@@ -60,12 +60,8 @@ def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
         row_start / row_end: this rank's global row range.
         out: optional preallocated ``[*ids.shape, embedding_dim]`` bf16 device tensor.
     """
-    # Gate on "triton exists + ids live on an accelerator", not on is_cuda:
-    # triton ships per-vendor backends (ROCm in-tree; NPU/XPU via vendor forks
-    # such as triton-ascend), so a platform that cannot run this kernel fails
-    # at launch instead of being silently excluded here. The device-side read
-    # of the pinned host table is only verified on CUDA so far.
-    if not HAVE_TRITON or ids.device.type == 'cpu':
+    # Pinned-host fast path is CUDA-only; use the torch fallback elsewhere.
+    if not HAVE_TRITON or ids.device.type != 'cuda':
         return None
     if host_table.dtype != torch.bfloat16:
         return None
