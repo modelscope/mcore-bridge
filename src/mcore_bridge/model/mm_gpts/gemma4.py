@@ -468,8 +468,8 @@ class Gemma4Bridge(MultimodalGPTBridge):
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         hf_state_dict.update(self._set_mlp_state(mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore))
-        self._set_state_dict(mg_layer, 'mlp.linear_fc1.layer_norm_weight', hf_state_dict,
-                             'pre_feedforward_layernorm.weight', to_mcore)
+        mg_key = 'mlp.linear_fc1.layer_norm_weight' if self.use_transformer_engine else 'pre_mlp_layernorm.weight'
+        self._set_state_dict(mg_layer, mg_key, hf_state_dict, 'pre_feedforward_layernorm.weight', to_mcore)
         if self.text_config.enable_moe_block:
             mg_experts = None if mg_layer is None else mg_layer.experts_mlp
             hf_state_dict.update(self._set_moe_state(mg_experts, hf_state_dict, '', layer_idx, to_mcore, is_mtp=is_mtp))
@@ -840,14 +840,20 @@ class Gemma4Loader(ModelLoader):
         num_moe_experts = self.config.num_moe_experts
         self.config.num_moe_experts = None
         layer_specs = get_gpt_decoder_block_spec(
-            self.config, use_transformer_engine=True, normalization=self.config.normalization, vp_stage=vp_stage)
+            self.config,
+            use_transformer_engine=self.use_transformer_engine,
+            normalization=self.config.normalization,
+            vp_stage=vp_stage)
         for layer_spec in layer_specs.layer_specs:
             layer_spec.submodules.self_attention.module = Gemma4SelfAttention
             self._set_mlp_spec(layer_spec.submodules, Gemma4MLP)
         if num_moe_experts is not None:
             self.config.num_moe_experts = num_moe_experts
             moe_layer_specs = get_gpt_decoder_block_spec(
-                self.config, use_transformer_engine=True, normalization=self.config.normalization, vp_stage=vp_stage)
+                self.config,
+                use_transformer_engine=self.use_transformer_engine,
+                normalization=self.config.normalization,
+                vp_stage=vp_stage)
             for layer_spec, moe_layer_spec in zip(layer_specs.layer_specs, moe_layer_specs.layer_specs):
                 layer_spec.submodules.experts_mlp = moe_layer_spec.submodules.mlp
                 self._set_mlp_spec(layer_spec.submodules, Gemma4MoELayer, mlp_key='experts_mlp')
