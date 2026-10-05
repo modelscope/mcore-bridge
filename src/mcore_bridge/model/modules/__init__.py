@@ -13,6 +13,7 @@ from .mtp_layer import MultiTokenPredictionLayer
 from .multi_latent_attention import MLASelfAttention
 from .ple import Qwen4ExpTextNGramEmbedding, Qwen4ExpTextPLELayer
 from .qsa_indexer import QSAIndexer
+from .router_replay import MaskedRouterReplay
 from .topk_router import TopKRouter
 from .transformer_block import TransformerBlock
 from .transformer_layer import TransformerLayer

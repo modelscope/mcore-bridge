@@ -3,7 +3,10 @@ import torch
 from megatron.core import tensor_parallel
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from typing import Optional
+
+from .router_replay import MaskedRouterReplay
 
 
 class TopKRouter(McoreTopKRouter):
@@ -27,6 +30,15 @@ class TopKRouter(McoreTopKRouter):
                 self.register_buffer('expert_bias_vl', torch.zeros_like(self.expert_bias, dtype=torch.float32))
             else:
                 self.expert_bias_vl = None
+
+        # mcore builds a mask-unaware ``RouterReplay`` when ``moe_enable_routing_replay`` is set; swap in
+        # our mask-aware subclass so selective replay (a per-token ``replay_mask``) works. Drop the orphaned
+        # mcore instance from the global registry first so it stays 1:1 per layer and ``set_replay_data`` /
+        # ``get_recorded_data`` keep lining up. mcore's ``routing()`` forwards ``self.router_replay`` into
+        # ``get_replay_topk``, so the subclass is picked up with no further wiring.
+        if getattr(self, 'router_replay', None) is not None and not isinstance(self.router_replay, MaskedRouterReplay):
+            RouterReplay.global_router_replay_instances.remove(self.router_replay)
+            self.router_replay = MaskedRouterReplay()
 
     def routing(self, logits, *args, **kwargs):
         # The base ``routing`` signature differs across Megatron releases (older versions take
@@ -60,6 +72,24 @@ class TopKRouter(McoreTopKRouter):
             return super().routing(logits, *args, **kwargs)
         finally:
             self.expert_bias = original_expert_bias
+
+    def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
+        # Hash layers pick experts from the fixed ``tid2eid`` table, so mcore's ``routing()`` bypasses
+        # ``router_replay`` for them entirely -- leaving R2 RECORD with a gap at every hash layer and a
+        # per-layer recorded tensor that no longer lines up. Record the hash decision here (mirroring the
+        # learned-router path) so a DeepSeek-V4 checkpoint with hash layers still yields complete R2
+        # routing. Under force-load-balancing / force-biased the effective choice is a plain top-k on the
+        # logits rather than the table, so record that instead to match what the forward actually used.
+        probs, routing_map = super()._hash_routing(logits, input_ids)
+        router_replay = getattr(self, 'router_replay', None)
+        if router_replay is not None and router_replay.router_replay_action == RouterReplayAction.RECORD:
+            if getattr(self.config, 'moe_router_force_load_balancing', False) \
+                    or getattr(self.config, 'moe_router_force_biased', None) is not None:
+                _, indices = torch.topk(logits, k=self.topk, dim=1)
+            else:
+                indices = self.tid2eid[input_ids.T.reshape(-1)].long()
+            router_replay.record_indices(indices)
+        return probs, routing_map
 
     @jit_fuser
     def _apply_expert_bias(self, routing_map: torch.Tensor, padding_mask: Optional[torch.Tensor] = None):
