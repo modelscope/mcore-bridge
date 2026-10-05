@@ -25,12 +25,14 @@ class MLLMModelType:
     qwen3_omni = 'qwen3_omni'
     qwen3_asr = 'qwen3_asr'
     qwen3_5 = 'qwen3_5'
+    qwen4_exp = 'qwen4_exp'
     ovis2_5 = 'ovis2_5'
 
     internvl_chat = 'internvl_chat'
     internvl = 'internvl'
     glm4v = 'glm4v'
     glm4v_moe = 'glm4v_moe'
+    glm5_next = 'glm5_next'
     kimi_vl = 'kimi_vl'
     llama4 = 'llama4'
     gemma4 = 'gemma4'
@@ -43,6 +45,8 @@ class MLLMModelType:
     minicpmv4_6 = 'minicpmv4_6'
 
     muse_glimmer = 'muse_glimmer'
+
+    deepseek_v41 = 'deepseek_v41'
 
 
 class ModelType(LLMModelType, MLLMModelType):

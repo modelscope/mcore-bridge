@@ -42,6 +42,10 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             if replace_eh_proj:
                 submodules.eh_proj = eh_proj
         self.tp_group = getattr(self, 'tp_group', None)
+        if self.tp_group is None:
+            # mcore 0.16 doesn't set tp_group on the MTP layer. If it stays None, sharded_state_dict uses
+            # tp rank 0 on every TP rank and the replicated enorm/hnorm end up with two main replicas.
+            self.tp_group = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
         if not replace_eh_proj:
             return
         fp8_context = transformer_engine.pytorch.fp8_model_init(enabled=False)
@@ -59,6 +63,21 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
                 tp_comm_buffer_name='mtp_eh_proj',
                 tp_group=self.tp_group,
             )
+
+    @property
+    def transformer_layer(self):
+        """The MTP inner transformer block, under whichever name the running Megatron registers it.
+
+        Megatron dev renamed the attribute to ``mtp_model_layer`` (and keys checkpoints as
+        ``transformer_layer`` for backward compat), while main still calls the module itself
+        ``transformer_layer``. mcore-bridge's forward below and ``GPTBridge._convert_mtp_layer``
+        reference ``.transformer_layer``, so resolve whichever exists.
+        """
+        return self._modules.get('mtp_model_layer', None) or self._modules.get('transformer_layer', None)
+
+    def _get_inner_layer_kwargs(self, input_ids, position_ids):
+        """Return model-specific rolled inputs consumed by the inner transformer layer."""
+        return {}
 
     def forward(
         self,
@@ -91,6 +110,7 @@ class MultiTokenPredictionLayer(_MultiTokenPredictionLayer):
             hidden_states=hidden_states,
             decoder_input=decoder_input,
         )
+        kwargs.update(self._get_inner_layer_kwargs(input_ids, position_ids))
         assert not self.transformer_layer.self_attention.config.apply_rope_fusion
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
         if self.config.position_embedding_type == 'rope' and packed_seq:

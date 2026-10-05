@@ -48,7 +48,11 @@ def _patch_lora_model():
             __origin_init__(self, *args, **kwargs)
         if not isinstance(self.model, MegatronModule):
             return
-        for m in self.model.modules():
+        for name, m in self.model.named_modules():
+            if isinstance(m, TopKRouter) and m.enable_expert_bias and '.modules_to_save.' not in name:
+                # Ordinary adapters omit expert bias; only explicitly saved router copies may update it.
+                m.frozen_expert_bias = True
+                m.local_tokens_per_expert.zero_()
             if isinstance(m, LoraLinear):
                 assert not isinstance(m, LoraParallelLinear)
                 for p in m.parameters():

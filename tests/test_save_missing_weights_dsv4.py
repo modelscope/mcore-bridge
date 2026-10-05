@@ -11,21 +11,39 @@ Two properties are checked:
   * `mtp.*` keys never appear twice under two different naming schemes, which is
     what would happen if Megatron also exported its own `model.mtp.*` weights.
 """
+import json
 import os
+import pytest
+import shutil
+import tempfile
+import torch
+from megatron.core import parallel_state
+from safetensors.torch import load_file, save_file
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-# The megatron entrypoint initializes torch.distributed via env:// rendezvous.
-os.environ.setdefault('RANK', '0')
-os.environ.setdefault('LOCAL_RANK', '0')
-os.environ.setdefault('WORLD_SIZE', '1')
-os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-os.environ.setdefault('MASTER_PORT', '29901')
+_DIST_ENV_DEFAULTS = {
+    'RANK': '0',
+    'LOCAL_RANK': '0',
+    'WORLD_SIZE': '1',
+    'MASTER_ADDR': '127.0.0.1',
+    'MASTER_PORT': '29901',
+}
+_TE_ATTN_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
 
-import json  # noqa: E402
-import shutil  # noqa: E402
-import tempfile  # noqa: E402
-import torch  # noqa: E402
-from safetensors.torch import load_file, save_file  # noqa: E402
+
+@pytest.fixture(autouse=True)
+def _isolate_megatron_runtime(monkeypatch):
+    """Provide a clean single-rank runtime and release all process-wide Megatron state."""
+    for variable, value in _DIST_ENV_DEFAULTS.items():
+        if variable not in os.environ:
+            monkeypatch.setenv(variable, value)
+    for variable in _TE_ATTN_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+    yield
+    if parallel_state.model_parallel_is_initialized():
+        parallel_state.destroy_model_parallel()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
 
 MODEL_TYPE = 'deepseek_v4'
 TEMPLATE = 'deepseek_v4_flash'
@@ -276,32 +294,35 @@ def test_dsv4_mtp_weights_dropped_by_default():
 
 
 def test_dsv4_no_duplicate_mtp_when_megatron_exports_it():
-    """Guard against storing the same DSpark parameters under two naming schemes.
+    """Treat native `mtp.*` and Megatron `model.mtp.*` names as one weight identity."""
+    from mcore_bridge.model.gpts.deepseek_v4 import DeepseekV4Bridge
 
-    When Megatron does materialize MTP layers it writes them as `model.mtp.*`,
-    while the source checkpoint names them `mtp.*`. Both sets would then land in
-    the output, doubling the size and leaving it ambiguous which one is loaded.
-    """
+    class RecordingSaver:
+
+        def __init__(self):
+            self.tensors = {}
+
+        def add_tensor(self, key, tensor):
+            self.tensors[key] = tensor
+
     with tempfile.TemporaryDirectory() as tmp_dir:
-        model_dir = _build_fake_checkpoint(os.path.join(tmp_dir, 'src'))
-        try:
-            output_dir = _export(
-                model_dir, os.path.join(tmp_dir, 'mtp'), save_missing_weights=True, mtp_num_layers=NUM_MTP_STAGES)
-        except Exception as e:  # noqa: BLE001
-            # Expected today: `_convert_mtp_extra` looks for the pre-0731 `enorm.weight`
-            # layout, so Megatron cannot build the DSpark stages at all.
-            print(f'SKIP: Megatron cannot load DSpark MTP layers yet ({type(e).__name__}: {e})')
-            return
-        exported = _load_exported(output_dir)
+        source = {
+            'mtp.0.input.main_proj.weight': torch.ones(2, 2),
+            'vision.encoder.weight': torch.full((2, 2), 2.0),
+        }
+        save_file(source, os.path.join(tmp_dir, 'model.safetensors'))
+        saver = RecordingSaver()
+        bridge = object.__new__(DeepseekV4Bridge)
 
-        megatron_mtp = {k for k in exported if k.startswith('model.mtp.')}
-        restored_mtp = {k for k in exported if k.startswith('mtp.')}
-        assert not (megatron_mtp
-                    and restored_mtp), (f'DSpark weights stored twice: {len(megatron_mtp)} keys as `model.mtp.*` and '
-                                        f'{len(restored_mtp)} keys as `mtp.*`')
+        bridge._save_missing_weights(saver, {'model.mtp.0.input.main_proj.weight'}, tmp_dir)
+
+        assert 'mtp.0.input.main_proj.weight' not in saver.tensors
+        assert torch.equal(saver.tensors['vision.encoder.weight'], source['vision.encoder.weight'])
 
 
 if __name__ == '__main__':
+    for variable, value in _DIST_ENV_DEFAULTS.items():
+        os.environ.setdefault(variable, value)
     test_dsv4_mtp_weights_restored()
     test_dsv4_mtp_weights_dropped_by_default()
     test_dsv4_no_duplicate_mtp_when_megatron_exports_it()

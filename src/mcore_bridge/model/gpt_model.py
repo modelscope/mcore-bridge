@@ -194,6 +194,11 @@ class GPTModel(McoreGPTModel):
         if self.config.is_multimodal and self.config.mtp_num_layers and decoder_input is None:
             input_tensor = self.get_input_tensor()
             input_tensor, mtp_decoder_input = input_tensor.chunk(2, dim=0)
+            # Pipeline communication carries a single tensor, so models whose backbone keeps
+            # multiple hidden streams pad the H-wide embedding to the n*H transport width.
+            # The padding is transport-only and must not enter the MTP projection.
+            if mtp_decoder_input.shape[-1] != self.config.hidden_size:
+                mtp_decoder_input = mtp_decoder_input[..., :self.config.hidden_size].contiguous()
             self.set_input_tensor(input_tensor)
 
         rotary_pos_emb, rotary_pos_cos, rotary_pos_sin = self._get_rotary_pos_emb(
@@ -235,10 +240,11 @@ class GPTModel(McoreGPTModel):
                 assert (inference_context.is_static_batching()
                         ), 'GPTModel currently only supports static inference batching.'
                 # Flash decoding uses precomputed cos and sin for RoPE
-                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                    inference_context.max_sequence_length,
-                    self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
-                )
+                max_sequence_length = inference_context.max_sequence_length
+                if max_sequence_length not in self.rotary_pos_emb_cache:
+                    self.rotary_pos_emb_cache[max_sequence_length] = self.rotary_pos_emb.get_cos_sin(
+                        max_sequence_length)
+                rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache[max_sequence_length]
             else:
                 rotary_seq_len = RotaryEmbedding.get_rotary_seq_len(self, inference_context, self.decoder,
                                                                     decoder_input, self.config, packed_seq_params)
@@ -333,8 +339,11 @@ class GPTModel(McoreGPTModel):
                 padding_mask = torch.chunk(padding_mask, tp_size, dim=1)[mpu.get_tensor_model_parallel_rank()]
             extra_block_kwargs['padding_mask'] = padding_mask.contiguous()
 
-        if self.config.moe_n_hash_layers > 0:
+        if self.config.moe_n_hash_layers > 0 or getattr(self.config, 'ple_layer_ids', None) \
+                or getattr(self.config, 'moe_router_enable_vl_bias', False):
             extra_block_kwargs['input_ids'] = input_ids
+        if getattr(self.config, 'indexer_n_heads', None) is not None:
+            extra_block_kwargs['position_ids'] = position_ids
 
         # Run decoder.
         decoder_output = self.decoder(
@@ -358,6 +367,9 @@ class GPTModel(McoreGPTModel):
 
         # MTP: https://github.com/NVIDIA/Megatron-LM/issues/1661
         extra_block_kwargs.pop('input_ids', None)
+        # self.mtp below takes position_ids explicitly; leaving it here would
+        # collide with the explicit kwarg.
+        extra_block_kwargs.pop('position_ids', None)
         return self._postprocess(
             hidden_states=hidden_states,
             input_ids=input_ids,
@@ -472,6 +484,16 @@ class GPTModel(McoreGPTModel):
         """
         if not self.post_process:
             if self.config.is_multimodal and self.config.mtp_num_layers:
+                # Pipeline P2P sends one tensor. Hyper-connection backbones can expose n*H
+                # hidden states while the embedding retained for MTP is only H wide, so pad
+                # the embedding for transport and slice it back in _preprocess on the next stage.
+                hidden_width = hidden_states.shape[-1]
+                decoder_width = decoder_input.shape[-1]
+                assert decoder_width <= hidden_width, (
+                    f'MTP pipeline transport requires decoder width <= hidden width, got '
+                    f'{decoder_width} and {hidden_width}.')
+                if decoder_width != hidden_width:
+                    decoder_input = F.pad(decoder_input, (0, hidden_width - decoder_width))
                 return torch.concat([hidden_states, decoder_input], dim=0)
             else:
                 return hidden_states

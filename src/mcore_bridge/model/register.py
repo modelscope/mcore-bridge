@@ -40,6 +40,7 @@ class ModelMeta:
     visual_cls: Optional[Type[nn.Module]] = None
     is_multimodal: bool = False
     loader: Optional[Type['ModelLoader']] = None
+    config_cls: Type[ModelConfig] = ModelConfig
 
     def __post_init__(self):
         if self.visual_cls is not None:

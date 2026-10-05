@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
 from transformers.utils.versions import require_version
@@ -144,6 +145,7 @@ class ModelConfig(TransformerConfig):
 
     normalization: Literal['LayerNorm', 'RMSNorm'] = 'RMSNorm'
     layernorm_epsilon: float = 1e-5
+    attention_latent_norm_epsilon: Optional[float] = None
     swiglu: bool = True
     quick_geglu: bool = False
     activation_func_clamp_value: Optional[float] = None
@@ -172,6 +174,10 @@ class ModelConfig(TransformerConfig):
     moe_router_score_function: Literal['sigmoid', 'softmax'] = 'softmax'
     moe_router_bias_update_rate: float = 1e-3
     moe_router_enable_expert_bias: bool = False
+    # Model-specific VL routing belongs to mcore-bridge rather than Megatron-Core.
+    # DeepSeek-V4.1 selects a separately checkpointed correction bias for image tokens.
+    moe_router_enable_vl_bias: bool = False
+    image_token_id: Optional[int] = None
     moe_router_topk_scaling_factor: Optional[float] = None
     # 'aux_loss', 'seq_aux_loss', 'global_aux_loss', 'sinkhorn', 'none'
     moe_router_load_balancing_type: Union[str, List[str]] = 'aux_loss'
@@ -195,6 +201,34 @@ class ModelConfig(TransformerConfig):
     layernorm_zero_centered_gamma: bool = False
     attention_output_gate: bool = False
     linear_decoupled_in_proj: bool = False
+
+    # glm5_next: KDA linear attention (`linear_*` are HF's own field names) + k-pool DSA indexer
+    # + mHC. `hc_count` / `mhc_sinkhorn_iterations` / `num_residual_streams` are reused as-is.
+    linear_num_heads: Optional[int] = None
+    linear_head_dim: Optional[int] = None
+    linear_lower_bound: Optional[float] = None
+    hc_eps: float = 1e-6
+    index_kpool: Optional[int] = None
+
+    # qwen3.8-flash-next (HC + PLE + QSA)
+    hc_count: Optional[int] = None
+    hc_lowrank: Optional[int] = None
+    ple_layer_ids: Optional[List[int]] = None
+    ple_embed_dim: Optional[int] = None
+    ple_conv_kernel_size: Optional[int] = None
+    ngram_size: Optional[int] = None
+    heads_per_ngram: Optional[int] = None
+    ngram_vocab_size_base: Optional[int] = None
+    make_ngram_vocab_size_divisible_by: Optional[int] = None
+    split_ngram_parts: Optional[int] = None
+    ple_seed: Optional[int] = None
+    eos_token_id: Optional[int] = None
+    indexer_n_heads: Optional[int] = None
+    indexer_kv_heads: Optional[int] = None
+    indexer_head_dim: Optional[int] = None
+    indexer_budget: Optional[int] = None
+    indexer_compress_ratio: Optional[int] = None
+    output_gate_type: Optional[str] = None
 
     # nemotron_h (hybrid mamba2 + attention + moe)
     hybrid_layer_pattern: Optional[str] = None
@@ -221,6 +255,31 @@ class ModelConfig(TransformerConfig):
     mhc_sinkhorn_iterations: int = 20
     mhc_init_gating_factor: float = 0.01
     moe_n_hash_layers: int = 0
+
+    # deepseek-v4.1 engram (HF layer IDs are 0-based)
+    # Declared here as well so the bridge remains importable on the PR #7224 baseline,
+    # where NVIDIA's optional Engram extension is not installed.
+    engram_enabled: bool = False
+    engram_layer_ids: Optional[List[int]] = None
+    engram_num_embeddings: Optional[List[int]] = None
+    engram_max_ngram_size: Optional[int] = None
+    engram_vocab_size: Optional[int] = None
+    engram_n_heads: Optional[int] = None
+    engram_head_dim: Optional[int] = None
+    engram_pad_token_id: Optional[int] = None
+    engram_compressed_vocab_size: Optional[int] = None
+    engram_tokenizer_map: Optional[str] = None
+
+    # DeepSeek-V4.1 DSpark. This is intentionally separate from mtp_num_layers:
+    # DSpark drafts a block in parallel and adds Markov/confidence heads, whereas
+    # Megatron MTP predicts successive tokens autoregressively.
+    dspark_num_layers: Optional[int] = None
+    dspark_block_size: int = 0
+    dspark_noise_token_id: Optional[int] = None
+    dspark_target_layer_ids: Optional[List[int]] = None
+    dspark_markov_rank: Optional[int] = None
+    dspark_num_experts: Optional[int] = None
+    dspark_router_topk: Optional[int] = None
 
     # mtp
     mtp_decoder_input_detach: bool = False
@@ -273,7 +332,6 @@ class ModelConfig(TransformerConfig):
             defaults = {}
             try:
                 import mindspeed.features_manager as mfm
-                import sys
                 from argparse import ArgumentParser
                 from mindspeed.arguments import process_args
 
@@ -305,6 +363,9 @@ class ModelConfig(TransformerConfig):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
         self._augment_mindspeed_defaults()
         self._format_config()
+        if self.hf_model_type == 'glm5_next':
+            from mcore_bridge.model.mm_gpts.glm5_next import require_glm5_hybrid
+            require_glm5_hybrid()
         if self.experimental_attention_variant is not None:
             require_version('megatron-core>=0.16.0.dev',
                             'experimental attention variant requires megatron-core>=0.16.0')
@@ -315,6 +376,11 @@ class ModelConfig(TransformerConfig):
         if self.num_moe_experts is not None:
             if self.moe_ffn_hidden_size is None:
                 self.moe_ffn_hidden_size = self.ffn_hidden_size
+        if self.moe_router_enable_vl_bias:
+            if not self.moe_router_enable_expert_bias:
+                raise ValueError('VL expert bias requires moe_router_enable_expert_bias.')
+            if self.image_token_id is None:
+                raise ValueError('VL expert bias requires image_token_id.')
         if self.rope_scaling is not None:
             self.rope_scaling = json_parse_to_dict(self.rope_scaling)
             if 'type' in self.rope_scaling and 'rope_type' not in self.rope_scaling:
@@ -358,9 +424,44 @@ class ModelConfig(TransformerConfig):
         assert not (self.mtp_freeze and self.enable_mtp_training), \
             'mtp_freeze and enable_mtp_training are contradictory: the first drops the MTP gradient, ' \
             'the second asks for it. Pick one.'
+        # ``num_nextn_predict_layers`` counts the draft layers for both DeepSeek's standard MTP and
+        # V4.1's DSpark, so it alone cannot tell them apart: on a plain V3/V4 checkpoint it means MTP
+        # and there is no DSpark at all. ``dspark_block_size`` is what actually marks a DSpark
+        # checkpoint (V4.1-Flash and the V4 Vision experiment carry it; plain V4-Flash does not).
+        if not self.dspark_block_size:
+            self.dspark_num_layers = None
+        if self.dspark_block_size:
+            required_dspark = {
+                'dspark_num_layers': self.dspark_num_layers,
+                'dspark_block_size': self.dspark_block_size,
+                'dspark_noise_token_id': self.dspark_noise_token_id,
+                'dspark_target_layer_ids': self.dspark_target_layer_ids,
+                'dspark_markov_rank': self.dspark_markov_rank,
+            }
+            missing_dspark = [name for name, value in required_dspark.items() if value is None]
+            if missing_dspark:
+                raise ValueError(f'DSpark config is missing required fields: {missing_dspark}.')
+            if self.dspark_num_layers <= 0 or self.dspark_block_size <= 0 or self.dspark_markov_rank <= 0:
+                raise ValueError('DSpark layer count, block size and Markov rank must all be positive.')
+            if not self.dspark_target_layer_ids:
+                raise ValueError('DSpark requires at least one target layer ID.')
+            if len(set(self.dspark_target_layer_ids)) != len(self.dspark_target_layer_ids):
+                raise ValueError('DSpark target layer IDs must be unique.')
+            if min(self.dspark_target_layer_ids) < 0 or max(self.dspark_target_layer_ids) >= self.num_layers:
+                raise ValueError('DSpark target layer IDs must refer to decoder layers.')
+            if self.dspark_noise_token_id < 0 or self.dspark_noise_token_id >= self.padded_vocab_size:
+                raise ValueError('DSpark noise token ID must be inside the padded vocabulary.')
+            # The draft stack's own expert counts are optional -- a checkpoint that omits them (as the
+            # V4 Vision experiment does) means its draft layers reuse the backbone's MoE shape, which
+            # is where the builder falls back to.
+            if self.dspark_num_experts is not None and self.dspark_router_topk is not None:
+                if self.dspark_num_experts <= 0 or not 0 < self.dspark_router_topk <= self.dspark_num_experts:
+                    raise ValueError('DSpark router top-k must be positive and no larger than its expert count.')
         if self.csa_compress_ratios is not None and self.mtp_num_layers is not None:
             self.csa_compress_ratios += [0] * self.mtp_num_layers
         if self.multi_latent_attention:
+            if self.attention_latent_norm_epsilon is None:
+                self.attention_latent_norm_epsilon = self.layernorm_epsilon
             # multi_latent_attention always uses interleave, which corresponds to is_neox_style=False.
             # deepseek-v32: interleave + non-interleave (indexer)
             # glm-5: interleave + interleave (indexer)
@@ -453,3 +554,8 @@ class ModelConfig(TransformerConfig):
             else:
                 setattr(new_obj, k, copy.deepcopy(v, memo))
         return new_obj
+
+
+@dataclass
+class MLAModelConfig(ModelConfig, MLATransformerConfig):
+    """ModelConfig variant for models requiring native Megatron MLA semantics."""
