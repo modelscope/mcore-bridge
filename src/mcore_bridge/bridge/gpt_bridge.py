@@ -1876,12 +1876,18 @@ class GPTBridge:
             hf_state_dict = {}
         lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
         if self.config.task_type != 'embedding':
-            if self.config.untie_embeddings_and_output_weights:
-                hf_lm_head_key = self.hf_lm_head_key
-                if self.config.task_type == 'seq_cls':
-                    hf_lm_head_key = self.hf_score_key
-                if not to_mcore or hf_lm_head_key in hf_state_dict:
-                    self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, hf_lm_head_key, to_mcore)
+            if self.config.task_type == 'seq_cls':
+                # A seq_cls head is a distinct [num_labels, hidden] classifier that is NEVER tied to the vocab
+                # embedding, so it ignores untie_embeddings_and_output_weights entirely. Load it from score.weight
+                # when the checkpoint has one (a real RM/reranker ckpt does); otherwise leave it randomly
+                # initialized -- exactly like transformers building a *ForSequenceClassification from a causal_lm
+                # checkpoint. On save (to_mcore=False) always export score.weight. Falling through to the tied
+                # branch below would reshape [vocab, hidden] into [num_labels, hidden] and crash.
+                if not to_mcore or self.hf_score_key in hf_state_dict:
+                    self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, self.hf_score_key, to_mcore)
+            elif self.config.untie_embeddings_and_output_weights:
+                if not to_mcore or self.hf_lm_head_key in hf_state_dict:
+                    self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, self.hf_lm_head_key, to_mcore)
             elif to_mcore and lm_model.output_layer.weight is not None:
                 self._set_state_dict(lm_model, 'output_layer.weight', hf_state_dict, self.hf_embed_key, to_mcore)
         self._set_final_layernorm(lm_model, hf_state_dict, to_mcore)

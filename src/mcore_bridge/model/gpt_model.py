@@ -78,6 +78,13 @@ class GPTModel(McoreGPTModel):
             config.cache_mla_latents = False
             config.rotary_scaling_factor = 40
             self._init_mla_softmax_scale(config)
+        # Only causal_lm / generative_reranker tie their LM head to the vocab embedding. A seq_cls head is a
+        # distinct [num_labels, hidden] classifier (built below) that is NEVER tied -- if the tie flag stays
+        # True for a tied base checkpoint, super().__init__ registers the vocab embedding as
+        # output_layer.weight and the forward feeds [vocab, hidden] into the [num_labels, hidden] head, so
+        # every score is garbage/inf (and the bridge load would reshape [vocab,hidden]->[num_labels,hidden]
+        # and crash). Force the tie off for seq_cls so the head keeps its own initialized weight.
+        _share_embed_output = not config.untie_embeddings_and_output_weights and config.task_type != 'seq_cls'
         super().__init__(
             config,
             transformer_layer_spec,
@@ -85,7 +92,7 @@ class GPTModel(McoreGPTModel):
             config.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
-            share_embeddings_and_output_weights=not config.untie_embeddings_and_output_weights,
+            share_embeddings_and_output_weights=_share_embed_output,
             position_embedding_type=config.position_embedding_type,
             rotary_base=config.rotary_base,
             mtp_block_spec=mtp_block_spec,
@@ -115,6 +122,16 @@ class GPTModel(McoreGPTModel):
                 parallel_mode='duplicated',
                 skip_weight_param_allocation=False,
             )
+            # mcore-bridge builds with perform_initialization=False (every weight is normally loaded straight
+            # from the HF checkpoint), so this freshly allocated head is UNINITIALIZED memory. A causal_lm
+            # base checkpoint has no score.weight, so the bridge load leaves it untouched and its garbage
+            # (~1e38) flows straight into the scores -> inf/nan loss. Initialize it here with config.init_method
+            # (the same normal init mcore would apply), mirroring transformers randomly initializing
+            # *ForSequenceClassification.score when built from a causal_lm base. When the checkpoint DOES
+            # carry score.weight, the bridge load below overwrites this.
+            if config.init_method is not None and self.output_layer.weight is not None:
+                with torch.no_grad():
+                    config.init_method(self.output_layer.weight)
         elif self.config.task_type == 'embedding' and self.post_process:
             self.output_layer = None
 
