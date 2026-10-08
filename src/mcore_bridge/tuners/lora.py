@@ -434,10 +434,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                                            f'Got base_layer type: {type(self.base_layer)}. ')
                 else:
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
-        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
-            result, bias = self.base_layer(x, *args, **kwargs)
-        elif isinstance(self.base_layer, (ColumnParallelLinear, RowParallelLinear)):
-            # Native parallel linears return (output, bias).
+        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear, ColumnParallelLinear, RowParallelLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

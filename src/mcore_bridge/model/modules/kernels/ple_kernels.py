@@ -51,7 +51,7 @@ if HAVE_TRITON:
 def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
     """Gather n-gram rows from the CPU-pinned table with a triton kernel.
 
-    Returns ``None`` when the fast path is not usable (no triton, CPU-resident
+    Returns ``None`` when the fast path is not usable (no triton, non-CUDA
     ids, or the table is not bf16), so the caller can fall back to the torch path.
 
     Args:

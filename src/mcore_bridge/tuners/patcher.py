@@ -8,6 +8,7 @@ from peft.tuners.lora import Linear as LoraLinear
 from peft.tuners.lora import model
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import Optional
 
 from mcore_bridge.utils import patch_deepcopy
@@ -28,9 +29,10 @@ def dispatch_megatron(
     else:
         target_base_layer = target
 
-    # MindSpeed uses native mcore classes for TE parallel linears.
-    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter, ColumnParallelLinear,
-                  RowParallelLinear)
+    linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter)
+    if is_torch_npu_available():
+        # MindSpeed uses native mcore classes for TE parallel linears.
+        linear_cls += (ColumnParallelLinear, RowParallelLinear)
     if isinstance(target_base_layer, linear_cls):
         new_module = LoraParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
 
