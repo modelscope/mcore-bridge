@@ -54,6 +54,43 @@ def _stable_topk_indices(scores: torch.Tensor, k: int) -> torch.Tensor:
     return order[..., :k]
 
 
+@torch.no_grad()
+def _score_packed_blocks(q, block_keys, cu_seqlens, compress_ratio, block_topk):
+    """Score each packed document against its own complete blocks.
+
+    Return pack-space block IDs with the same padded width as global scoring.
+    Invalid entries are identified by ``keep``, including documents without a
+    complete block. Stable sorting retains the earlier block on score ties.
+    """
+    total, heads, dim = q.shape
+    k = min(block_topk, block_keys.shape[0])
+    top_blocks = torch.zeros(total, k, dtype=torch.long, device=q.device)
+    keep = torch.zeros(total, k, dtype=torch.bool, device=q.device)
+    boundaries = cu_seqlens.tolist()
+    block_start = 0
+    scale = math.sqrt(dim)
+    for doc_start, doc_end in zip(boundaries, boundaries[1:]):
+        blocks = (doc_end - doc_start) // compress_ratio
+        block_end = block_start + blocks
+        if blocks and k:
+            local_k = min(k, blocks)
+            keys = block_keys[block_start:block_end].float()
+            block_ids = torch.arange(blocks, device=q.device)
+            chunk = max(1, _QSA_INDEX_SCORE_CHUNK_BYTES // (heads * blocks * 4))
+            for start in range(doc_start, doc_end, chunk):
+                end = min(start + chunk, doc_end)
+                scores = torch.einsum('thd,kd->thk', q[start:end].float(), keys)
+                scores = torch.relu(scores).sum(dim=1) / scale
+                visible = (torch.arange(start, end, device=q.device) - doc_start + 1) // compress_ratio
+                valid = block_ids[None, :] < visible[:, None]
+                scores.masked_fill_(~valid, float('-inf'))
+                selected = _stable_topk_indices(scores, local_k)
+                top_blocks[start:end, :local_k] = selected + block_start
+                keep[start:end, :local_k] = valid.gather(1, selected)
+        block_start = block_end
+    return top_blocks, keep
+
+
 class QSAIndexer(nn.Module):
     """QSA block selection: score compressed key blocks, keep the top-k per query.
 
@@ -374,30 +411,10 @@ class QSAIndexer(nn.Module):
         first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
         block_keys = apply_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
 
-        # ---- score every (token, block) pair, chunked over queries ----
-        # The score -> relu -> head-sum -> mask -> top-k pipeline is row-wise independent, so it is
-        # processed in query chunks and only each row's top-k survives. This keeps peak memory at
-        # O(chunk * NB) instead of materializing the full [T, n_heads, NB] fp32 score tensor (and the
-        # [T, NB] masked copy), which is O(seq^2 / compress_ratio) and OOMs at long packed sequences.
-        # Numerically identical to the un-chunked form: every row is computed the same way.
+        # ---- score only in-document blocks, chunked over queries ----
         q_nblocks = (pos_in_doc + 1) // R  # [T]
-        k = min(self.block_topk, NB)
-        scale = math.sqrt(self.index_head_dim)
-        chunk = max(1, min(T, _QSA_INDEX_SCORE_CHUNK_BYTES // max(1, self.index_n_heads * NB * 4)))
-        top_blocks = torch.empty(T, k, dtype=torch.long, device=device)
-        keep = torch.empty(T, k, dtype=torch.bool, device=device)
-        for start in range(0, T, chunk):
-            end = min(start + chunk, T)
-            sc = torch.einsum('thd,kd->thk', q[start:end].float(), block_keys.float())
-            sc = torch.relu(sc).sum(dim=1) / scale  # [c, NB]
-            td = token_doc[start:end]
-            valid_c = (block_doc[None, :] == td[:, None]) & \
-                (block_in_doc_idx[None, :] < q_nblocks[start:end, None])  # [c, NB]
-            sc = sc.masked_fill(~valid_c, float('-inf'))
-            tb = _stable_topk_indices(sc, k)  # [c, k] into [0, NB)
-            top_blocks[start:end] = tb
-            keep[start:end] = valid_c.gather(1, tb)
-        del sc, valid_c, tb
+        top_blocks, keep = _score_packed_blocks(q, block_keys, cu_seqlens, R, self.block_topk)
+        k = top_blocks.shape[1]
 
         # ---- top-k blocks -> token indices ----
         arange_r = torch.arange(R, device=device)
