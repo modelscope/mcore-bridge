@@ -24,6 +24,7 @@ from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils.accelerator import accelerator_device
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
@@ -419,7 +420,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         is_moe = mg_mlp is not None and hasattr(mg_mlp, 'experts')
         if not to_mcore:
-            is_moe = torch.tensor([is_moe], dtype=torch.bool, device='cuda')
+            is_moe = torch.tensor([is_moe], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_moe, group=self.pp_group)
         if is_moe:
@@ -450,7 +451,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
 
     def _get_pp_src_rank(self, has_module: bool) -> int:
         """Global rank of the PP stage holding the module (all-reduce MAX)."""
-        holder = torch.tensor([dist.get_rank() if has_module else -1], dtype=torch.long, device='cuda')
+        holder = torch.tensor([dist.get_rank() if has_module else -1], dtype=torch.long, device=accelerator_device())
         if self.pp_size > 1:
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())

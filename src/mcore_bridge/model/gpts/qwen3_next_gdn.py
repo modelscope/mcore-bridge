@@ -10,6 +10,7 @@ from typing import Optional
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import get_env_args
+from mcore_bridge.utils.accelerator import accelerator_device
 
 from ..constant import ModelType
 from ..modules import GatedDeltaNet, GatedSelfAttention
@@ -75,7 +76,7 @@ class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
             qkvz_dim = key_dim * 2 + value_dim * 2
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj,
                                                                LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
