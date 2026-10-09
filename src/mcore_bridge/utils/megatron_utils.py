@@ -114,6 +114,34 @@ def get_num_samples(packed_seq_params) -> int:
     return int(packed_seq_params.cu_seqlens_q.numel()) - 1
 
 
+class _CpAllGather(torch.autograd.Function):
+    """All-gather equal CP shards along ``dim`` and reduce-scatter the gradient.
+
+    ``torch.distributed.all_gather`` does not track autograd. Splicing the local
+    shard back into the result only keeps the gradient for that shard, so a
+    consumer that mixes the sequence (PLE's causal conv) drops every contribution
+    that lands on another rank.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor, dim, group):
+        cp_size = group.size()
+        ctx.dim = dim
+        ctx.group = group
+        ctx.cp_size = cp_size
+        parts = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(parts, tensor.contiguous(), group=group)
+        return torch.cat(parts, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        width = grad_output.shape[ctx.dim] // ctx.cp_size
+        chunks = [chunk.contiguous() for chunk in torch.split(grad_output, width, dim=ctx.dim)]
+        grad_local = torch.empty_like(chunks[0])
+        torch.distributed.reduce_scatter(grad_local, chunks, group=ctx.group)
+        return grad_local, None, None
+
+
 def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode: str = 'zigzag') -> torch.Tensor:
     """In CP mode, all-gather and undo the chunking produced by
     ``split_cp_inputs``, restoring the full sequence in original token order
@@ -136,14 +164,16 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode
     if cp_size <= 1:
         return tensor
 
-    cp_rank = mpu.get_context_parallel_rank()
     cp_group = mpu.get_context_parallel_group()
 
-    # All-gather across CP ranks (preserve local autograd graph for `tensor`).
-    output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
-    torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
-    output_list[cp_rank] = tensor
-    gathered = torch.cat(output_list, dim=dim)
+    if tensor.requires_grad:
+        gathered = _CpAllGather.apply(tensor, dim, cp_group)
+    else:
+        cp_rank = mpu.get_context_parallel_rank()
+        output_list = [torch.empty_like(tensor) for _ in range(cp_size)]
+        torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
+        output_list[cp_rank] = tensor
+        gathered = torch.cat(output_list, dim=dim)
 
     if cp_partition_mode == 'contiguous':
         # Rank r owns block r, so concatenating the shards in rank order already
