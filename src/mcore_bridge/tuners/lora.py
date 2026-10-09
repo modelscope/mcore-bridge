@@ -93,6 +93,21 @@ def _get_tensor_parallel_group_for_lora(base_layer):
     return getattr(base_layer, 'parallel_group', None)
 
 
+def _is_replicated_base(base_layer) -> bool:
+    """Whether a TELinear base keeps its full weight on every TP rank.
+
+    Megatron's TELinear passes ``parallel_mode=None`` to TE for ``'duplicated'`` layers, so
+    the tag is gone after construction; the layout is recorded on the weight instead
+    (``tensor_model_parallel=False``, while TE flags every other linear weight as tensor
+    parallel). MindSpeed keeps the original tag.
+    """
+    if not isinstance(base_layer, TELinear):
+        return False
+    if getattr(base_layer, 'parallel_mode', None) == 'duplicated':
+        return True
+    return getattr(getattr(base_layer, 'weight', None), 'tensor_model_parallel', None) is False
+
+
 class LoraParallelLinear(MegatronModule, LoraLayer):
 
     def __init__(
@@ -167,9 +182,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
-        replicated_base = (
-            is_torch_npu_available() and isinstance(self.base_layer, TELinear)
-            and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
+        replicated_base = _is_replicated_base(self.base_layer)
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
