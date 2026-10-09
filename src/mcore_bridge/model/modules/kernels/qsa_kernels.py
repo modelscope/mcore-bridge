@@ -57,10 +57,15 @@ def qsa_sparse_supported(head_dim: int) -> bool:
     if not HAVE_TRITON or head_dim <= 0 or (head_dim & (head_dim - 1)):
         return False
     if not torch.cuda.is_available():
-        logger.warning_once('The QSA sparse kernel is only tested on CUDA GPUs and may fail to compile on '
-                            'this device. If you hit triton compile errors, set '
-                            f'{QSA_SPARSE_KERNEL_ENV}=0 to disable it (QSA then falls back to full '
-                            'attention under packing/CP, and to the bool-mask path otherwise).')
+        # Triton-Ascend compiles this kernel with the CUDA tile sizes and fails
+        # (UB/Cc overflow). Do not install it there. Packing and CP then take the
+        # explicit QSA_SPARSE_KERNEL=0 full-attention fallback instead of dying
+        # inside the compiler. The bool-mask path (CP == 1, not packed) is unchanged.
+        logger.warning_once('The QSA sparse kernel is CUDA-only and is disabled on this device. '
+                            f'Set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention under '
+                            'packing or context parallelism. With CP == 1 and packing off, QSA '
+                            'keeps the bool-mask path.')
+        return False
     return True
 
 
