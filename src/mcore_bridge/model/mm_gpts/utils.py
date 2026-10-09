@@ -7,6 +7,7 @@ from transformers import PretrainedConfig, dynamic_module_utils
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import safe_ddp_context
+from mcore_bridge.utils.accelerator import accelerator_device
 
 
 @contextmanager
@@ -57,7 +58,7 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
             else:
                 self.prepare_model(hf_config)
 
-        self.to(device='cuda')
+        self.to(device=accelerator_device())
 
     @abstractmethod
     def prepare_model(self, hf_config: PretrainedConfig):

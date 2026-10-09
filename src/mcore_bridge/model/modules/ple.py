@@ -14,6 +14,7 @@ from torch import nn
 from typing import List, Optional
 
 from ...utils import get_env_args, get_logger
+from ...utils.accelerator import accelerator_device
 from ...utils.constants import EXPORT_CHUNK_BYTES
 from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
@@ -255,7 +256,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
             if self.cpu_offload:
                 table = self.host_table
                 tp_start, tp_end = self.vocab_start, self.vocab_end
-                device = torch.cuda.current_device()
+                device = accelerator_device()
             else:
                 table = self.ngram_embedding.weight
                 tp_start = tp_rank * self.ngram_embedding.num_embeddings_per_partition

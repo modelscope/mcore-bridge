@@ -16,6 +16,8 @@ except ImportError:
 from torch import nn
 from typing import Callable, Optional, Sequence
 
+from mcore_bridge.utils.accelerator import accelerator_device
+
 
 class DeepseekV41DSparkRMSNorm(nn.Module):
     """RMSNorm matching the fp32 accumulation used by the reference model."""
@@ -66,7 +68,7 @@ class DeepseekV41DSparkInput(nn.Module):
             input_is_parallel=False,
             skip_bias_add=False,
         )
-        device = None if config.use_cpu_initialization else torch.cuda.current_device()
+        device = None if config.use_cpu_initialization else accelerator_device()
         self.main_norm = DeepseekV41DSparkRMSNorm(
             config.hidden_size,
             config.layernorm_epsilon,
@@ -160,7 +162,7 @@ class DeepseekV41DSparkConfidenceHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         input_size = config.hidden_size + config.dspark_markov_rank
-        device = None if config.use_cpu_initialization else torch.cuda.current_device()
+        device = None if config.use_cpu_initialization else accelerator_device()
         self.proj = nn.Linear(
             input_size,
             1,
@@ -264,7 +266,7 @@ class DeepseekV41DSparkOutput(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        device = None if config.use_cpu_initialization else torch.cuda.current_device()
+        device = None if config.use_cpu_initialization else accelerator_device()
         self.block_size = config.dspark_block_size
         self.norm = DeepseekV41DSparkRMSNorm(
             config.hidden_size,

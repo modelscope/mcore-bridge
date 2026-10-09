@@ -18,6 +18,7 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
                                 deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
+from mcore_bridge.utils.accelerator import accelerator_device
 from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
@@ -321,7 +322,7 @@ class GPTBridge:
             if self.pp_size > 1:
                 src_rank = torch.tensor([0 if hf_state_dict is None else self.pp_rank],
                                         dtype=torch.int64,
-                                        device='cuda')
+                                        device=accelerator_device())
                 dist.all_reduce(src_rank, group=self.pp_group)
                 src_rank = dist.get_global_rank(self.pp_group, src_rank.item())
                 meta_data = [None] if hf_state_dict is None else [list(hf_state_dict.keys())]
@@ -426,8 +427,8 @@ class GPTBridge:
             for start in range(0, shape[0], rows):
                 end = min(shape[0], start + rows)
                 send = tensor[start:end]
-                if not send.is_cuda or send.dtype != dtype or not send.is_contiguous():
-                    send = send.to(device='cuda', dtype=dtype).contiguous()
+                if send.device.type != accelerator_device().type or send.dtype != dtype or not send.is_contiguous():
+                    send = send.to(device=accelerator_device(), dtype=dtype).contiguous()
                 dist.broadcast(send, src=src_rank, group=pp_group)
             return tensor
         output = torch.empty(shape, dtype=dtype, device='cpu')
@@ -435,7 +436,7 @@ class GPTBridge:
         for start in range(0, shape[0], rows):
             end = min(shape[0], start + rows)
             if buf is None or buf.shape[0] != end - start:
-                buf = torch.empty([end - start] + list(shape[1:]), device='cuda', dtype=dtype)
+                buf = torch.empty([end - start] + list(shape[1:]), device=accelerator_device(), dtype=dtype)
             dist.broadcast(buf, src=src_rank, group=pp_group)
             output[start:end] = buf.cpu()
         return output
@@ -446,10 +447,10 @@ class GPTBridge:
         pp_rank = self.ep_pp_rank if is_expert else self.pp_rank
         # pp/ep
         if pp_size > 1:
-            src_rank = torch.tensor([0 if tensor is None else pp_rank], dtype=torch.int64, device='cuda')
+            src_rank = torch.tensor([0 if tensor is None else pp_rank], dtype=torch.int64, device=accelerator_device())
             dist.all_reduce(src_rank, group=pp_group)
             src_rank = dist.get_global_rank(pp_group, src_rank.item())
-            meta_data = torch.zeros(10, dtype=torch.int64, device='cuda')
+            meta_data = torch.zeros(10, dtype=torch.int64, device=accelerator_device())
             dtype_mapping = [torch.float64, torch.float32, torch.float16, torch.bfloat16, torch.uint8, torch.int32]
             dtype_mapping_r = {v: k for k, v in enumerate(dtype_mapping)}
             if tensor is None:
@@ -460,11 +461,12 @@ class GPTBridge:
                 elem_size = torch.empty((), dtype=dtype).element_size()
                 if self._stream_to_cpu() and numel * elem_size > self.export_chunk_bytes and len(shape) > 0:
                     return self._chunked_broadcast_pp(None, shape, dtype, src_rank, pp_group)
-                tensor = torch.empty(shape, device='cuda', dtype=dtype)
+                tensor = torch.empty(shape, device=accelerator_device(), dtype=dtype)
                 dist.broadcast(tensor, src=src_rank, group=pp_group)
             else:
                 meta_data[0] = tensor.ndim
-                meta_data[1:1 + tensor.ndim] = torch.tensor(tensor.shape, dtype=torch.int64, device='cuda')
+                meta_data[1:1 + tensor.ndim] = torch.tensor(
+                    tensor.shape, dtype=torch.int64, device=accelerator_device())
                 meta_data[-1] = dtype_mapping_r[tensor.dtype]
                 dist.broadcast(meta_data, src=src_rank, group=pp_group)
                 if self._stream_to_cpu() and tensor.numel() * tensor.element_size() > (
@@ -559,7 +561,7 @@ class GPTBridge:
         is_lora = isinstance(sub_module, LoraParallelLinear)
         is_modules_to_save = isinstance(sub_module, ModulesToSaveWrapper)
         if not to_mcore:
-            state = torch.tensor([is_lora, is_modules_to_save], dtype=torch.bool, device='cuda')
+            state = torch.tensor([is_lora, is_modules_to_save], dtype=torch.bool, device=accelerator_device())
             if is_expert and self.ep_pp_size > 1:
                 dist.all_reduce(state, group=self.ep_pp_group)
             elif not is_expert and self.pp_size > 1:
@@ -635,7 +637,7 @@ class GPTBridge:
     def _reduce_tensor_pp_group(self, tensor, to_mcore, dtype=torch.bool, op=dist.ReduceOp.MAX):
         if to_mcore:
             return tensor
-        tensor = torch.tensor([tensor], dtype=dtype, device='cuda')
+        tensor = torch.tensor([tensor], dtype=dtype, device=accelerator_device())
         if self.pp_size > 1:
             dist.all_reduce(tensor, group=self.pp_group, op=op)
         tensor = tensor.item()
@@ -695,7 +697,7 @@ class GPTBridge:
             kv_block = kv_dim // self.fp8_block_size
             is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
                                                                LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
@@ -1064,7 +1066,7 @@ class GPTBridge:
         else:
             is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc1,
                                                               LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if is_expert and self.ep_pp_size > 1:
                 dist.all_reduce(is_lora, group=self.ep_pp_group)
             elif not is_expert and self.pp_size > 1:
@@ -1302,7 +1304,7 @@ class GPTBridge:
             else:
                 is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc2,
                                                                   LoraParallelLinear) and self._peft_format
-                is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+                is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
                 if is_expert and self.ep_pp_size > 1:
                     dist.all_reduce(is_lora, group=self.ep_pp_group)
                 elif not is_expert and self.pp_size > 1:
@@ -1451,7 +1453,7 @@ class GPTBridge:
             qkv_dim = key_dim * 2 + value_dim
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj_qkvz,
                                                                LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
@@ -1518,7 +1520,7 @@ class GPTBridge:
             a_dim = config.linear_num_value_heads // num_key_heads
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj_ba,
                                                                LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
@@ -1586,7 +1588,7 @@ class GPTBridge:
             a_dim = config.linear_num_value_heads // num_key_heads
             is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj,
                                                                LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
@@ -1732,7 +1734,7 @@ class GPTBridge:
         mg_mlp = None if mg_layer is None else mg_layer.mlp
         is_moe = True if hasattr(mg_mlp, 'experts') else False
         if not to_mcore:
-            is_moe = torch.tensor([is_moe], dtype=torch.bool, device='cuda')
+            is_moe = torch.tensor([is_moe], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_moe, group=self.pp_group)
         if is_moe:
@@ -1903,7 +1905,7 @@ class GPTBridge:
                 else:
                     mg_layer = None
             if not to_mcore and self.pp_size > 1:
-                has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device='cuda')
+                has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device=accelerator_device())
                 dist.all_reduce(has_model, group=self.pp_group)
                 if not has_model:
                     mg_model = next(mg_models)  # compat vpp
