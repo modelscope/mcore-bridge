@@ -61,6 +61,7 @@ from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
 from mcore_bridge.utils import is_master
+from mcore_bridge.utils.accelerator import accelerator_device
 
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
@@ -131,7 +132,7 @@ class DeepseekV41DSparkCoreAttention(MegatronModule):
         world_size = parallel_state.get_tensor_model_parallel_world_size()
         if config.num_attention_heads % world_size:
             raise ValueError('DSpark attention heads must be divisible by tensor parallel size.')
-        device = 'cpu' if config.use_cpu_initialization else torch.cuda.current_device()
+        device = 'cpu' if config.use_cpu_initialization else accelerator_device()
         self.attn_sink = mark_keep_in_fp32(
             nn.Parameter(torch.zeros(config.num_attention_heads // world_size, dtype=torch.float32, device=device)))
 
@@ -520,7 +521,7 @@ class DeepseekV41Vision(nn.Module):
         self.image_start = nn.Parameter(torch.empty(config.hidden_size))
         self.image_end = nn.Parameter(torch.empty(config.hidden_size))
         self.image_newline = nn.Parameter(torch.empty(config.hidden_size))
-        target_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        target_device = accelerator_device()
         self.to(device=target_device, dtype=config.params_dtype)
         # Official RMSNorm scales remain fp32 even when the remaining ViT is bf16.
         for module in self.modules():
@@ -1541,7 +1542,7 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 else:
                     mg_layer = None
             if not to_mcore and self.pp_size > 1:
-                has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device='cuda')
+                has_model = torch.tensor([mg_layer is not None], dtype=torch.bool, device=accelerator_device())
                 dist.all_reduce(has_model, group=self.pp_group)
                 if not has_model:
                     mg_model = next(mg_models)  # compat vpp
