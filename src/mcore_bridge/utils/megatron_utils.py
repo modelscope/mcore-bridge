@@ -82,8 +82,9 @@ def split_cp_inputs(inputs: torch.Tensor,
             val = inputs[tuple(slices)]
         view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] // (2 * cp_size), *inputs.shape[dim + 1:])
         val = val.view(view_shape)
-        index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
-                             pin_memory=True).cuda(non_blocking=True)
+        # Keep the index on the same device as the activation. `.cuda()` sends an NPU
+        # (or CPU) tensor's index to CUDA and index_select then fails before the CP slice.
+        index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], dtype=torch.long, device=val.device)
         val = val.index_select(dim, index)
         view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
         new_inputs.append(val.view(view_shape))
