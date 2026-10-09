@@ -70,6 +70,7 @@ def _qsa_bs_fwd_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -108,7 +109,7 @@ def _qsa_bs_fwd_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-sequence block grid: after the packed-indexer fix a sequence's blocks start
         # at its own first token, which is not a multiple of BLK in a packed batch.
@@ -186,6 +187,7 @@ def _qsa_bs_dq_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -220,7 +222,7 @@ def _qsa_bs_dq_kernel(
     for i in range(0, n_tiles):
         kt = tl.load(KLIST + pid_t * stride_kl + i).to(tl.int64)
         offs_k = kt * BK + tl.arange(0, BK)
-        k_in = offs_k < T
+        k_in = offs_k < S
 
         # per-sequence block grid: after the packed-indexer fix a sequence's blocks start
         # at its own first token, which is not a multiple of BLK in a packed batch.
@@ -284,6 +286,7 @@ def _qsa_bs_dkdv_kernel(
     stride_ot,
     stride_oh,
     T,
+    S,
     NB,
     scale,
     GROUP: tl.constexpr,
@@ -304,7 +307,7 @@ def _qsa_bs_dkdv_kernel(
 
     offs_k = pid_k * BK + tl.arange(0, BK)
     offs_d = tl.arange(0, D)
-    k_in = offs_k < T
+    k_in = offs_k < S
 
     k_tile = tl.load(
         K + offs_k[:, None] * stride_kt + kv_head * stride_kh + offs_d[None, :], mask=k_in[:, None], other=0.0)
@@ -366,14 +369,14 @@ def _qsa_bs_dkdv_kernel(
     tl.store(DV + offs_k[:, None] * stride_vt + kv_head * stride_vh + offs_d[None, :], dv, mask=k_in[:, None])
 
 
-def selection_to_block_bitmap(indices: Tensor, num_tokens: int, block_size: int) -> Tensor:
-    """``[T, K]`` token indices (``-1`` pad) -> ``[T, ceil(T / block_size)]`` uint8 flags.
+def selection_to_block_bitmap(indices: Tensor, num_keys: int, block_size: int) -> Tensor:
+    """``[T, K]`` token indices (``-1`` pad) -> ``[T, ceil(num_keys / block_size)]`` uint8 flags.
 
-    A block is flagged when any of its tokens appears in the row. Tokens that the caller
-    clamped away inside an otherwise selected block are re-excluded by the ``lo``/``hi``
-    range test in the kernel, so this stays exact while being ``block_size``x smaller.
+    ``num_keys`` is the key length. Under context parallelism the query shard is shorter
+    than the gathered keys, and sizing the bitmap from the query count drops every key
+    past that count.
     """
-    num_blocks = -(-num_tokens // block_size)
+    num_blocks = -(-num_keys // block_size)
     flags = torch.zeros(indices.shape[0], num_blocks, dtype=torch.uint8, device=indices.device)
     valid = indices >= 0
     rows = torch.arange(indices.shape[0], device=indices.device).unsqueeze(1).expand_as(indices)
@@ -472,6 +475,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             o.stride(0),
             o.stride(1),
             T,
+            S,
             selc.shape[1],
             scale,
             GROUP=group,
@@ -531,6 +535,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(0),
             do.stride(1),
             T,
+            kc.shape[0],
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -541,7 +546,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             num_warps=8,
             num_stages=1,
         )
-        _qsa_bs_dkdv_kernel[(triton.cdiv(T, BK), kc.shape[1])](
+        _qsa_bs_dkdv_kernel[(triton.cdiv(kc.shape[0], BK), kc.shape[1])](
             qc,
             kc,
             vc,
@@ -562,6 +567,7 @@ class _QSABlockSparseAttn(torch.autograd.Function):
             do.stride(0),
             do.stride(1),
             T,
+            kc.shape[0],
             selc.shape[1],
             ctx.scale,
             GROUP=ctx.group,
@@ -602,8 +608,8 @@ def qsa_sparse_attention_from_indices(q: Tensor,
                                       scale: float,
                                       block_size: int = 4) -> Tensor:
     """Drop-in for the gather kernel: derives the bitmap and range from ``indices``."""
-    T = q.shape[0]
-    sel = selection_to_block_bitmap(indices, T, block_size)
+    key_len = k.shape[0]
+    sel = selection_to_block_bitmap(indices, key_len, block_size)
     valid = indices >= 0
     big = torch.iinfo(torch.int32).max
     lo = torch.where(valid, indices, torch.full_like(indices, big)).min(dim=1).values.to(torch.int32)
