@@ -543,7 +543,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             # them instead of KeyError-ing on `ple.ple_embedding.layer_multipliers`.
             skip_ngram_state = self._peft_format
         else:
-            skip_ngram_state = not self._is_saving and (self._peft_format or ple_offloaded)
+            # Adapter saves must also omit the base n-gram buffers and table.
+            skip_ngram_state = self._peft_format or (not self._is_saving and ple_offloaded)
         for buf in () if skip_ngram_state else self._PLE_NGRAM_BUFFERS:
             if to_mcore:
                 buffer = getattr(ple.ple_embedding, buf)
