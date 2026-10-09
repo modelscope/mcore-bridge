@@ -960,7 +960,7 @@ class GPTBridge:
                               for i in range(num_local_experts)] if is_expert else mg_mlp.linear_fc1.weight
                 fc1_bias = None
                 if config.add_bias_linear:
-                    assert is_expert and not has_scale_inv, 'not support'  # TODO
+                    assert is_expert, 'linear_fc1 bias is only converted for local experts'
                     fc1_bias = [getattr(mg_mlp.linear_fc1, f'bias{i}') for i in range(num_local_experts)]
                 gate_up_scale_inv = None
                 if is_gate_up:
