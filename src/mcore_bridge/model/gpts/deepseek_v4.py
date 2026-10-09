@@ -80,11 +80,15 @@ def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
         f'freqs.shape[0]={freqs.shape[0]} vs tokens={t.shape[0]}. `GPTModel` must pre-index the '
         'rotary table by `position_ids` (requires `apply_rope_fusion=False`), and under CP the '
         '`position_ids` must be split with the same partition mode as the hidden states.')
+    # Do not forward cu_seqlens. The packed helper re-derives positions from it and, when
+    # cp_size > 1, assumes Megatron's zigzag split. DSv4 uses a contiguous split and already
+    # stores the absolute position in row i of `freqs`, so the elementwise bshd path is the
+    # one that matches this tensor. The argument stays so existing callers keep working.
     return apply_rotary_pos_emb(
         t,
         freqs,
         config=config,
-        cu_seqlens=cu_seqlens,
+        cu_seqlens=None,
         cp_group=cp_group,
         mla_rotary_interleaved=True,
         mla_output_remove_interleaving=True,
