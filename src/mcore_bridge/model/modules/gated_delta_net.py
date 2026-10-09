@@ -33,6 +33,30 @@ except ImportError:
     _GatedDeltaNet = object
 
 
+def gdn_padding_keep(attention_mask, seq_len: int, batch: int):
+    """Return ``[seq, batch, 1]`` with 0 on padding positions, or None.
+
+    Megatron's padding mask is ``attention_mask.all(dim=(1, 2))`` on a
+    ``[batch, 1, seq, seq]`` mask, True where a key is padding. Left padding
+    has to be zero before the causal conv and the delta-rule update. The loss
+    mask does not clear that state. A mask whose length does not match the
+    hidden states is left alone rather than applied to the wrong axis.
+    """
+    if isinstance(attention_mask, dict):
+        attention_mask = attention_mask.get('full_attention')
+    if not torch.is_tensor(attention_mask):
+        return None
+    if attention_mask.dim() == 4 and attention_mask.shape[0] == batch:
+        pad = attention_mask.bool().all(dim=(1, 2))
+    elif attention_mask.dim() == 2 and tuple(attention_mask.shape) == (batch, seq_len):
+        pad = attention_mask.bool()
+    else:
+        return None
+    if tuple(pad.shape) != (batch, seq_len) or not bool(pad.any()):
+        return None
+    return (~pad).transpose(0, 1).unsqueeze(-1)
+
+
 # Code borrowed from NVIDIA/Megatron-LM
 def _unpack_sequence(x, cu_seqlens, dim=1):
     unpacked_x = []
@@ -209,8 +233,11 @@ class GatedDeltaNet(_GatedDeltaNet):
             (Tuple[Tensor, Tensor]) GDN output and bias.
 
         """
-        # TODO: Deal with attention_mask (There is an issue when left padding is used.)
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if packed_seq_params is None:
+            keep = gdn_padding_keep(attention_mask, hidden_states.shape[0], hidden_states.shape[1])
+            if keep is not None:
+                hidden_states = hidden_states * keep.to(dtype=hidden_states.dtype, device=hidden_states.device)
 
         use_sp = self.config.sequence_parallel and self.tp_size > 1
         tp_group = self.pg_collection.tp
