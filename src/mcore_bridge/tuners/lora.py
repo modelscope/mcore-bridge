@@ -167,9 +167,11 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
+        # Duplicated TELinear (hyper-connection, indexer, PLE) replicates its output.
+        # A column-parallel lora_b shards that output by TP, so the adapter no longer
+        # matches the base. This holds on CUDA as well as NPU.
         replicated_base = (
-            is_torch_npu_available() and isinstance(self.base_layer, TELinear)
-            and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
+            isinstance(self.base_layer, TELinear) and getattr(self.base_layer, 'parallel_mode', None) == 'duplicated')
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
