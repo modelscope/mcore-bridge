@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
@@ -614,7 +615,15 @@ class Qwen4ExpTextPLELayer(nn.Module):
             # zigzag-splits hidden/input_ids per sample via cu_seqlens_q while keeping
             # packed_seq_params itself global, so the undo uses the same cu.
             psp_for_cp = packed_seq_params if thd else None
-            hidden_states = reconstruct_tensor_cp(hidden_states, psp_for_cp, dim=0)
+            # The causal conv mixes tokens across the shard boundary and the output
+            # is split back below, so a token's gradient partly lands on other CP
+            # ranks: the gather must reduce-scatter it back (reconstruct_tensor_cp
+            # keeps only the local slice).
+            hidden_states = gather_from_sequence_parallel_region(
+                hidden_states, tensor_parallel_output_grad=True, group=parallel_state.get_context_parallel_group())
+            hidden_states = _undo_attention_load_balancing(hidden_states,
+                                                           parallel_state.get_context_parallel_world_size(),
+                                                           psp_for_cp)
             # The data pipeline may hand us either a CP-sharded or a full copy of
             # input_ids; re-align only when the lengths disagree.
             if input_ids.shape[-1] != hidden_states.shape[0]:
