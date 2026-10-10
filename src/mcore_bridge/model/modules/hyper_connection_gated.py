@@ -50,18 +50,39 @@ class Qwen4ExpTextGroupedRMSNorm(nn.Module):
         return f'{tuple(self.weight.shape)}, eps={self.eps}'
 
 
-@torch.compile
-def _mix_elementwise(down_out: torch.Tensor, hc_count: int) -> torch.Tensor:
+def _mix_elementwise_reference(down_out: torch.Tensor, hc_count: int) -> torch.Tensor:
     """silu(down/hc) -- the pre-up-projection half of the gate chain."""
     return F.silu(down_out / hc_count)
 
 
-@torch.compile
-def _mix_and_reduce(up_out: torch.Tensor, hyper_input_normed: torch.Tensor, hc_count: int,
-                    hidden_size: int) -> torch.Tensor:
+def _mix_and_reduce_reference(up_out: torch.Tensor, hyper_input_normed: torch.Tensor, hc_count: int,
+                              hidden_size: int) -> torch.Tensor:
     """sigmoid -> unflatten -> multiply -> mean, the post-up-projection half."""
     w = torch.sigmoid(up_out).unflatten(-1, (hc_count, hidden_size))
     return (w * hyper_input_normed.unflatten(-1, (hc_count, hidden_size))).mean(dim=-2)
+
+
+_mix_elementwise_compiled = torch.compile(_mix_elementwise_reference)
+_mix_and_reduce_compiled = torch.compile(_mix_and_reduce_reference)
+_mix_elementwise_eager = torch.compiler.disable(_mix_elementwise_reference)
+_mix_and_reduce_eager = torch.compiler.disable(_mix_and_reduce_reference)
+
+
+def _mix_elementwise(down_out: torch.Tensor, hc_count: int) -> torch.Tensor:
+    # Fusion removes the activation-dtype rounding after division. Keep the HF
+    # operation boundaries for low-precision activations, including backward.
+    if down_out.dtype in (torch.float16, torch.bfloat16):
+        return _mix_elementwise_eager(down_out, hc_count)
+    return _mix_elementwise_compiled(down_out, hc_count)
+
+
+def _mix_and_reduce(up_out: torch.Tensor, hyper_input_normed: torch.Tensor, hc_count: int,
+                    hidden_size: int) -> torch.Tensor:
+    # Eager rounds sigmoid and multiplication before the stream reduction.
+    # Disabling this region also retains those stores under an outer compile.
+    if up_out.dtype in (torch.float16, torch.bfloat16):
+        return _mix_and_reduce_eager(up_out, hyper_input_normed, hc_count, hidden_size)
+    return _mix_and_reduce_compiled(up_out, hyper_input_normed, hc_count, hidden_size)
 
 
 class Qwen4ExpTextGatedResidual(nn.Module):
