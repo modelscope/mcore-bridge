@@ -131,6 +131,15 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode
     Returns:
         torch.Tensor: Full-sequence tensor with the same shape as ``tensor``
         except the size at ``dim`` is multiplied by ``cp_size``.
+
+    Gradient: only the local shard keeps its autograd graph; the slices gathered
+    from other ranks are constants. That is correct when the tensor needs no
+    grad, or when every rank computes the same full-sequence loss from the
+    result (each rank then owns the gradient of its own shard). It drops
+    gradient when the consumer mixes tokens across shards and splits its output
+    back to the local shard; use a differentiable gather there
+    (``gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=True,
+    group=cp_group)``), as PLE does.
     """
 
     cp_size = mpu.get_context_parallel_world_size()
