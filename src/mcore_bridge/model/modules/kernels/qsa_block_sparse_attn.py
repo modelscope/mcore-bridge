@@ -614,5 +614,6 @@ def qsa_sparse_attention_from_indices(q: Tensor,
     big = torch.iinfo(torch.int32).max
     lo = torch.where(valid, indices, torch.full_like(indices, big)).min(dim=1).values.to(torch.int32)
     hi = torch.where(valid, indices, torch.full_like(indices, -1)).max(dim=1).values.to(torch.int32)
-    zeros = torch.zeros(T, dtype=torch.int32, device=q.device)
+    # One base per query. A single sequence sits at the origin of the packed grid.
+    zeros = torch.zeros(q.shape[0], dtype=torch.int32, device=q.device)
     return qsa_block_sparse_attention_triton(q, k, v, sel, lo, hi, zeros, zeros, scale, block_size)
