@@ -57,7 +57,7 @@ def test_index_path_bases_follow_the_query_count_when_keys_are_longer():
     indices = torch.tensor([[6, -1], [-1, -1]])
     out = fn(q, k, k, indices, 1.0, 4)
     assert out.shape == q.shape
-    assert captured['blk_base'].shape == (2,)
-    assert captured['tok_base'].shape == (2,)
+    assert captured['blk_base'].shape == (2, )
+    assert captured['tok_base'].shape == (2, )
     assert int(captured['blk_base'].sum()) == 0
     assert int(captured['tok_base'].sum()) == 0
