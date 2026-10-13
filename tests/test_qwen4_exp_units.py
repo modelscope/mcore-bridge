@@ -170,6 +170,15 @@ def test_indexer_is_forward_only():
     torch.manual_seed(0)
     cfg = _make_config(compress_ratio=4, budget=64)
     idx = QSAIndexer(cfg).cuda()
+    expected_state_keys = {
+        'index_qk_proj.weight',
+        'q_layernorm.weight',
+        'k_layernorm.weight',
+    }
+    for name, parameter in idx.named_parameters():
+        assert not parameter.requires_grad, f'{name} should be frozen'
+        assert parameter.grad is None, f'{name} unexpectedly got a gradient'
+    assert expected_state_keys.issubset(idx.state_dict())
     with torch.no_grad():
         idx.index_qk_proj.weight.normal_(0, 0.02)
 
@@ -184,14 +193,15 @@ def test_indexer_is_forward_only():
     logits = (q @ q.T).masked_fill(mask[0, 0], float('-inf'))
     logits.softmax(-1).sum().backward()
     backbone_ok = hs.grad is not None and torch.isfinite(hs.grad).all() and hs.grad.abs().sum() > 0
-    indexer_ok = all(p.grad is None for p in idx.parameters())
+    indexer_ok = all(not p.requires_grad and p.grad is None for p in idx.parameters())
 
     print(f'    mask is non-differentiable constant: {mask_is_const} (dtype={mask.dtype})')
     print(f'    backbone received gradient: {backbone_ok}')
-    print(f'    indexer params still have no grad: {indexer_ok}')
+    print(f'    indexer params are frozen and have no grad: {indexer_ok}')
     assert mask_is_const, f'QSA mask must be a non-differentiable bool constant (got {mask.dtype})'
     assert backbone_ok, 'backbone did not receive a finite non-zero gradient through the mask'
-    assert indexer_ok, 'indexer parameters received gradient; the forward-only design no longer holds'
+    assert indexer_ok, ('indexer parameters are trainable or received a gradient; '
+                        'the forward-only design no longer holds')
 
 
 # --------------------------------------------------------------------------

@@ -79,6 +79,29 @@ class TransformerLayer(McoreTransformerLayer):
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
 
+        # This mirrors the upstream composition point. It has to be built here, and unconditionally
+        # set to None otherwise, because the inherited `_forward_attention` reads `self.engram` on
+        # every layer -- this `__init__` replaces upstream's rather than extending it, so anything
+        # the inherited forward relies on has to be set up here too. `getattr` keeps this working
+        # against a Megatron-Core whose submodules predate the Engram composition point.
+        self.engram = None
+        engram_submodule = getattr(submodules, 'engram', IdentityOp)
+        if engram_submodule is not IdentityOp and not is_mtp_layer:
+            # MTP layers use their own local layer numbering, which would collide with the
+            # decoder's global Engram layer IDs; Engram never attaches to MTP layers.
+            if not isinstance(engram_submodule, ModuleSpec):
+                raise TypeError('The Engram composition point must be a ModuleSpec or IdentityOp.')
+            engram_config = engram_submodule.params.get('engram_config')
+            if engram_config is None:
+                raise ValueError('The Engram ModuleSpec must provide engram_config.')
+            if self.layer_number in engram_config.layer_ids:
+                self.engram = build_module(
+                    engram_submodule,
+                    config=self.config,
+                    layer_number=self.layer_number,
+                    pg_collection=pg_collection,
+                )
+
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
         self.input_layernorm = submodules.input_layernorm(

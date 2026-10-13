@@ -497,6 +497,12 @@ class TransformerBlock(McoreTransformerBlock):
         elif enable_gated_hc and self.has_final_layernorm_in_this_stage():
             # Gated low-rank contraction (hyper_connection_mixer, use_combine=False
             # so forward returns only the mixed stream).
+            # When MTP is enabled, save the pre-contraction multi-stream [s, b, n*C] for the MTP
+            # head: Qwen4Exp's MTP fuses it with the rolled-token embedding (residual_linear_shared)
+            # and runs its own hyper_connection_mixer, so it needs the multi-stream, not the
+            # contracted [s, b, C] that the lm_head consumes.
+            if self.config.mtp_num_layers:
+                mhc_multistream = hidden_states
             # [s, b, n*C] -> [s, b, C]
             hidden_states = self.hyper_connection_mixer(hidden_states)
 

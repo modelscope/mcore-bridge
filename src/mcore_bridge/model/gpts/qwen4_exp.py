@@ -1,27 +1,35 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import math
+import megatron.core
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_mtp_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
+                                                    scatter_to_sequence_parallel_region)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
+from megatron.core.utils import make_viewless_tensor
+from torch import nn
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
-from ..modules import (GatedDeltaNet, QSAIndexer, QSASparseCoreAttention, Qwen4ExpTextGatedResidual,
-                       Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer, qsa_sparse_supported)
+from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
+                       QSASparseCoreAttention, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
+                       TransformerLayer, qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules.ple import Qwen4ExpTextNGramEmbedding
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -58,7 +66,7 @@ class Qwen4ExpLayer(TransformerLayer):
         if self.layer_number in config.ple_layer_ids:
             self.ple = Qwen4ExpTextPLELayer(
                 config, config.ple_layer_ids.index(self.layer_number), pg_collection=self.pg_collection)
-        is_linear_attention = config.linear_attention_freq[self.layer_number - 1]
+        is_linear_attention = self._resolve_is_linear_attention(config)
         if not is_linear_attention and config.indexer_n_heads is not None:
             self.self_attention.indexer = QSAIndexer(config, tp_group=self.tp_group)
             if qsa_sparse_supported(config.kv_channels):
@@ -67,6 +75,10 @@ class Qwen4ExpLayer(TransformerLayer):
                     attn.core_attention, config, softmax_scale=config.softmax_scale)
         self.attn_hyper_connection = Qwen4ExpTextGatedResidual(config)
         self.mlp_hyper_connection = Qwen4ExpTextGatedResidual(config)
+
+    # override in MTP layer
+    def _resolve_is_linear_attention(self, config):
+        return config.linear_attention_freq[self.layer_number - 1]
 
     def forward(self, hidden_states: torch.Tensor, **kwargs):
         attention_mask = kwargs.get('attention_mask')
@@ -158,16 +170,22 @@ class Qwen4ExpLayer(TransformerLayer):
         if not needs_kernel:
             return self._qsa_select_mask(hidden_states, attn_kwargs), False
 
-        # From here the mask path is not an option, so every failure raises instead of
-        # silently degrading to dense attention (which would diverge from the sparse
-        # rollout without telling anyone).
+        # From here the mask path is not an option, so by default a failure raises instead
+        # of silently degrading to dense attention (which would diverge from the sparse
+        # rollout without telling anyone). An explicit opt-out via the env var is the one
+        # sanctioned fallback: full attention, warned about once.
         if not sparse_ok:
+            if not use_qsa_sparse_kernel():
+                logger.warning_once(f'QSA sparse kernel is disabled via {QSA_SPARSE_KERNEL_ENV}=0; '
+                                    f'falling back to full attention ({"packing/thd" if is_thd else f"CP={cp_size}"}).')
+                return None, False
             raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
                                'but QSASparseCoreAttention was not installed -- triton is missing or '
                                f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
-                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path.')
+                               'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
+                               f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
-            raise RuntimeError(f"QSA sparse selection with context_parallel_size={cp_size} requires "
+            raise RuntimeError(f'QSA sparse selection with context_parallel_size={cp_size} requires '
                                f"cp_comm_type='all_gather' (got {getattr(self.config, 'cp_comm_type', None)!r}): the "
                                'selection has to see every key before attention runs, which ring/p2p cannot provide.')
         rotary_pos_emb = attn_kwargs.get('rotary_pos_emb')
@@ -275,8 +293,102 @@ class Qwen4ExpTransformerBlock(TransformerBlock):
             self.hyper_connection_mixer = Qwen4ExpTextGatedResidual(config, use_combine=False)
 
 
+class Qwen4ExpMTPInnerLayer(Qwen4ExpLayer):
+
+    def _resolve_is_linear_attention(self, config):
+        return False
+
+
+class Qwen4ExpMTPStreamNorm(nn.Module):
+    """Zero-centered RMSNorm over the full multi-stream (``hc_count * hidden_size``).
+
+    Qwen3.8-Flash-Next's MTP ``pre_fc_norm_hidden`` normalizes the concatenated ``hc_count`` streams
+    jointly (a single GemmaRMSNorm over n*H with a per-element affine), unlike Megatron's mHC MTP which
+    normalizes each H-sized stream independently. The MTP spec builds norms with ``hidden_size=H``, so
+    scale by ``hc_count`` here.
+    """
+
+    def __init__(self, config, hidden_size, eps):
+        super().__init__()
+        self.dim = config.hc_count * hidden_size
+        self.eps = eps
+        self.weight = nn.Parameter(torch.zeros(self.dim, dtype=config.params_dtype))
+        self.weight.sequence_parallel = config.sequence_parallel
+
+    def forward(self, x):
+        input_dtype = x.dtype
+        x = x.float()
+        x = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return ((1.0 + self.weight.float()) * x).to(input_dtype)
+
+
+class Qwen4ExpMultiTokenPredictionLayer(MultiTokenPredictionLayer):
+    """Qwen3.8-Flash-Next MTP head: the ``residual_linear_shared`` fusion over the gated-HC backbone.
+
+    The backbone runs Qwen4Exp's own gated hyper-connections (``hc_count`` streams) but NOT Megatron's
+    ``enable_hyper_connections`` mHC. The MTP head still needs Megatron's mHC *projection* form
+    (separate ``e_proj``/``h_proj`` rather than a fused ``eh_proj``), because the checkpoint stores
+    ``fc_embedding``/``fc_hidden`` (H->H each) and adds the embedding residual to every stream. So the
+    subtree is built with hyper-connections enabled via a config copy -- which selects e_proj/h_proj --
+    then Megatron's mHC-only contraction params (``hc_head_*``) and ``final_layernorm`` are dropped in
+    favour of Qwen4Exp's own ``hyper_connection_mixer``, matching the checkpoint and the vLLM draft
+    model. ``_concat_embeddings`` normalizes the multi-stream jointly (``Qwen4ExpMTPStreamNorm``) and
+    ``_postprocess`` contracts with the mixer, so the layer returns the multi-stream and the MTP block
+    applies ``_postprocess`` for the loss head.
+    """
+
+    def __init__(self, config, submodules, *args, **kwargs):
+        mtp_config = copy.copy(config)
+        mtp_config.enable_hyper_connections = True
+        super().__init__(mtp_config, submodules, *args, **kwargs)
+        for name in ('hc_head_fn', 'hc_head_base', 'hc_head_scale', 'final_layernorm'):
+            if hasattr(self, name):
+                delattr(self, name)
+        self.hyper_connection_mixer = Qwen4ExpTextGatedResidual(config, use_combine=False)
+
+    def _concat_embeddings(self, hidden_states, decoder_input):
+        # hidden_states: pre-mixer multi-stream [s, b, n*H]; decoder_input: rolled-token embedding [s, b, H].
+        n = self.config.hc_count
+        h = self.config.hidden_size
+        decoder_input = self.enorm(decoder_input)
+        decoder_input = make_viewless_tensor(inp=decoder_input, requires_grad=True, keep_graph=True)
+        # Qwen4Exp normalizes the full multi-stream jointly (pre_fc_norm_hidden over n*H), not per-stream.
+        hs = self.hnorm(hidden_states)
+        hs = make_viewless_tensor(inp=hs, requires_grad=True, keep_graph=True).unflatten(-1, (n, h))
+        e_out, _ = self.e_proj(decoder_input)  # fc_embedding -> [s, b, H/tp]
+        h_out, _ = self.h_proj(hs)  # fc_hidden -> [s, b, n, H/tp]
+        out = e_out.unsqueeze(2) + h_out  # add the embedding residual to every stream
+        out = gather_from_tensor_model_parallel_region(out, group=self.tp_group)
+        # Read the shape AFTER the gather: under sequence parallel the column-parallel projections
+        # all-gather the sequence dim, so a pre-projection `s` would be stale.
+        s, b, n_out, h_dim = out.shape
+        out = out.reshape(s, b, n_out * h_dim)
+        if self.sequence_parallel:
+            out = scatter_to_sequence_parallel_region(out, group=self.tp_group)
+        return out
+
+    def _postprocess(self, hidden_states):
+        # Contract the multi-stream [s, b, n*H] to [s, b, H] with Qwen4Exp's gated mixer (no final norm).
+        return self.hyper_connection_mixer(hidden_states)
+
+    def _get_inner_layer_kwargs(self, input_ids, position_ids):
+        # Pass per-depth state through the checkpoint boundary instead of mutable module attributes.
+        return {'input_ids': input_ids, 'position_ids': position_ids}
+
+
 class Qwen4ExpBridge(Qwen3NextBridge):
     hf_mixer_prefix = 'model.'
+    additional_dim0_keys = {'e_proj', 'h_proj'}
+
+    def _save_missing_weights(self, saver, saved_keys, source_model_dir=None) -> None:
+        # PLE export emits every shard. If it omits the scale, these are already
+        # dequantized parameters; copying the source FP8 scale would corrupt them.
+        accounted_keys = set(saved_keys)
+        suffix = 'ngram_embedding.shard_0.weight'
+        for key in saved_keys:
+            if key.endswith(f'ple.ple_embedding.{suffix}'):
+                accounted_keys.add(key[:-len(suffix)] + 'ngram_embedding.weight_scale')
+        super()._save_missing_weights(saver, accounted_keys, source_model_dir)
 
     def _get_hf_experts_attr(self, is_mtp: bool = False):
         # The checkpoint stores experts as packed per-layer tensors
@@ -343,7 +455,69 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             dist.all_reduce(holder, op=dist.ReduceOp.MAX, group=self.pp_group)
         return int(holder.item())
 
-    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool):
+    def _broadcast_pp_weight(self, tensor, pp_src_rank: int):
+        """Cross-pp transfer of one exported weight through the tp-aligned pp
+        group. `tensor` is non-None only on the exporting rank (tp rank 0 of the
+        stage owning the PLE layer, i.e. the src of its pp group); the other pp
+        members receive it. The payload is streamed through
+        `_chunked_broadcast_pp` so no full-size GPU buffer is materialized, and
+        it always rides as raw bytes (flattened uint8): any current or future
+        low-width dtype (fp8 e4m3/e5m2, int8, packed fp4, ...) is transported
+        without NCCL dtype concerns; the meta carries the original shape/dtype
+        for the receiver to view back. Groups whose src has nothing to transfer
+        (tp != 0 coords) exchange only the empty meta.
+        """
+        meta = [None if tensor is None else [list(tensor.shape), str(tensor.dtype).replace('torch.', '')]]
+        dist.broadcast_object_list(meta, src=pp_src_rank, group=self.pp_group)
+        if meta[0] is None:
+            return None
+        shape, dtype_name = meta[0]
+        dtype = getattr(torch, dtype_name)
+        if tensor is not None:
+            payload = tensor.contiguous().flatten().view(torch.uint8)
+            self._chunked_broadcast_pp(payload, list(payload.shape), payload.dtype, pp_src_rank, self.pp_group)
+            return tensor
+        byte_count = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
+        out = self._chunked_broadcast_pp(None, [byte_count], torch.uint8, pp_src_rank, self.pp_group)
+        return out.view(dtype).view(shape)
+
+    def _iter_ple_table_export(self, ple, pp_src_rank, layer_prefix: str):
+        """Lazily export the PLE table shards one by one. On the exporting rank
+        (tp rank 0 of the owning stage) each shard is assembled by the chunked
+        all_reduce inside ``iter_export_table_to_hf`` and immediately streamed
+        to the other pp members; on the other stages it is received as it
+        arrives. Nothing accumulates: only the consumer (the safetensors
+        writer) drives the pace, so no rank ever holds more than a single shard
+        of the 100GB-scale table in host memory. The per-shard collectives keep
+        every rank of the tp-aligned pp groups in lockstep, exactly like the
+        synchronous version this generator replaces.
+        """
+        parts = self.config.split_ngram_parts
+        scale_key = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
+        shard_prefix = 'ple.ple_embedding.ngram_embedding'
+        # On tp != 0 ranks of the owning stage the table iterator executes the
+        # same all_reduces but yields nothing (shards exist only on tp rank 0).
+        table_iter = ple.ple_embedding.iter_export_table_to_hf() if ple is not None else iter(())
+        for i in range(parts):
+            shard = next(table_iter, (None, None))[1] if ple is not None else None
+            if self.pp_size > 1:
+                shard = self._broadcast_pp_weight(shard, pp_src_rank)
+            if shard is not None:
+                yield f'{layer_prefix}{shard_prefix}.shard_{i}.weight', shard
+        # The scale is a tiny scalar; a pickled broadcast is fine.
+        scale = None
+        if ple is not None:
+            for k, v in table_iter:
+                if k == scale_key:
+                    scale = v
+        if self.pp_size > 1:
+            obj = [scale]
+            dist.broadcast_object_list(obj, src=pp_src_rank, group=self.pp_group)
+            scale = obj[0]
+        if scale is not None:
+            yield f'{layer_prefix}{scale_key}', scale
+
+    def _set_layer_ple(self, mg_layer, hf_state_dict, to_mcore: bool, layer_prefix: str = ''):
         ple = None if mg_layer is None else getattr(mg_layer, 'ple', None)
         if to_mcore:
             # Only the stage owning the PLE layer reaches this path, so it
@@ -363,7 +537,14 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         # loop runs pp collectives (broadcast_object_list) and export_table_to_hf runs
         # tp ones, and stages disagreeing on whether to enter would deadlock.
         ple_offloaded = self._reduce_tensor_pp_group(ple is not None and ple.ple_embedding.cpu_offload, to_mcore)
-        skip_ngram_state = not to_mcore and not self._is_saving and (self._peft_format or ple_offloaded)
+        if to_mcore:
+            # A PEFT/adapter checkpoint carries no PLE n-gram buffers -- those come from the base
+            # checkpoint that the adapter is applied on top of -- so a peft-format load must skip
+            # them instead of KeyError-ing on `ple.ple_embedding.layer_multipliers`.
+            skip_ngram_state = self._peft_format
+        else:
+            # Adapter saves must also omit the base n-gram buffers and table.
+            skip_ngram_state = self._peft_format or (not self._is_saving and ple_offloaded)
         for buf in () if skip_ngram_state else self._PLE_NGRAM_BUFFERS:
             if to_mcore:
                 buffer = getattr(ple.ple_embedding, buf)
@@ -382,8 +563,15 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         if not skip_ngram_state and to_mcore:
             # The table's only ingestion path: fill from the HF checkpoint shards.
             ple.ple_embedding.fill_table_from_hf(hf_state_dict)
-        elif not skip_ngram_state and ple is not None:
-            ple.ple_embedding.export_table_to_hf(hf_state_dict)
+        if not to_mcore and not skip_ngram_state:
+            # Stream the table shards one at a time instead of accumulating the
+            # 100GB-scale table in host memory: the generator below is only
+            # consumed at _convert's yield point (the safetensors writer drives
+            # the pace), and each shard is broadcast to the other pp members as
+            # it is produced, then released once written.
+            self._pending_export_iter = self._iter_ple_table_export(ple, pp_src_rank, layer_prefix)
+        else:
+            self._pending_export_iter = None
         self._converting_ple = True
         try:
             for mg_key, hf_key in [('key_proj.weight', 'ple.key_proj.weight'),
@@ -406,7 +594,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         hf_state_dict.update(self._set_layer_mlp(mg_layer, hf_state_dict, layer_idx, to_mcore))
         self._set_layer_hc(mg_layer, hf_state_dict, to_mcore)
         if (layer_idx + 1) in (self.config.ple_layer_ids or []):
-            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore)
+            self._set_layer_ple(mg_layer, hf_state_dict, to_mcore, layer_prefix=hf_prefix)
         if to_mcore:
             hf_state_dict = {}
         else:
@@ -434,6 +622,60 @@ class Qwen4ExpBridge(Qwen3NextBridge):
                                      f'{self.hf_mixer_prefix}hyper_connection_mixer.{key}', to_mcore)
         return res
 
+    def _convert_mtp_extra(self, mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict):
+        # Qwen3.8-Flash-Next's MTP head lives at the `mtp.` level (not under `mtp.layers.i`):
+        # pre_fc_norm_embedding/pre_fc_norm_hidden -> enorm/hnorm, fc_embedding/fc_hidden -> e_proj/h_proj
+        # (the residual_linear_shared fusion), plus its own hyper_connection_mixer for the contraction.
+        # There is no fused eh_proj and no final norm (the mixer is the contraction).
+        sd = self._remove_prefix(origin_hf_state_dict, 'mtp.')
+        for mg_key, key in [('enorm.weight', 'pre_fc_norm_embedding.weight'),
+                            ('hnorm.weight', 'pre_fc_norm_hidden.weight'), ('e_proj.weight', 'fc_embedding.weight'),
+                            ('h_proj.weight', 'fc_hidden.weight')]:
+            self._set_state_dict(mtp_layer, mg_key, sd, key, to_mcore)
+        self._fp8_skip_modules.update({'mtp.fc_embedding', 'mtp.fc_hidden'})
+        mixer = None if mtp_layer is None else getattr(mtp_layer, 'hyper_connection_mixer', None)
+        for key in ('hc_norm.weight', 'input_mix_weight_down.weight', 'input_mix_weight_up.weight'):
+            self._set_state_dict(mixer, key, sd, f'hyper_connection_mixer.{key}', to_mcore)
+        if not to_mcore:
+            origin_hf_state_dict.update(self._add_prefix(sd, 'mtp.'))
+
+    def _convert_mtp_layer(self, lm_model, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
+        mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
+        hf_prefix = f'{hf_prefix}{layer_idx}.'  # 'mtp.layers.0.'
+        if to_mcore:
+            origin_hf_state_dict = hf_state_dict
+            mtp_present = len(self._remove_prefix(origin_hf_state_dict, 'mtp.')) > 0
+            hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
+            if not mtp_present:
+                if self._peft_format:
+                    # A PEFT/adapter checkpoint carries no base MTP weights -- those were already
+                    # loaded from the base checkpoint the adapter sits on top of. Re-initializing
+                    # here would wipe the (frozen) base MTP head + inner block.
+                    return {}
+                logger.info(f'MTP layer {layer_idx} safetensors weights not found, '
+                            'this part will be randomly initialized.')
+                for param in mtp_layer.parameters():
+                    if param.ndim == 2:
+                        mtp_layer.config.init_method(param.data)
+                return {}
+        else:
+            origin_hf_state_dict = {}
+            hf_state_dict = {}
+        self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
+        # Inner block: a full-attention + MoE Qwen4ExpLayer with its own gated hyper-connections.
+        # layer_idx=-1 routes _set_layer_attn through linear_attention_freq[-1] (the backbone's last
+        # layer, full_attention), matching the MTP head, which is always full-attention.
+        inner = None if mtp_layer is None else mtp_layer.transformer_layer
+        hf_state_dict.update(self._set_layer_attn(inner, hf_state_dict, -1, to_mcore))
+        hf_state_dict.update(self._set_layer_mlp(inner, hf_state_dict, -1, to_mcore, is_mtp=True))
+        self._set_layer_hc(inner, hf_state_dict, to_mcore)
+        if to_mcore:
+            hf_state_dict = {}
+        else:
+            hf_state_dict = self._add_prefix(hf_state_dict, hf_prefix)
+            hf_state_dict.update(origin_hf_state_dict)
+        return hf_state_dict
+
 
 class Qwen4ExpLoader(ModelLoader):
     transformer_block = Qwen4ExpTransformerBlock
@@ -454,8 +696,6 @@ class Qwen4ExpLoader(ModelLoader):
                 "Qwen4-Exp QSA under context parallelism requires cp_comm_type='all_gather'; "
                 f"got {getattr(config, 'cp_comm_type', None)!r} (mcore's default), promoting to 'all_gather'.")
             config.cp_comm_type = 'all_gather'
-        if getattr(config, 'mtp_num_layers', None):
-            raise NotImplementedError('Qwen4-Exp MTP is not supported yet')
         moe_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
@@ -509,6 +749,44 @@ class Qwen4ExpLoader(ModelLoader):
     def _set_transformer_layer(self, transformer_layer_spec):
         for layer_spec in transformer_layer_spec.layer_specs:
             layer_spec.module = Qwen4ExpLayer
+
+    def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        if (self.config.mtp_num_layers or 0) > 1 and not self.config.mtp_shared_weights:
+            # HF exposes a single top-level `mtp.*` head; multiple independent heads would all map
+            # to the same `mtp.*` keys on export and overwrite each other (no lossless round-trip).
+            raise NotImplementedError(
+                'Qwen3.8-Flash-Next exposes a single top-level `mtp.*` head, so multiple independent '
+                'MTP heads (mtp_num_layers>1 without mtp_shared_weights) cannot round-trip through HF. '
+                'Use mtp_shared_weights=True to reuse one head across prediction depths, or '
+                'mtp_num_layers=1.')
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
+        if mtp_block_spec is not None:
+            for layer_spec in mtp_block_spec.layer_specs:
+                sub = layer_spec.submodules
+                # The residual_linear_shared head needs Megatron's mHC *projection* form (separate
+                # e_proj/h_proj slots). megatron-core <= 0.18 only has the fused eh_proj slot, and
+                # assigning e_proj/h_proj there would silently no-op and surface later as an
+                # AttributeError on self.e_proj -- so reject early and name the fix.
+                if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
+                    raise NotImplementedError(
+                        'Qwen3.8-Flash-Next MTP requires a Megatron whose MultiTokenPredictionLayerSubmodules '
+                        'exposes e_proj/h_proj (megatron-core >= 0.19 / dev); got '
+                        f'{megatron.core.__version__}.')
+                layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
+                # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
+                # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm
+                # (final_layernorm) is built then dropped by the layer -- the mixer is the contraction.
+                sub.enorm = TENorm
+                sub.hnorm = Qwen4ExpMTPStreamNorm
+                sub.eh_proj = None
+                sub.e_proj = TEColumnParallelLinear
+                sub.h_proj = TEColumnParallelLinear
+                sub.layer_norm = TENorm
+                # The MTP inner block is always full-attention (config.mtp.layer_types), independent of
+                # the backbone layer numbering that Qwen4ExpLayer would otherwise read.
+                sub.mtp_model_layer.module = Qwen4ExpMTPInnerLayer
+        return mtp_block_spec
 
     def build_model(
         self,

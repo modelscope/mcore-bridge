@@ -25,6 +25,7 @@ config_mapping = {
     'add_bias_linear': ['mlp_bias'],
     'kv_channels': ['head_dim'],
     'hf_model_type': ['model_type'],
+    'image_token_id': ['image_token_id'],
     # moe
     'moe_ffn_hidden_size': ['moe_intermediate_size'],
     'moe_shared_expert_intermediate_size': ['shared_expert_intermediate_size', 'moe_shared_expert_intermediate_size'],
@@ -52,6 +53,12 @@ config_mapping = {
     'linear_key_head_dim': ['linear_key_head_dim'],
     'linear_value_head_dim': ['linear_value_head_dim'],
     'linear_conv_kernel_dim': ['linear_conv_kernel_dim'],
+    # glm5_next (KDA); `linear_lower_bound` is HF's resolved safe-gate bound
+    'linear_num_heads': ['linear_num_heads'],
+    'linear_head_dim': ['linear_head_dim'],
+    'linear_lower_bound': ['linear_lower_bound'],
+    'hc_eps': ['hc_eps'],
+    'index_kpool': ['index_kpool'],
     # qwen4_exp
     'hc_count': ['hc_count'],
     'hc_lowrank': ['hc_lowrank'],
@@ -79,11 +86,34 @@ config_mapping = {
     # deepseek_v4
     'csa_compress_ratios': ['compress_rates'],
     'csa_compress_rotary_base': ['compress_rope_theta'],
+    # deepseek_v41 / CSA2 source-layer routing
+    'csa2_kv_source_layers': ['kv_source_layer_ids'],
+    'csa2_index_source_layers': ['index_source_layer_ids'],
+    'csa2_candidate_source_layer': ['candidate_source_layer_id'],
+    'csa2_candidate_topk_blocks': ['candidate_topk_blocks'],
+    'csa2_candidate_block_size': ['candidate_block_size'],
     'o_groups': ['o_groups'],
     'o_lora_rank': ['o_lora_rank'],
     'num_residual_streams': ['hc_mult'],
     'mhc_sinkhorn_iterations': ['hc_sinkhorn_iters'],
     'moe_n_hash_layers': ['mlp_layer_types'],
+    'engram_layer_ids': ['engram_layer_ids'],
+    'engram_num_embeddings': ['engram_num_embeddings'],
+    'engram_max_ngram_size': ['engram_max_ngram_size'],
+    'engram_vocab_size': ['engram_vocab_size'],
+    'engram_n_heads': ['engram_n_heads'],
+    'engram_head_dim': ['engram_head_dim'],
+    'engram_pad_token_id': ['engram_pad_token_id'],
+    'engram_compressed_vocab_size': ['engram_compressed_vocab_size'],
+    'engram_tokenizer_map': ['engram_tokenizer_map'],
+    # DeepSeek-V4.1 DSpark is a parallel draft stack, not Megatron's autoregressive MTP.
+    'dspark_num_layers': ['num_nextn_predict_layers'],
+    'dspark_block_size': ['dspark_block_size'],
+    'dspark_noise_token_id': ['dspark_noise_token_id'],
+    'dspark_target_layer_ids': ['dspark_target_layer_ids'],
+    'dspark_markov_rank': ['dspark_markov_rank'],
+    'dspark_num_experts': ['dspark_n_routed_experts'],
+    'dspark_router_topk': ['dspark_num_experts_per_tok', 'dspark_n_activated_experts'],
     'activation_func_clamp_value': ['swiglu_limit'],
     # nemotron_h / mamba2
     'mamba_num_heads': ['mamba_num_heads'],
@@ -185,8 +215,10 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res.pop('ffn_hidden_size', None)
         if llm_model_type in {'qwen2_moe', 'qwen3_next'} or hf_model_type == 'qwen3_5_moe':
             res['moe_shared_expert_gate'] = True
-    if llm_model_type in {'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1', 'deepseek_v4'
-                          } or hf_model_type == 'kimi_vl':
+    if llm_model_type in {
+            'deepseek', 'deepseek_v2', 'deepseek_v3', 'kimi_k2', 'deepseek_v32', 'dots1', 'deepseek_v4',
+            'deepseek_v41_text'
+    } or hf_model_type == 'kimi_vl':
         if llm_model_type != 'deepseek':
             res['qk_layernorm'] = True
         res['moe_router_load_balancing_type'] = 'seq_aux_loss'
@@ -204,6 +236,28 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             csa_compress_ratios = res.pop('csa_compress_ratios', None)
             res['csa_compress_ratios'] = [csa_compress_ratios.get(layer_type, 0) for layer_type in layer_types]
             res['moe_n_hash_layers'] = len([layer for layer in moe_n_hash_layers if layer == 'hash_moe'])
+        elif llm_model_type == 'deepseek_v41_text':
+            if 'v_head_dim' not in res:
+                res['v_head_dim'] = res['kv_channels']
+            res['experimental_attention_variant'] = 'dsv4_hybrid'
+            res['dsv4_version'] = 'v4.1'
+            # Native V4.1 uses unrotated indexer activations and no YaRN
+            # amplitude scaling (generic MLA defaults differ).
+            res['dsa_indexer_rotate_activation'] = False
+            res['mscale'] = 0.0
+            res['mscale_all_dim'] = 0.0
+            res['moe_router_enable_expert_bias'] = True
+            res['moe_router_enable_vl_bias'] = getattr(hf_config, 'vision_config', None) is not None
+            res['csa_window_size'] = window_size
+            res['enable_hyper_connections'] = True
+            res['mhc_single_pass'] = True
+            # CSA2 consumes raw 0/1/2 ratios; drop any trailing MTP entries.
+            res.pop('csa_compress_ratios', None)
+            text_config = getattr(hf_config, 'text_config', hf_config)
+            res['csa_compress_ratios'] = list(text_config.compress_ratios)[:res['num_layers']]
+            # V4.1 has no Hash-MoE bootstrap layers.
+            res['moe_n_hash_layers'] = 0
+            res['engram_enabled'] = bool(res.get('engram_layer_ids'))
     elif llm_model_type == 'hunyuan':
         # Since HunYuan’s attention applies RoPE before using q/k_layernorm,
         # which is incompatible with megatron-core, support is not provided here.
@@ -213,6 +267,33 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
             if isinstance(val, list) and val and min(val) == max(val):
                 res[key] = val[0]
         n_shared_experts = res.pop('n_shared_experts')
+    elif hf_model_type == 'glm5_next':
+        text_config = hf_config.text_config
+        num_layers = res['num_layers']
+        layer_types = text_config.layer_types
+        mlp_layer_types = text_config.mlp_layer_types
+        # `hc_mult` reaches `num_residual_streams` through config_mapping (deepseek_v4's mHC
+        # field); Megatron dev's hybrid transformer block, which expands the residual into mHC
+        # streams, reads `hc_count` for the same thing.
+        res['hc_count'] = res['num_residual_streams']
+        pattern = ''.join(('K' if attn == 'linear_attention' else 'D') + ('E' if mlp == 'sparse' else '-')
+                          for attn, mlp in zip(layer_types, mlp_layer_types))
+        res['hybrid_layer_pattern'] = pattern
+        res['is_hybrid_model'] = True
+        res['num_layers'] = len(pattern)
+        res['linear_attention_freq'] = '[' + ','.join(str(int(symbol == 'K')) for symbol in pattern) + ']'
+        res['moe_layer_freq'] = '[' + ','.join(str(int(symbol == 'E')) for symbol in pattern) + ']'
+        res['enable_hyper_connections'] = True
+        res['position_embedding_type'] = 'none'
+        # config_mapping reads `kv_channels` off HF's `head_dim`, which glm5_next forces to
+        # `qk_rope_head_dim` (0, NoPE). Restore MCore's own default so the MLA dims stay intact.
+        res['kv_channels'] = res['hidden_size'] // res['num_attention_heads']
+        res['qk_layernorm'] = True
+        res['moe_router_load_balancing_type'] = 'none'
+        res['moe_router_enable_expert_bias'] = True
+        # moe_layer_freq above already encodes mlp_layer_types; keep the generic
+        # first_k_dense_replace expansion at the end of this function from overwriting it.
+        first_k_dense_replace = None
     elif llm_model_type in {'ernie4_5', 'ernie4_5_moe', 'glm4'}:
         res['rotary_interleaved'] = True
     elif hf_model_type in {'gemma4', 'gemma4_unified'}:

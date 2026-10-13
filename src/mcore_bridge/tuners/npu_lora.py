@@ -97,7 +97,8 @@ class NpuGroupedLoraLinear(nn.Module):
             edp_replica_id = 0
         else:
             edp_replica_id = parallel_state.get_expert_data_parallel_rank()
-        sharded_tensor.replica_id = (*replica_id[:2], edp_replica_id)
+        # Dense TP ranks can own different experts when expert TP differs from TP.
+        sharded_tensor.replica_id = (replica_id[0], parallel_state.get_expert_tensor_parallel_rank(), edp_replica_id)
         return sharded_tensor
 
     def sharded_state_dict(

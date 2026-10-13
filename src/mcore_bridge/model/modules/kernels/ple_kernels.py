@@ -33,7 +33,7 @@ if HAVE_TRITON:
         # One program per flattened (token, hash-head) id. Rows outside this TP
         # rank's [row_start, row_end) are written as zero; the caller sums the
         # per-rank results across TP to reassemble the full embedding.
-        row_id = tl.program_id(0)
+        row_id = tl.program_id(0).to(tl.int64)
         global_idx = tl.load(ids_ptr + row_id)
         in_range = (global_idx >= row_start) & (global_idx < row_end)
         local_idx = tl.where(in_range, global_idx - row_start, 0)
@@ -51,7 +51,7 @@ if HAVE_TRITON:
 def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
     """Gather n-gram rows from the CPU-pinned table with a triton kernel.
 
-    Returns ``None`` when the fast path is not usable (no triton, CPU-resident
+    Returns ``None`` when the fast path is not usable (no triton, non-CUDA
     ids, or the table is not bf16), so the caller can fall back to the torch path.
 
     Args:
@@ -60,12 +60,8 @@ def gather_ple_rows(host_table, ids, row_start, row_end, out=None):
         row_start / row_end: this rank's global row range.
         out: optional preallocated ``[*ids.shape, embedding_dim]`` bf16 device tensor.
     """
-    # Gate on "triton exists + ids live on an accelerator", not on is_cuda:
-    # triton ships per-vendor backends (ROCm in-tree; NPU/XPU via vendor forks
-    # such as triton-ascend), so a platform that cannot run this kernel fails
-    # at launch instead of being silently excluded here. The device-side read
-    # of the pinned host table is only verified on CUDA so far.
-    if not HAVE_TRITON or ids.device.type == 'cpu':
+    # Pinned-host fast path is CUDA-only; use the torch fallback elsewhere.
+    if not HAVE_TRITON or ids.device.type != 'cuda':
         return None
     if host_table.dtype != torch.bfloat16:
         return None
@@ -110,7 +106,8 @@ if HAVE_TRITON:
     ):
         # Fused: grouped RMSNorm(key) * grouped RMSNorm(query) -> per-group score,
         # gate = sigmoid(sign(s)*sqrt(max(|s|,1e-6))), out = gate * value.
-        pid = tl.program_id(0)
+        # Promote before multiplying: 256K * (4 * 2560) exceeds int32.
+        pid = tl.program_id(0).to(tl.int64)
         t = pid // N
         c = pid % N
         if t >= T:
@@ -162,7 +159,7 @@ if HAVE_TRITON:
         SQRTC: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        pid = tl.program_id(0)
+        pid = tl.program_id(0).to(tl.int64)
         t = pid // N
         c = pid % N
         if t >= T:
@@ -222,7 +219,7 @@ if HAVE_TRITON:
         BLOCK_C: tl.constexpr,
     ):
         # Grouped zero-centered RMSNorm: out = x * rstd * (1 + w), fp32 out.
-        pid = tl.program_id(0)
+        pid = tl.program_id(0).to(tl.int64)
         t = pid // N
         c = pid % N
         if t >= T:
@@ -248,7 +245,7 @@ if HAVE_TRITON:
         C: tl.constexpr,
         BLOCK_C: tl.constexpr,
     ):
-        pid = tl.program_id(0)
+        pid = tl.program_id(0).to(tl.int64)
         t = pid // N
         c = pid % N
         if t >= T:
@@ -281,7 +278,7 @@ if HAVE_TRITON:
     ):
         # Causal dilated depthwise conv; rows never read across their segment
         # start. out = gated + silu(conv(normed)).
-        t = tl.program_id(0)
+        t = tl.program_id(0).to(tl.int64)
         wb = tl.program_id(1)
         if t >= T:
             return
@@ -319,7 +316,7 @@ if HAVE_TRITON:
         DIL: tl.constexpr,
         BLOCK_W: tl.constexpr,
     ):
-        t = tl.program_id(0)
+        t = tl.program_id(0).to(tl.int64)
         wb = tl.program_id(1)
         if t >= T:
             return
@@ -477,13 +474,19 @@ if HAVE_TRITON:
                     DIL=dilation,
                     BLOCK_W=BW)
 
+            # The convolution backward has consumed the recomputed norm output.
+            del normed
+
             # norm_conv backward: dwc on host, dx via kernel (fp32).
             x_hat = (gated.view(T, n, C) * rstdc.unsqueeze(-1)).view(T, W)
             dwc = (dnormed * x_hat).sum(dim=0).to(wc.dtype)
+            del x_hat
             dgated_norm = torch.empty(T, W, dtype=torch.float32, device=dev)
             if T > 0:
                 _ple_norm_bwd_kernel[(T * n, )](gated, wc, rstdc, dnormed, dgated_norm, T, N=n, C=C, BLOCK_C=block_c)
             dgated += dgated_norm
+            # Release token-sized FP32 temporaries before gate gradient buffers.
+            del gated, dnormed, dgated_norm
 
             dkey = torch.empty_like(key)
             dquery = torch.empty_like(hc_state)

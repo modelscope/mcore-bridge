@@ -18,6 +18,13 @@ from .logger import get_logger
 
 mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 
+# Megatron dev (0.19+) refactored `roll_tensor` to take a LIST of tensors and return a list of rolled
+# tensors; 0.16/0.18 take a single tensor and return `(rolled, rolled.sum())`. mcore-bridge's callers
+# (gpt_model / mtp_layer) use the single-tensor form, so detect the installed signature once.
+import inspect  # noqa: E402
+
+_ROLL_TAKES_LIST = 'tensors' in inspect.signature(mcore_roll_tensor).parameters
+
 logger = get_logger()
 
 
@@ -75,8 +82,9 @@ def split_cp_inputs(inputs: torch.Tensor,
             val = inputs[tuple(slices)]
         view_shape = (*inputs.shape[:dim], 2 * cp_size, val.shape[dim] // (2 * cp_size), *inputs.shape[dim + 1:])
         val = val.view(view_shape)
-        index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], device='cpu',
-                             pin_memory=True).cuda(non_blocking=True)
+        # Keep the index on the same device as the activation. `.cuda()` sends an NPU
+        # (or CPU) tensor's index to CUDA and index_select then fails before the CP slice.
+        index = torch.tensor([cp_rank, (2 * cp_size - cp_rank - 1)], dtype=torch.long, device=val.device)
         val = val.index_select(dim, index)
         view_shape = (*inputs.shape[:dim], -1, *inputs.shape[dim + 1:])
         new_inputs.append(val.view(view_shape))
@@ -107,20 +115,31 @@ def get_num_samples(packed_seq_params) -> int:
     return int(packed_seq_params.cu_seqlens_q.numel()) - 1
 
 
-def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int) -> torch.Tensor:
-    """In CP mode, all-gather and undo the load-balanced (zigzag) chunking
-    produced by ``split_cp_inputs``, restoring the full sequence in original
-    token order along ``dim``.
+def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode: str = 'zigzag') -> torch.Tensor:
+    """In CP mode, all-gather and undo the chunking produced by
+    ``split_cp_inputs``, restoring the full sequence in original token order
+    along ``dim``.
 
     Args:
         tensor: CP-sharded local tensor whose sequence dim is at ``dim``.
         packed_seq_params: ``PackedSeqParams`` for THD inputs, or ``None`` for
             regular ``[B, S, ...]`` inputs.
         dim: Sequence dimension index of ``tensor`` (default: 1).
+        cp_partition_mode: CP partition layout, either ``zigzag`` or ``contiguous``.
+            It must match the mode used by ``split_cp_inputs``.
 
     Returns:
         torch.Tensor: Full-sequence tensor with the same shape as ``tensor``
         except the size at ``dim`` is multiplied by ``cp_size``.
+
+    Gradient: only the local shard keeps its autograd graph; the slices gathered
+    from other ranks are constants. That is correct when the tensor needs no
+    grad, or when every rank computes the same full-sequence loss from the
+    result (each rank then owns the gradient of its own shard). It drops
+    gradient when the consumer mixes tokens across shards and splits its output
+    back to the local shard; use a differentiable gather there
+    (``gather_from_sequence_parallel_region(..., tensor_parallel_output_grad=True,
+    group=cp_group)``), as PLE does.
     """
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -135,6 +154,11 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int) -> torch.Tensor:
     torch.distributed.all_gather(output_list, tensor.contiguous(), group=cp_group)
     output_list[cp_rank] = tensor
     gathered = torch.cat(output_list, dim=dim)
+
+    if cp_partition_mode == 'contiguous':
+        # Rank r owns block r, so concatenating the shards in rank order already
+        # restores the original token order.
+        return gathered
 
     # `_undo_attention_load_balancing` assumes sequence dim is 0; transpose if needed.
     if dim != 0:
@@ -284,6 +308,9 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=None):
     if mcore_016 or packed_seq_params is None:
         kwargs = {'packed_seq_params': packed_seq_params} if mcore_016 else {}
+        if _ROLL_TAKES_LIST:
+            rolled = mcore_roll_tensor([tensor], shifts=shifts, dims=dims, cp_group=cp_group, **kwargs)[0]
+            return rolled, rolled.sum()
         return mcore_roll_tensor(tensor, shifts=shifts, dims=dims, cp_group=cp_group, **kwargs)
     # mcore 0.15 & packed_seq_params
     return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)

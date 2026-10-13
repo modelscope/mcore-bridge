@@ -10,15 +10,24 @@ from .env import is_last_rank, is_master
 
 class LazyTensor:
 
-    def __init__(self, tensor=None, loader=None):
+    def __init__(self, tensor=None, loader=None, slice_loader=None):
         """You need to provide a tensor or loader"""
         self.tensor = tensor
         self.loader = loader
+        self.slice_loader = slice_loader
 
     def load(self):
         if self.tensor is None:
             return self.loader()
         return self.tensor
+
+    def load_slice(self, slices):
+        """Load only ``slices`` when the backing format supports partial reads."""
+        if self.tensor is not None:
+            return self.tensor[slices]
+        if self.slice_loader is not None:
+            return self.slice_loader(slices=slices)
+        return self.loader()[slices]
 
 
 class SafetensorLazyLoader:
@@ -60,13 +69,21 @@ class SafetensorLazyLoader:
     def get_state_dict(self):
         res = {}
         for k in self._weight_map.keys():
-            res[k] = LazyTensor(loader=partial(self._load_tensor, key=k))
+            res[k] = LazyTensor(
+                loader=partial(self._load_tensor, key=k),
+                slice_loader=partial(self._load_tensor_slice, key=k),
+            )
         return res
 
     def _load_tensor(self, key):
         filename = self._weight_map[key]
         file_handle = self._open_file(filename)
         return file_handle.get_tensor(key)
+
+    def _load_tensor_slice(self, key, slices):
+        filename = self._weight_map[key]
+        file_handle = self._open_file(filename)
+        return file_handle.get_slice(key)[slices]
 
     def close(self):
         self._file_handles.clear()
