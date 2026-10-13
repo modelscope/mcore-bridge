@@ -76,15 +76,25 @@ class NpuGroupedLoraLinear(nn.Module):
         device = torch.device('cpu') if config.use_cpu_initialization else get_current_device()
         dtype = config.params_dtype
         for i in range(num_gemms):
-            self.register_parameter(
-                f'weight{i}',
-                nn.Parameter(torch.empty(output_size, input_size, device=device, dtype=dtype)),
-            )
+            weight = nn.Parameter(torch.empty(output_size, input_size, device=device, dtype=dtype))
+            bias_param = None
             if bias:
-                self.register_parameter(
-                    f'bias{i}',
-                    nn.Parameter(torch.empty(output_size, device=device, dtype=dtype)),
-                )
+                bias_param = nn.Parameter(torch.empty(output_size, device=device, dtype=dtype))
+            if is_expert:
+                # Mark expert adapter parameters with the same topology metadata
+                # Megatron attaches to expert layers. Consumers such as the
+                # parameter/gradient buffer classify a parameter as expert from
+                # ``not getattr(param, 'allreduce', True)``; without it these
+                # per-expert adapters are treated as ordinary dense parameters
+                # and can be reduced over the wrong (dense TP/DP) group.
+                # ``allreduce=False`` still synchronizes replicas of the *same*
+                # expert through expert data parallel.
+                weight.allreduce = False
+                if bias_param is not None:
+                    bias_param.allreduce = False
+            self.register_parameter(f'weight{i}', weight)
+            if bias_param is not None:
+                self.register_parameter(f'bias{i}', bias_param)
 
     @property
     def weight(self):
