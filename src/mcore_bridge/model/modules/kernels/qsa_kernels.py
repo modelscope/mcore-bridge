@@ -126,12 +126,8 @@ def qsa_sparse_attention_thd(q, k, v, indices, scale, block_size):
                            'selected for packing (thd) or CP>1, where no dense fallback is correct.')
     if q.shape[-1] & (q.shape[-1] - 1):
         raise RuntimeError(f'QSA sparse attention needs a power-of-two head dim, got {q.shape[-1]}.')
-    if q.shape[0] != k.shape[0]:
-        # The kernel takes its key bound from the query count (T, Hq, D = q.shape,
-        # then `offs_k < T`), so unequal lengths would silently drop every key past
-        # len(q). Callers must equalise first -- _forward_cp does this by scattering
-        # the local query shard into a full-length buffer.
-        raise ValueError(f'QSA sparse attention needs len(q) == len(k), got {q.shape[0]} vs {k.shape[0]}.')
+    if q.shape[0] > k.shape[0]:
+        raise ValueError(f'QSA sparse attention got more queries than keys, {q.shape[0]} vs {k.shape[0]}.')
     return qsa_sparse_attention_from_indices(q, k, v, indices.contiguous(), scale, block_size)
 
 
@@ -254,7 +250,7 @@ class QSASparseCoreAttention(torch.nn.Module):
             gathered_pos = torch.cat([_cp_query_global_positions_thd(cu_q, cp_size, r, device) for r in range(cp_size)])
             kv_reorder = torch.argsort(gathered_pos)
         else:
-            sq, b = query.shape[0], query.shape[1]
+            sq = query.shape[0]
             q_pos = _cp_query_global_positions(sq * cp_size, cp_size, cp_rank, device)
             kv_reorder = _cp_gathered_to_logical_order(sq * cp_size, cp_size, device)
         # gather k/v across CP with a DIFFERENTIABLE all-gather (backward is a
@@ -270,41 +266,9 @@ class QSASparseCoreAttention(torch.nn.Module):
 
         key_full = _gather_full(key)
         value_full = _gather_full(value)
-        # The kernel derives the key bound from the query count (T, Hq, D = q.shape,
-        # then `offs_k < T`), so it structurally requires len(q) == len(k). Under CP
-        # the queries are a 1/cp_size shard while k/v are now full length, so scatter
-        # the local queries back into a full-length buffer, run, and take our rows
-        # out again. The padding rows carry an all-`-1` selection, which the kernel
-        # skips, so they cost tile launches but produce nothing.
+        # Query stays the local CP shard. Key indices are in the gathered sequence.
+        # The kernel bounds keys by k.shape[0], so the empty rows of a full-length
+        # query buffer are not required.
         if thd:
-            local_idx = indices[q_pos]
-            out_full = qsa_sparse_attention(*self._scatter_q_to_full(query, key_full, value_full, local_idx, q_pos),
-                                            scale, self.block_size)
-            return out_full.index_select(0, q_pos)
-        # sbhd: token-space kernel on the batch-major flattening (t = r*sk + p)
-        local_idx = indices[:, q_pos]
-        sk = key_full.shape[0]
-        k_f = key_full.permute(1, 0, 2, 3).reshape(b * sk, key_full.shape[2], key_full.shape[3])
-        v_f = value_full.permute(1, 0, 2, 3).reshape(b * sk, value_full.shape[2], value_full.shape[3])
-        off = torch.arange(b, device=device).view(b, 1, 1) * sk
-        idx_f = torch.where(local_idx >= 0, local_idx + off, local_idx.new_full((), -1)).reshape(sq * b, -1)
-        q_f = query.permute(1, 0, 2, 3).reshape(sq * b, query.shape[2], query.shape[3])
-        # batch-major token ids of this rank's rows: sample r contributes q_pos + r*sk
-        rows = (q_pos[None, :] + torch.arange(b, device=device).view(b, 1) * sk).reshape(-1)
-        out_f = qsa_sparse_attention(*self._scatter_q_to_full(q_f, k_f, v_f, idx_f, rows), scale, self.block_size)
-        out_f = out_f.index_select(0, rows)
-        return out_f.view(b, sq, query.shape[2], query.shape[3]).permute(1, 0, 2, 3)
-
-    @staticmethod
-    def _scatter_q_to_full(q, k, v, indices, rows):
-        """Place ``q``/``indices`` rows at ``rows`` inside a len(k)-row buffer.
-
-        index_copy keeps this differentiable: backward gathers the same rows, so the
-        padded positions contribute no gradient.
-        """
-        n = k.shape[0]
-        q_full = q.new_zeros((n, *q.shape[1:]))
-        q_full = q_full.index_copy(0, rows, q)
-        idx_full = indices.new_full((n, indices.shape[1]), -1)
-        idx_full = idx_full.index_copy(0, rows, indices)
-        return q_full, k, v, idx_full
+            return qsa_sparse_attention(query, key_full, value_full, indices[q_pos], scale, self.block_size)
+        return qsa_sparse_attention(query, key_full, value_full, indices[:, q_pos], scale, self.block_size)
