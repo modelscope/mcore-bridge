@@ -180,8 +180,9 @@ class Qwen4ExpLayer(TransformerLayer):
                                     f'falling back to full attention ({"packing/thd" if is_thd else f"CP={cp_size}"}).')
                 return None, False
             raise RuntimeError(f'QSA needs the sparse kernel here ({"packing/thd" if is_thd else f"CP={cp_size}"}), '
-                               'but QSASparseCoreAttention was not installed -- triton is missing or '
-                               f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two. '
+                               'but QSASparseCoreAttention was not installed -- triton is missing, '
+                               f'kv_channels={getattr(self.config, "kv_channels", None)} is not a power of two, '
+                               'or this device is not CUDA (the kernel is not compiled for NPU). '
                                'Use --padding_free false with context_parallel_size 1 to take the bool-mask path, '
                                f'or set {QSA_SPARSE_KERNEL_ENV}=0 to fall back to full attention.')
         if cp_size > 1 and getattr(self.config, 'cp_comm_type', None) != 'all_gather':
