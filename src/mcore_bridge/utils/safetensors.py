@@ -30,6 +30,26 @@ class LazyTensor:
         return self.loader()[slices]
 
 
+def checkpoint_path(root: str, name: str) -> str:
+    """Join a checkpoint-relative name and reject paths that leave ``root``.
+
+    ``os.path.join`` drops the root when ``name`` is absolute, and a weight-map
+    entry such as ``../../other.safetensors`` would otherwise open a file
+    outside the model directory.
+    """
+    if os.path.isabs(name):
+        raise ValueError(f'Checkpoint file {name!r} is outside {root}')
+    base = os.path.realpath(root)
+    path = os.path.realpath(os.path.join(base, name))
+    try:
+        inside = os.path.commonpath([base, path]) == base
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ValueError(f'Checkpoint file {name!r} is outside {root}')
+    return path
+
+
 class SafetensorLazyLoader:
 
     def __init__(self, hf_model_dir: str, peft_format: bool = False):
@@ -42,7 +62,7 @@ class SafetensorLazyLoader:
     def _open_file(self, filename: str):
         """Open a safetensors file if not already open."""
         if filename not in self._file_handles:
-            file_path = os.path.join(self.hf_model_dir, filename)
+            file_path = checkpoint_path(self.hf_model_dir, filename)
             self._file_handles[filename] = safe_open(file_path, framework='pt')
         return self._file_handles[filename]
 
