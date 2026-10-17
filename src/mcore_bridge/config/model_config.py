@@ -16,17 +16,102 @@ from mcore_bridge.utils import get_logger, json_parse_to_dict
 
 logger = get_logger()
 
+# Layer-pattern strings are list literals with repetition, for example
+# "([0]*3+[1]*1)*3". The alphabet is tiny, but eval still accepts "[0]*10**9"
+# and will try to allocate it. Parse the grammar instead and refuse a result
+# longer than a model would ever have.
+_MAX_PATTERN_ITEMS = 100_000
 
-# code borrowed from NVIDIA/Megatron-LM
+
 def _eval_pattern(pattern):
-    """ Validate and evaluate a string containing a Python list expression """
+    """Parse a layer-pattern list expression. No eval."""
     assert isinstance(pattern, str)
-
-    # validate input, only allow comma, digits, [, ], (, ), +, and *
-    if bool(re.compile(r'[^,\d\[\]\(\)\+\*]').search(pattern)):
+    compact = re.sub(r'\s+', '', pattern)
+    if compact == '' or re.search(r'[^,\d\[\]\(\)\+\*]', compact):
         raise ValueError(f'Invalid pattern: {pattern}')
+    if '**' in compact:
+        raise ValueError(f'Invalid pattern: {pattern}')
+    parser = _PatternParser(compact)
+    value = parser.parse()
+    if parser.i != len(compact):
+        raise ValueError(f'Invalid pattern: {pattern}')
+    if not isinstance(value, list):
+        raise ValueError(f'Invalid pattern: {pattern}')
+    return value
 
-    return eval(pattern)
+
+class _PatternParser:
+
+    def __init__(self, text):
+        self.text = text
+        self.i = 0
+
+    def parse(self):
+        return self._expr()
+
+    def _peek(self):
+        return self.text[self.i] if self.i < len(self.text) else ''
+
+    def _eat(self, char):
+        if self._peek() != char:
+            raise ValueError(f'Invalid pattern: {self.text}')
+        self.i += 1
+
+    def _expr(self):
+        value = self._term()
+        while self._peek() == '+':
+            self._eat('+')
+            right = self._term()
+            if not isinstance(value, list) or not isinstance(right, list):
+                raise ValueError(f'Invalid pattern: {self.text}')
+            value = value + right
+            if len(value) > _MAX_PATTERN_ITEMS:
+                raise ValueError(f'Pattern is longer than {_MAX_PATTERN_ITEMS}: {self.text}')
+        return value
+
+    def _term(self):
+        value = self._atom()
+        if self._peek() == '*':
+            self._eat('*')
+            count = self._number()
+            if not isinstance(value, list):
+                raise ValueError(f'Invalid pattern: {self.text}')
+            if count > _MAX_PATTERN_ITEMS or len(value) * count > _MAX_PATTERN_ITEMS:
+                raise ValueError(f'Pattern is longer than {_MAX_PATTERN_ITEMS}: {self.text}')
+            value = value * count
+        return value
+
+    def _atom(self):
+        if self._peek() == '(':
+            self._eat('(')
+            value = self._expr()
+            self._eat(')')
+            return value
+        if self._peek() == '[':
+            return self._list()
+        raise ValueError(f'Invalid pattern: {self.text}')
+
+    def _list(self):
+        self._eat('[')
+        if self._peek() == ']':
+            self._eat(']')
+            return []
+        items = [self._number()]
+        while self._peek() == ',':
+            self._eat(',')
+            items.append(self._number())
+            if len(items) > _MAX_PATTERN_ITEMS:
+                raise ValueError(f'Pattern is longer than {_MAX_PATTERN_ITEMS}: {self.text}')
+        self._eat(']')
+        return items
+
+    def _number(self):
+        start = self.i
+        if not self._peek().isdigit():
+            raise ValueError(f'Invalid pattern: {self.text}')
+        while self._peek().isdigit():
+            self.i += 1
+        return int(self.text[start:self.i])
 
 
 # code borrowed from NVIDIA/Megatron-LM
