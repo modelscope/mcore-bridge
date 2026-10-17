@@ -226,6 +226,49 @@ class AbsorbedMLASelfAttention(McoreAbsorbedMLASelfAttention):
 
         return q_absorbed, kv_compressed, q_compressed
 
+    def _checkpoint_absorbed_core_attention(self, q_absorbed, kv_compressed, absorbed_kwargs):
+        """Recompute absorbed DSA with the same arguments as the non-checkpoint path.
+
+        Tensor inputs go through ``tensor_parallel.checkpoint`` so the backward
+        recompute sees detached copies. ``packed_seq_params`` and ``attn_mask_type``
+        are not tensors; the base checkpoint closes over them the same way.
+        """
+        hidden_states = absorbed_kwargs['x']
+        q_compressed = absorbed_kwargs['qr']
+        attention_mask = absorbed_kwargs['attention_mask']
+        v_up_weight = absorbed_kwargs['up_v_weight']
+        position_ids = absorbed_kwargs['position_ids']
+        packed_seq_params = absorbed_kwargs['packed_seq_params']
+        attn_mask_type = absorbed_kwargs['attn_mask_type']
+        checkpoint_args = [q_absorbed, kv_compressed, hidden_states, q_compressed, v_up_weight]
+        include_mask = torch.is_tensor(attention_mask)
+        include_pos = torch.is_tensor(position_ids)
+        if include_mask:
+            checkpoint_args.append(attention_mask)
+        if include_pos:
+            checkpoint_args.append(position_ids)
+
+        def custom_forward(*inputs):
+            q, kv, x, qr, up_v, *optional = inputs
+            cursor = 0
+            mask = optional[cursor] if include_mask else attention_mask
+            cursor += int(include_mask)
+            pos = optional[cursor] if include_pos else position_ids
+            return self.core_attention(
+                q,
+                kv,
+                value=None,
+                attention_mask=mask,
+                x=x,
+                qr=qr,
+                up_v_weight=up_v,
+                position_ids=pos,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=attn_mask_type,
+            )
+
+        return tensor_parallel.checkpoint(custom_forward, False, *checkpoint_args)
+
     def forward(
         self,
         hidden_states,
@@ -284,30 +327,24 @@ class AbsorbedMLASelfAttention(McoreAbsorbedMLASelfAttention):
                                      f'"full" layer precedes it in this PP stage. Please adjust '
                                      f'`--pipeline_model_parallel_layout` to ensure each PP stage starts with '
                                      f'a "full" indexer layer. indexer_types: {self.config.hf_config.indexer_types}.')
+        absorbed_kwargs = dict(
+            value=None,
+            attention_mask=attention_mask,
+            x=hidden_states,
+            qr=q_compressed,
+            up_v_weight=v_up_weight,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+            attn_mask_type=self.attn_mask_type,
+        )
         if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
-                q_absorbed,
-                kv_compressed,
-                hidden_states,
-                q_compressed,
-                attention_mask,
-                v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-            )
+            # The base checkpoint signature is (query, key, value, attention_mask, ...).
+            # Passing hidden_states/q_compressed positionally binds them to value and
+            # attention_mask, and `position_ids` is not a parameter, so selective
+            # core-attention recompute either raises or runs DSA without x/qr.
+            core_attn_out = self._checkpoint_absorbed_core_attention(q_absorbed, kv_compressed, absorbed_kwargs)
         else:
-            core_attn_out = self.core_attention(
-                q_absorbed,
-                kv_compressed,
-                value=None,
-                attention_mask=attention_mask,
-                x=hidden_states,
-                qr=q_compressed,
-                up_v_weight=v_up_weight,
-                position_ids=position_ids,
-                packed_seq_params=packed_seq_params,
-                attn_mask_type=self.attn_mask_type,
-            )
+            core_attn_out = self.core_attention(q_absorbed, kv_compressed, **absorbed_kwargs)
 
         # ==================================
         # Apply V up projection
