@@ -3,6 +3,7 @@ import copy
 import math
 import torch
 from contextlib import contextmanager
+from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import (SplitAlongDim, TEColumnParallelLinear, TENorm,
                                                          TERowParallelLinear)
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -29,7 +30,7 @@ from typing import Optional, Tuple
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import get_gemma4_attention_dims, get_gemma4_rope_head_dim_key
-from mcore_bridge.utils import get_logger
+from mcore_bridge.utils import get_env_args, get_logger
 
 from ..constant import ModelType
 from ..gpt_model import GPTModel
@@ -137,6 +138,36 @@ class Gemma4Vit(HuggingFaceVit):
         return res
 
 
+def get_ffpa_softmax_scale(config, head_dim: int) -> float:
+    # Same scale as TE: Gemma 4 uses 1.0 (q/k norms), not the kernel default 1/sqrt(head_dim).
+    softmax_scale = getattr(config, 'softmax_scale', None)
+    return head_dim**-0.5 if softmax_scale is None else float(softmax_scale)
+
+
+def ffpa_varlen_attention(query, key, value, packed_seq_params: PackedSeqParams, softmax_scale: float):
+    # THD: query [t, np, hn], key/value [t, ng, hn]; cu_seqlens keep documents apart.
+    from ffpa_attn import ffpa_attn_varlen_func
+    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+    for padded, cu_seqlens in ((packed_seq_params.cu_seqlens_q_padded, cu_seqlens_q),
+                               (packed_seq_params.cu_seqlens_kv_padded, cu_seqlens_kv)):
+        if padded is not None and not torch.equal(padded, cu_seqlens):
+            raise NotImplementedError('GEMMA4_FFPA_ATTN does not support padded packed sequences '
+                                      '(cu_seqlens_*_padded != cu_seqlens_*).')
+    return ffpa_attn_varlen_func(
+        query.contiguous(),
+        key.contiguous(),
+        value.contiguous(),
+        cu_seqlens_q.to(torch.int32),
+        cu_seqlens_kv.to(torch.int32),
+        int(packed_seq_params.max_seqlen_q),
+        int(packed_seq_params.max_seqlen_kv),
+        softmax_scale=softmax_scale,
+        causal=True,
+        enable_gqa=query.shape[1] != key.shape[1],
+    )
+
+
 class Gemma4SelfAttention(SelfAttention):
 
     def __init__(
@@ -205,6 +236,32 @@ class Gemma4SelfAttention(SelfAttention):
         if not self.is_kv_shared_layer:
             self.v_norm = Gemma4RMSNormNoScale(self.head_dim, eps=self.config.layernorm_epsilon)
 
+        # Hopper has no fused TE backward for head_dim 512, so TE falls back to unfused attention on the
+        # full-attention layers. GEMMA4_FFPA_ATTN=1 runs these layers with ffpa-attn when inputs are packed (THD).
+        self.use_ffpa_attn = not self.is_sliding and get_env_args('GEMMA4_FFPA_ATTN', bool, False)
+        if self.use_ffpa_attn:
+            try:
+                import ffpa_attn  # noqa
+            except ImportError as e:
+                raise ImportError('GEMMA4_FFPA_ATTN=1 requires ffpa-attn: `pip install ffpa-attn`.') from e
+            if self.pg_collection.cp.size() > 1:
+                raise NotImplementedError('GEMMA4_FFPA_ATTN does not support context parallelism.')
+            if self.config.attention_dropout > 0:
+                raise NotImplementedError('GEMMA4_FFPA_ATTN does not support attention dropout.')
+            self.ffpa_softmax_scale = get_ffpa_softmax_scale(self.config, self.head_dim)
+
+    def _forward_ffpa_attention(self, query, key, value, attention_bias, packed_seq_params):
+        mask_type = self.attn_mask_type
+        if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal) or attention_bias is not None:
+            raise NotImplementedError(f'GEMMA4_FFPA_ATTN supports causal masks only, got {mask_type}.')
+
+        def custom_forward(query, key, value):
+            return ffpa_varlen_attention(query, key, value, packed_seq_params, self.ffpa_softmax_scale)
+
+        if self.checkpoint_core_attention and self.training:
+            return tensor_parallel.checkpoint(custom_forward, False, query, key, value)
+        return custom_forward(query, key, value)
+
     def _forward_core_attention(
         self,
         query,
@@ -216,7 +273,9 @@ class Gemma4SelfAttention(SelfAttention):
     ):
         nvtx_range_push(suffix='core_attention')
         attn_mask_type = self.attn_mask_type
-        if self.checkpoint_core_attention and self.training:
+        if self.use_ffpa_attn and packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            core_attn_out = self._forward_ffpa_attention(query, key, value, attention_bias, packed_seq_params)
+        elif self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
                 key,
