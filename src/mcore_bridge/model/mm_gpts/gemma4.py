@@ -28,6 +28,7 @@ from typing import Optional, Tuple
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.config import ModelConfig
+from mcore_bridge.config.parser import get_gemma4_attention_dims, get_gemma4_rope_head_dim_key
 from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
@@ -153,15 +154,10 @@ class Gemma4SelfAttention(SelfAttention):
         self.layer_type = text_config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == 'sliding_attention'
 
-        # Head dim: global layers may use a different head dim than sliding ones
-        self.head_dim = (
-            text_config.global_head_dim
-            if not self.is_sliding and text_config.global_head_dim else text_config.head_dim)
+        # Head dim / KV heads: global layers may differ from sliding ones
+        self.head_dim, self.num_key_value_heads = get_gemma4_attention_dims(text_config, self.layer_type)
 
         self.use_alternative_attention = (text_config.attention_k_eq_v and not self.is_sliding)
-        self.num_key_value_heads = (
-            text_config.num_global_key_value_heads
-            if self.use_alternative_attention else text_config.num_key_value_heads)
         # Shared KV across the trailing layers
         self.num_kv_shared_layers = getattr(text_config, 'num_kv_shared_layers', 0)
         if self.num_kv_shared_layers:
@@ -444,9 +440,9 @@ class Gemma4Bridge(MultimodalGPTBridge):
     def _set_qkv(self, mg_attn, hf_state_dict, to_mcore: bool, **kwargs):
         text_config = self.text_config
         layer_idx = kwargs['layer_idx']
-        is_sliding = text_config.layer_types[layer_idx] == 'sliding_attention'
-        head_dim = (
-            text_config.global_head_dim if not is_sliding and text_config.global_head_dim else text_config.head_dim)
+        layer_type = text_config.layer_types[layer_idx]
+        is_sliding = layer_type == 'sliding_attention'
+        head_dim, num_key_value_heads = get_gemma4_attention_dims(text_config, layer_type)
         is_kv_shared_layer = self._get_is_kv_shared_layer(layer_idx)
         if is_kv_shared_layer:
             self._set_state_dict(mg_attn, 'linear_qkv.weight', hf_state_dict, 'q_proj.weight', to_mcore)
@@ -455,9 +451,7 @@ class Gemma4Bridge(MultimodalGPTBridge):
             kwargs['kv_channels'] = head_dim
             use_alternative_attention = text_config.attention_k_eq_v and not is_sliding
             kwargs['attention_k_eq_v'] = use_alternative_attention
-            kwargs['num_query_groups'] = (
-                text_config.num_global_key_value_heads
-                if use_alternative_attention else text_config.num_key_value_heads)
+            kwargs['num_query_groups'] = num_key_value_heads
             return super()._set_qkv(mg_attn, hf_state_dict, to_mcore, **kwargs)
 
     def _set_router(self, mg_mlp, hf_state_dict, to_mcore, **kwargs):
@@ -584,7 +578,7 @@ class Gemma4TextGPTModel(GPTModel):
         self.config.rope_scaling = rope_scaling['full_attention']
         kwargs = {'layer_type': 'full_attention'}
         if self.config.rope_scaling['rope_type'] == 'proportional':
-            kwargs['head_dim_key'] = 'global_head_dim'
+            kwargs['head_dim_key'] = get_gemma4_rope_head_dim_key(self.config.hf_config.text_config)
         new_inv_freq, attention_scaling = get_rope_inv_freq(
             self.config, text_config=self.config.hf_config.text_config, **kwargs)
         self.full_rotary_pos_emb.inv_freq = new_inv_freq
@@ -680,7 +674,7 @@ class Gemma4TextGPTModel(GPTModel):
         per_layer_inputs_shape = [
             sequence_len, input_tensor.shape[1], self.config.num_layers, self.hidden_size_per_layer_input // tp_size
         ]
-        full_head_dim = self.text_config.global_head_dim
+        full_head_dim, _ = get_gemma4_attention_dims(self.text_config, 'full_attention')
         full_states_shape = per_layer_inputs_shape[:2] + [self.num_query_groups_per_partition, full_head_dim * 2]
         sliding_states_shape = full_states_shape[:3] + [self.config.kv_channels * 2]
         per_layer_inputs_dim = math.prod(per_layer_inputs_shape) // math.prod(input_tensor.shape[:2])

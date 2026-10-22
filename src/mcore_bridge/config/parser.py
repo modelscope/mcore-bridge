@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from functools import partial
 from megatron.core.activations import squared_relu
 from transformers import PretrainedConfig
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from mcore_bridge.utils import get_env_args
 
@@ -135,10 +135,40 @@ config_mapping = {
 }
 
 
+# transformers>=5.15 (huggingface/transformers#47384) keeps attributes that differ across layers in
+# `config.per_layer_config`; reading them on the global config raises AmbiguousGlobalPerLayerAttributeError.
+def has_per_layer_config(config) -> bool:
+    return getattr(config, 'per_layer_config', None) is not None
+
+
+def get_gemma4_attention_dims(text_config, layer_type: str) -> Tuple[int, int]:
+    """Return `(head_dim, num_key_value_heads)` used by Gemma 4 layers of `layer_type`."""
+    if has_per_layer_config(text_config):
+        layer_config = text_config.per_layer_config[layer_type]
+        return layer_config.head_dim, layer_config.num_key_value_heads
+    # transformers<5.15: full-attention layers read `global_head_dim` / `num_global_key_value_heads`.
+    is_sliding = layer_type == 'sliding_attention'
+    head_dim = text_config.global_head_dim if not is_sliding and text_config.global_head_dim else text_config.head_dim
+    if not is_sliding and text_config.attention_k_eq_v:
+        num_key_value_heads = text_config.num_global_key_value_heads
+    else:
+        num_key_value_heads = text_config.num_key_value_heads
+    return head_dim, num_key_value_heads
+
+
+def get_gemma4_rope_head_dim_key(text_config) -> str:
+    # transformers>=5.15 resolves `per_layer_config['full_attention']` in the RoPE init (global head_dim there).
+    return 'head_dim' if has_per_layer_config(text_config) else 'global_head_dim'
+
+
 def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
     megatron_config = {}
+    # Per-layer attributes have no single global value; model-specific code reads them per layer.
+    per_layer_attributes = getattr(config, 'per_layer_attributes', None) or ()
     for k, hf_keys in config_mapping.items():
         for hf_k in hf_keys:
+            if hf_k in per_layer_attributes:
+                continue
             if hasattr(config, hf_k):
                 hf_v = getattr(config, hf_k)
                 if hf_v is None:
@@ -300,6 +330,9 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     elif llm_model_type in {'ernie4_5', 'ernie4_5_moe', 'glm4'}:
         res['rotary_interleaved'] = True
     elif hf_model_type in {'gemma4', 'gemma4_unified'}:
+        # Global defaults follow the sliding layers; `Gemma4SelfAttention` overrides them for full-attention layers.
+        res['kv_channels'], res['num_query_groups'] = get_gemma4_attention_dims(hf_config.text_config,
+                                                                                'sliding_attention')
         res['qk_layernorm'] = True
         res['window_size'] = f'{window_size - 1},0'
         window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])
