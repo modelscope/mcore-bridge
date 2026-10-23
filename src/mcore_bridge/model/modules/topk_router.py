@@ -97,11 +97,29 @@ class TopKRouter(McoreTopKRouter):
         Update expert bias and tokens_per_expert
         Prevent extra local tokens accumulation on evaluation or activation recomputation
         """
-        # Older Megatron versions update bias from these counts without checking frozen_expert_bias.
+        # The frozen_expert_bias gate is the bridge's own addition (the LoRA-freeze patch pins the
+        # bias); the counting body mirrors the CURRENT upstream, including the dense-indices form a
+        # flex token dispatcher produces -- the bool-only form sums expert IDs there and silently
+        # corrupts the bias updates.
         if self.enable_expert_bias and not getattr(self, 'frozen_expert_bias', False) and torch.is_grad_enabled():
             with torch.no_grad():
+                use_dense_indices = routing_map.dtype != torch.bool
                 if padding_mask is not None:
-                    if padding_mask.ndim == 1:
-                        padding_mask = padding_mask.unsqueeze(-1)
-                    routing_map = routing_map & (~padding_mask)
-                self.local_tokens_per_expert += routing_map.sum(dim=0)
+                    flat_mask = padding_mask.reshape(-1)
+                    assert (
+                        flat_mask.shape[0] == routing_map.shape[0]
+                    ), f'padding_mask flat {flat_mask.shape} vs routing_map {routing_map.shape}'
+                    if use_dense_indices:
+                        routing_map = routing_map[~flat_mask]
+                    else:
+                        routing_map = routing_map & (~flat_mask).unsqueeze(-1)
+                if use_dense_indices:
+                    expert_indices = routing_map.reshape(-1).to(torch.long)
+                    token_counts = torch.ones_like(
+                        expert_indices, dtype=self.local_tokens_per_expert.dtype)
+                    if torch.are_deterministic_algorithms_enabled():
+                        self.local_tokens_per_expert.index_add_(0, expert_indices, token_counts)
+                    else:
+                        self.local_tokens_per_expert.scatter_add_(0, expert_indices, token_counts)
+                else:
+                    self.local_tokens_per_expert += routing_map.sum(dim=0)

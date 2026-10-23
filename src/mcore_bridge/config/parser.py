@@ -168,7 +168,7 @@ def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
     # compat llama3
     if getattr(config, 'rope_scaling', None) is not None:
         if isinstance(config.rope_scaling, int):
-            megatron_config['rope_scaling'] = {'factor': config.rope_scaling, 'type': 'linear'},
+            megatron_config['rope_scaling'] = {'factor': config.rope_scaling, 'type': 'linear'}
         elif isinstance(config.rope_scaling, dict):
             megatron_config['rope_scaling'] = config.rope_scaling
     return megatron_config
