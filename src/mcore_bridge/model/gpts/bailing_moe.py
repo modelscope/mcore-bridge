@@ -4,6 +4,7 @@ import torch.distributed as dist
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
+from mcore_bridge.utils.accelerator import accelerator_device
 
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
@@ -70,7 +71,7 @@ class BailingMoeBridge(GPTBridge):
         else:
             is_lora = False if mg_attn is None else (isinstance(mg_attn.linear_qkv, LoraParallelLinear)
                                                      and self._peft_format)
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+            is_lora = torch.tensor([is_lora], dtype=torch.bool, device=accelerator_device())
             if self.pp_size > 1:
                 dist.all_reduce(is_lora, group=self.pp_group)
             if is_lora:
