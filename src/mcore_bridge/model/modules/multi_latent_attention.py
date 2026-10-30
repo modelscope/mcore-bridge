@@ -1,3 +1,4 @@
+import inspect
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
@@ -10,6 +11,41 @@ from megatron.core.utils import deprecate_inference_params
 
 
 class MLASelfAttention(McoreMLASelfAttention):
+
+    def _checkpoint_accepts_extra_kwargs(self) -> bool:
+        cached = getattr(self, '_ckpt_accepts_extra', None)
+        if cached is None:
+            params = inspect.signature(super()._checkpointed_attention_forward).parameters
+            cached = 'core_attention_extra_kwargs' in params
+            self._ckpt_accepts_extra = cached
+        return cached
+
+    def _checkpoint_mla_core_attention(self, query, key, value, attention_mask, packed_seq_params, attn_mask_type,
+                                       extra_kwargs):
+        if not extra_kwargs or self._checkpoint_accepts_extra_kwargs():
+            kwargs = {'packed_seq_params': packed_seq_params, 'attn_mask_type': attn_mask_type}
+            if extra_kwargs:
+                kwargs['core_attention_extra_kwargs'] = extra_kwargs
+            return self._checkpointed_attention_forward(query, key, value, attention_mask, **kwargs)
+
+        # mcore <= 0.16 checkpoints only q/k/v/mask and drops DSA's x/qr.
+        hidden_states = extra_kwargs['x']
+        q_compressed = extra_kwargs['qr']
+
+        def custom_forward(query, key, value, attention_mask, hidden_states, q_compressed):
+            return self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params=packed_seq_params,
+                attn_mask_type=attn_mask_type,
+                x=hidden_states,
+                qr=q_compressed,
+            )
+
+        return tensor_parallel.checkpoint(custom_forward, False, query, key, value, attention_mask, hidden_states,
+                                          q_compressed)
 
     def get_query_key_value_tensors(
         self,
@@ -247,22 +283,30 @@ class MLASelfAttention(McoreMLASelfAttention):
         if thd_qkv_format and query.shape[-1] != v_dim:
             value = F.pad(value, [0, query.shape[-1] - v_dim])
             self.core_attention.hidden_size_per_attention_head_v = value.shape[-1]
+        extra_kwargs = {}
+        if self.config.experimental_attention_variant == 'dsa':
+            if packed_seq_params is not None or self.config.context_parallel_size > 1:
+                raise ImportError('Please install the megatron-core main branch to support `DSAttention` '
+                                  'padding_free/context parallelism: '
+                                  '`pip install git+https://github.com/NVIDIA/Megatron-LM.git`')
+            # For dsa we need to pass in the original hidden states and the compressed
+            # query representation. Selective core-attention recompute has to see the
+            # same arguments; the base checkpoint call does not forward them.
+            extra_kwargs['x'] = hidden_states
+            extra_kwargs['qr'] = q_compressed
+            # for easy injection of rotary_pos_emb (patch)
+            packed_seq_params = (packed_seq_params, rotary_pos_emb)
         if self.checkpoint_core_attention and self.training:
-            core_attn_out = self._checkpointed_attention_forward(
-                query, key, value, attention_mask, packed_seq_params=packed_seq_params)
+            core_attn_out = self._checkpoint_mla_core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                packed_seq_params,
+                attn_mask_type,
+                extra_kwargs,
+            )
         else:
-            extra_kwargs = {}
-            if self.config.experimental_attention_variant == 'dsa':
-                if packed_seq_params is not None or self.config.context_parallel_size > 1:
-                    raise ImportError('Please install the megatron-core main branch to support `DSAttention` '
-                                      'padding_free/context parallelism: '
-                                      '`pip install git+https://github.com/NVIDIA/Megatron-LM.git`')
-                # For dsa we need to pass in the original hidden states and the compressed
-                # query representation.
-                extra_kwargs['x'] = hidden_states
-                extra_kwargs['qr'] = q_compressed
-                # for easy injection of rotary_pos_emb (patch)
-                packed_seq_params = (packed_seq_params, rotary_pos_emb)
             core_attn_out = self.core_attention(
                 query,
                 key,
