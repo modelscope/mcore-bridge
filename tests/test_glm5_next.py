@@ -3,6 +3,7 @@ import math
 import os
 import pytest
 import statistics
+import sys
 import tempfile
 import torch
 import torch.nn.functional as F
@@ -11,7 +12,7 @@ from contextlib import contextmanager
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
@@ -327,6 +328,46 @@ def test_glm5_registers_only_the_composite_model_type():
     assert get_model_meta('glm5_next').is_multimodal
     # `glm5_next_text` is the text sub-config's own model_type; deliberately not a registry key.
     assert get_mcore_model_type('glm5_next_text') is None
+
+
+@pytest.mark.parametrize('transformer_has_kda,layer_has_kda,missing_field', [
+    pytest.param(True, None, None, id='legacy-config-without-layer-module'),
+    pytest.param(False, True, None, id='kda-layer-config'),
+    pytest.param(False, False, 'kda_two_stage_gates', id='missing-from-both-configs'),
+    pytest.param(False, None, 'kda_two_stage_gates', id='missing-layer-module'),
+    pytest.param(False, True, 'mhc_keep_mappings_in_fp32', id='other-required-field-still-checked'),
+])
+def test_glm5_hybrid_guard_kda_config_locations(monkeypatch, transformer_has_kda, layer_has_kda, missing_field):
+    """Accept either Core field layout without bypassing the remaining capability checks."""
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    import mcore_bridge.model.mm_gpts.glm5_next as glm5_next
+
+    # Isolate field validation from the unchanged HybridModel/API probes. No model or process group
+    # is needed; synthetic metadata makes the cases independent of the installed Core version.
+    monkeypatch.setattr(glm5_next, '_HYBRID_API_PROBES', ())
+    fields = dict.fromkeys(glm5_next._PATCH_CONFIG_FIELDS)
+    if not transformer_has_kda:
+        fields.pop('kda_two_stage_gates')
+    if missing_field is not None:
+        fields.pop(missing_field, None)
+    monkeypatch.setattr(TransformerConfig, '__dataclass_fields__', fields)
+
+    module_name = 'megatron.core.models.hybrid.layers.utils'
+    layer_module = None
+    if layer_has_kda is not None:
+        layer_module = ModuleType(module_name)
+        layer_fields = {'kda_two_stage_gates': None} if layer_has_kda else {}
+        layer_config = SimpleNamespace(__dataclass_fields__=layer_fields)
+        layer_module.Symbols = SimpleNamespace(LAYER_CONFIG_MAP={'K': layer_config})
+    monkeypatch.setitem(sys.modules, module_name, layer_module)
+
+    if missing_field is None:
+        glm5_next.require_glm5_hybrid()
+    else:
+        with pytest.raises(ImportError, match=missing_field) as exc_info:
+            glm5_next.require_glm5_hybrid()
+        assert 'apply_megatron_patch' in str(exc_info.value)
 
 
 def test_glm5_config_wires_the_patched_dev_guard(monkeypatch):

@@ -75,7 +75,17 @@ def require_glm5_hybrid():
                           '  pip install -U git+https://github.com/NVIDIA/Megatron-LM.git@dev')
 
     from megatron.core.transformer.transformer_config import TransformerConfig
-    missing_fields = sorted(set(_PATCH_CONFIG_FIELDS) - TransformerConfig.__dataclass_fields__.keys())
+    available_fields = set(TransformerConfig.__dataclass_fields__)
+    if 'kda_two_stage_gates' not in available_fields:
+        try:
+            from megatron.core.models.hybrid.layers.utils import Symbols
+        except ImportError:
+            pass
+        else:
+            kda_config = Symbols.LAYER_CONFIG_MAP.get('K')
+            if 'kda_two_stage_gates' in getattr(kda_config, '__dataclass_fields__', {}):
+                available_fields.add('kda_two_stage_gates')
+    missing_fields = sorted(set(_PATCH_CONFIG_FIELDS) - available_fields)
     if missing_fields:
         raise ImportError(f'GLM-5.3 requires the Megatron patch shipped with mcore-bridge, which adds '
                           f'{missing_fields}. Apply it with:\n'
