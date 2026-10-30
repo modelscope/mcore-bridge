@@ -15,7 +15,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from mcore_bridge.config import ModelConfig
 
@@ -158,8 +158,18 @@ class GatedDeltaNet(_GatedDeltaNet):
             return None
         return cu_seqlens
 
-    def _set_linear_sequence_parallel(self, enabled: bool) -> list[tuple[nn.Module, bool]]:
-        saved: list[tuple[nn.Module, bool]] = []
+    def _set_linear_sequence_parallel(self, enabled: bool) -> list[tuple[Union[nn.Module, nn.Parameter], bool]]:
+        """Set ``sequence_parallel`` on the projections and on their parameters.
+
+        Transformer Engine reads the module attribute to choose between reduce-scatter and all-reduce for
+        the projection gradient, while Megatron's gradient finalizer reads ``param.sequence_parallel``
+        (``finalize_model_grads``) to decide whether that gradient still needs to be summed over the tensor
+        parallel group. Transformer Engine marks the parameters it wants reduced with the same flag, for
+        example ``layer_norm_weight`` in a ``LayerNormLinear``, so the two have to be toggled together:
+        with only the module attribute off, the projection all-reduces the gradient itself and the
+        finalizer sums the already complete copy again, which multiplies it by the tensor parallel size.
+        """
+        saved: list[tuple[Union[nn.Module, nn.Parameter], bool]] = []
         for name in ('in_proj', 'in_proj_qkvz', 'in_proj_ba', 'out_proj'):
             module = getattr(self, name, None)
             if module is None:
@@ -168,11 +178,23 @@ class GatedDeltaNet(_GatedDeltaNet):
                 if hasattr(sub, 'sequence_parallel'):
                     saved.append((sub, sub.sequence_parallel))
                     sub.sequence_parallel = enabled
+                for param in sub.parameters(recurse=False):
+                    if hasattr(param, 'sequence_parallel'):
+                        saved.append((param, param.sequence_parallel))
+                        param.sequence_parallel = enabled
         return saved
 
-    def _restore_linear_sequence_parallel(self, saved: list[tuple[nn.Module, bool]]) -> None:
+    def _restore_linear_sequence_parallel(self, saved: list[tuple[Union[nn.Module, nn.Parameter], bool]]) -> None:
+        """Restore the module attributes; leave the parameters at ``enabled=False``.
+
+        The parameters are deliberately not restored. ``finalize_model_grads`` reads them after the
+        backward, long after ``forward`` returned and restored the modules, and this layer gathers the
+        sequence before the projections, so every tensor parallel rank holds the complete gradient for the
+        parameters marked here and the finalizer must not sum them again.
+        """
         for module, enabled in saved:
-            module.sequence_parallel = enabled
+            if isinstance(module, nn.Module):
+                module.sequence_parallel = enabled
 
     def forward(
         self,
