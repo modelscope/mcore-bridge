@@ -6,7 +6,6 @@ features are small CPU doubles. NEMOTRON_OMNI_HF_DIR enables additional tests of
 verbatim official projector/EVS code with only the RADIO tower replaced.
 """
 import ast
-import importlib.util
 import os
 import pytest
 import torch
@@ -357,22 +356,6 @@ def test_packed_rejected_before_vision(monkeypatch):
     with pytest.raises(NotImplementedError, match='padding_free false --packing false'):
         model(**_batch(), packed_seq_params=object())
     assert not model.visual.vision_projector.calls
-
-
-@pytest.mark.parametrize('missing,version', [(True, '0.18.2'), (False, '0.17.0')])
-def test_optional_hybrid_import_guard(monkeypatch, missing, version):
-    import megatron.core
-
-    from mcore_bridge.model.gpts import nemotron_h
-    monkeypatch.setattr(nemotron_h, '_HYBRID_MODEL_AVAILABLE', not missing)
-    monkeypatch.setattr(megatron.core, '__version__', version)
-    spec = importlib.util.spec_from_file_location('mcore_bridge.model.mm_gpts._omni_no_hybrid', omni.__file__)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert not module._OMNI_HYBRID_AVAILABLE
-    assert not hasattr(module, 'NemotronH_OmniGPTModel')
-    with pytest.raises(ImportError, match='megatron-core>=0.18.0'):
-        module.NemotronH_OmniLoader(_config())
 
 
 def test_canonical_parser_and_registration():

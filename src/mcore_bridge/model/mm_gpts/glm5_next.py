@@ -27,10 +27,10 @@ try:
 
     from ..hybrid_model import HybridModel
 except ImportError:
-    # Released Megatron has no hybrid stack for this model (0.18 has no mark_keep_in_fp32, 0.16 no
-    # models.hybrid). The package must still import for every other model, so fall back to a base
-    # that lets the class definitions below succeed; a GLM config is rejected before any of this is
-    # used, by require_glm5_hybrid(), which names the missing dev patch.
+    # Released Megatron has no hybrid stack for this model (0.18 has no mark_keep_in_fp32). The package
+    # must still import for every other model, so fall back to a base that lets the class definitions
+    # below succeed; a GLM config is rejected before any of this is used, by require_glm5_hybrid(),
+    # which names the missing dev patch.
     HybridModel = HybridStack = McoreMultiTokenPredictionLayer = object
     parse_hybrid_pattern = select_pipeline_segment = mark_keep_in_fp32 = None
 

@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import copy
 import math
-import megatron.core
 import os
 import torch
 import torch.nn.functional as F
@@ -20,20 +18,17 @@ from megatron.core.tensor_parallel.mappings import (copy_to_tensor_model_paralle
                                                     reduce_from_tensor_model_parallel_region)
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from packaging import version
 from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, split_cp_inputs
 
-from .mtp import prepare_mtp_loss_mask, process_mtp_loss_compat
+from .mtp import prepare_mtp_loss_mask, process_mtp_loss
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
-
-mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
-mcore_ge_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class OutputLayerLinear(TELinear):
@@ -323,7 +318,7 @@ class GPTModel(McoreGPTModel):
         full_attention_mask = attention_mask
         if isinstance(full_attention_mask, dict):
             full_attention_mask = full_attention_mask['full_attention']
-        if mcore_ge_016 and full_attention_mask is not None:
+        if full_attention_mask is not None:
             assert packed_seq_params is None
             padding_mask = full_attention_mask.all(dim=(1, 2))
             if self.config.context_parallel_size > 1:
@@ -526,7 +521,7 @@ class GPTModel(McoreGPTModel):
             # sees a clean mask (bridge historically filtered inside its loop).
             mtp_loss_mask = prepare_mtp_loss_mask(labels, loss_mask)
 
-            hidden_states = process_mtp_loss_compat(
+            hidden_states = process_mtp_loss(
                 hidden_states=hidden_states,
                 labels=labels,
                 loss_mask=mtp_loss_mask,
@@ -620,12 +615,8 @@ class GPTModel(McoreGPTModel):
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         assert not sharded_offsets, 'Unexpected sharded offsets'
-        if mcore_ge_016:
-            from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
-            metadata = ensure_metadata_has_dp_cp_group(metadata)
-            kwargs = {'tp_group': self.tp_group, 'dp_cp_group': metadata['dp_cp_group']}
-        else:
-            kwargs = {}
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        kwargs = {'tp_group': self.tp_group, 'dp_cp_group': metadata['dp_cp_group']}
         # Skip LanguageModule.sharded_state_dict to avoid KeyError on output_layer.weight.
         sharded_state_dict = super(LanguageModule, self).sharded_state_dict(prefix, sharded_offsets, metadata)
 

@@ -1,20 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
-from packaging import version
+from megatron.core.transformer.experimental_attention_variant.dsa import (DSAIndexerLossAutoScaler,
+                                                                          DSAIndexerLossLoggingHelper)
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention as McoreDSAttention
+from megatron.core.transformer.experimental_attention_variant.dsa import FusedDSAIndexerLoss, unfused_dsa_fn
 from typing import Optional
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
-
-try:
-    from megatron.core.transformer.experimental_attention_variant.dsa import (DSAIndexerLossAutoScaler,
-                                                                              DSAIndexerLossLoggingHelper)
-    from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention as McoreDSAttention
-    from megatron.core.transformer.experimental_attention_variant.dsa import FusedDSAIndexerLoss, unfused_dsa_fn
-except ImportError:
-    McoreDSAttention = object
-
-mcore_ge_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class DSAttention(McoreDSAttention):

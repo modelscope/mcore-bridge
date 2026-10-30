@@ -12,7 +12,8 @@ from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils.safetensors import LazyTensor
 
 from ..constant import ModelType
-from ..gpts.nemotron_h import _HYBRID_MODEL_AVAILABLE, NemotronHBridge, NemotronHLoader
+from ..gpts.nemotron_h import NemotronHBridge, NemotronHLoader
+from ..hybrid_model import HybridModel
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
@@ -286,27 +287,22 @@ class NemoSpeechLMVit(HuggingFaceVit):
         return inputs_embeds.masked_scatter(audio_mask.unsqueeze(-1).expand_as(inputs_embeds), audio_embeds)
 
 
-if _HYBRID_MODEL_AVAILABLE:
-    from ..hybrid_model import HybridModel
+class NemoSpeechLMGPTModel(MultimodalGPTModel):
+    language_model_cls = HybridModel
 
-    class NemoSpeechLMGPTModel(MultimodalGPTModel):
-        language_model_cls = HybridModel
-
-        def __init__(self, config, *args, **kwargs):
-            bridge = config.bridge
-            config.bridge = None
-            try:
-                super().__init__(config, *args, **kwargs)
-            finally:
-                config.bridge = bridge
+    def __init__(self, config, *args, **kwargs):
+        bridge = config.bridge
+        config.bridge = None
+        try:
+            super().__init__(config, *args, **kwargs)
+        finally:
+            config.bridge = bridge
 
 
 class NemoSpeechLMLoader(NemotronHLoader):
-    model_cls = NemoSpeechLMGPTModel if _HYBRID_MODEL_AVAILABLE else None
+    model_cls = NemoSpeechLMGPTModel
 
     def __init__(self, config):
-        if not _HYBRID_MODEL_AVAILABLE:
-            raise ImportError('Nemotron Transcribe requires megatron-core with models.hybrid support.')
         if config.context_parallel_size > 1:
             raise NotImplementedError('Nemotron Transcribe requires --context_parallel_size 1.')
         if config.mtp_num_layers and not getattr(config, 'mtp_use_repeated_layer', False):
@@ -319,15 +315,14 @@ class NemoSpeechLMLoader(NemotronHLoader):
         super().__init__(config)
 
 
-if _HYBRID_MODEL_AVAILABLE:
-    register_model(
-        ModelMeta(
-            ModelType.nemo_speechlm, ['nemo_speechlm'],
-            bridge_cls=NemoSpeechLMBridge,
-            visual_cls=NemoSpeechLMVit,
-            loader=NemoSpeechLMLoader,
-            config_cls=NemoSpeechLMConfig,
-            mtp_prefix='llm.mtp.layers',
-            mtp_depth_field='mtp.num_nextn_predict_layers',
-            mtp_repeated_field='mtp.use_repeated_layer',
-            mtp_layers_per_depth=2))
+register_model(
+    ModelMeta(
+        ModelType.nemo_speechlm, ['nemo_speechlm'],
+        bridge_cls=NemoSpeechLMBridge,
+        visual_cls=NemoSpeechLMVit,
+        loader=NemoSpeechLMLoader,
+        config_cls=NemoSpeechLMConfig,
+        mtp_prefix='llm.mtp.layers',
+        mtp_depth_field='mtp.num_nextn_predict_layers',
+        mtp_repeated_field='mtp.use_repeated_layer',
+        mtp_layers_per_depth=2))

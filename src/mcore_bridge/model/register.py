@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import megatron.core
 from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
@@ -12,7 +11,6 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec,
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
-from packaging import version
 from torch import nn
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
@@ -149,14 +147,6 @@ class ModelLoader:
             self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
         return adapt_mtp_block_spec(self.config, mtp_block_spec)
 
-    def _set_shared_expert_gate(self, transformer_layer_spec):
-        mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
-        if (not mcore_ge_016 and self.config.moe_shared_expert_gate and self.config.num_moe_experts
-                and self.config.moe_shared_expert_intermediate_size):
-            for layer_spec in transformer_layer_spec.layer_specs:
-                if hasattr(layer_spec.submodules.mlp.submodules, 'shared_experts'):
-                    layer_spec.submodules.mlp.submodules.shared_experts.params = {'gate': True}
-
     def _set_transformer_layer(self, transformer_layer_spec):
         if self.config.enable_hyper_connections:
             return
@@ -194,7 +184,6 @@ class ModelLoader:
         vp_stage: Optional[int] = None,
     ) -> Union['GPTModel', 'MultimodalGPTModel']:
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
-        self._set_shared_expert_gate(transformer_layer_spec)
         self._set_transformer_layer(transformer_layer_spec)
         self._replace_mla_attention(transformer_layer_spec)
         self._replace_router(transformer_layer_spec)

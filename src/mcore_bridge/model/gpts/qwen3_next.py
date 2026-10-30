@@ -14,7 +14,7 @@ from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.utils import deprecate_inference_params, is_fa_min_version
+from megatron.core.utils import deprecate_inference_params, is_fa_min_version, nvtx_range_pop, nvtx_range_push
 from transformers.utils import is_torch_npu_available
 from typing import Optional, Tuple, Union
 
@@ -173,16 +173,6 @@ class Qwen3NextSelfAttention(SelfAttention):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
-        try:
-            from megatron.core.utils import nvtx_range_pop, nvtx_range_push
-        except ImportError:
-
-            def nvtx_range_pop(*args, **kwargs):
-                return
-
-            def nvtx_range_push(*args, **kwargs):
-                return
-
         # Check if we need to skip RoPE
         # no_rope is 0-indexed array and self.layer_number is 1-indexed
         if hasattr(self.config, 'no_rope_freq'):

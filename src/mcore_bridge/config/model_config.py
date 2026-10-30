@@ -5,11 +5,11 @@ import re
 import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
-from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
 
 from mcore_bridge.utils import get_logger, json_parse_to_dict
@@ -322,9 +322,6 @@ class ModelConfig(TransformerConfig):
         if self.hf_model_type == 'glm5_next':
             from mcore_bridge.model.mm_gpts.glm5_next import require_glm5_hybrid
             require_glm5_hybrid()
-        if self.experimental_attention_variant is not None:
-            require_version('megatron-core>=0.16.0.dev',
-                            'experimental attention variant requires megatron-core>=0.16.0')
         if isinstance(self.moe_router_dtype, str) and self.moe_router_dtype.lower() == 'none':
             self.moe_router_dtype = None
         if self.moe_shared_expert_intermediate_size == 0:
@@ -351,11 +348,6 @@ class ModelConfig(TransformerConfig):
             self.activation_func = F.silu
             self.gated_linear_unit = True
         if self.quick_geglu:
-            # megatron-core>=0.14.0
-            try:
-                from megatron.core.fusions.fused_bias_geglu import quick_gelu
-            except ImportError:
-                from megatron.core.activations import quick_gelu
             assert not self.swiglu
             self.gated_linear_unit = True
             self.activation_func = quick_gelu
@@ -373,32 +365,7 @@ class ModelConfig(TransformerConfig):
         if self.mtp_shared_weights:
             assert self.mtp_num_layers is not None and self.mtp_num_layers > 0, \
                 'mtp_shared_weights requires a positive mtp_num_layers'
-            if not hasattr(self, 'mtp_use_repeated_layer'):
-                # COMPAT(0.16): the field does not exist yet; the block provides the shim.
-                object.__setattr__(self, 'mtp_use_repeated_layer', True)
-            else:
-                self.mtp_use_repeated_layer = True
-        elif not hasattr(self, 'mtp_use_repeated_layer'):
-            object.__setattr__(self, 'mtp_use_repeated_layer', False)
-        if (self.mtp_use_repeated_layer and self.pipeline_model_parallel_layout is not None
-                and (self.mtp_num_layers or 0) > 1
-                and 'mtp_use_repeated_layer' not in TransformerConfig.__dataclass_fields__):
-            # MCore 0.16 only: its layout assert counts MTP entries against
-            # config.mtp_num_layers (the LOGICAL depth) while the bridge
-            # repeated-layer shim physically builds ONE layer -- with depth>1
-            # no consistent layout mapping exists.  Depth 1 is conflict-free
-            # (logical == physical == 1, the pre-migration behaviour) and stays
-            # allowed.  Note for 0.17+: upstream supports repeated layers
-            # natively but its layout assert still requires the custom layout
-            # to declare the LOGICAL depth in MTP entries; layouts written for
-            # the old shared semantics (one physical entry) must be updated
-            # accordingly -- upgrading alone does not remap them.
-            raise ValueError('mtp_shared_weights with mtp_num_layers > 1 and a custom '
-                             'pipeline_model_parallel_layout is not supported on megatron-core 0.16: '
-                             'the upstream layout assert counts MTP entries against the logical depth '
-                             'while the repeated-layer shim builds one physical layer. Use depth 1, '
-                             'drop the custom layout, or use megatron-core >= 0.17 with a layout that '
-                             'declares mtp_num_layers MTP entries.')
+            self.mtp_use_repeated_layer = True
         # Legacy alias kept for downstream code that still reads it
         self.mtp_unroll_steps = self.mtp_num_layers
         # ``num_nextn_predict_layers`` counts the draft layers for both DeepSeek's standard MTP and

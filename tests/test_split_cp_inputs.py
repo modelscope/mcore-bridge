@@ -33,18 +33,14 @@ def _load_megatron_utils():
 
     megatron = types.ModuleType('megatron')
     core = types.ModuleType('megatron.core')
-    core.__version__ = '0.16.1'
     megatron.core = core
     mpu = types.SimpleNamespace(get_context_parallel_world_size=lambda: 2, get_context_parallel_rank=lambda: 0)
     core.mpu = mpu
     core.tensor_parallel = types.SimpleNamespace()
-    distributed = types.ModuleType('megatron.core.distributed')
-    distributed.DistributedDataParallel = type('DDP', (), {})
-    distributed.FullyShardedDataParallel = type('FSDP', (), {})
+    core_utils = types.ModuleType('megatron.core.utils')
+    core_utils.unwrap_model = lambda models, module_instances=None: models
     ssm = types.ModuleType('megatron.core.ssm.mamba_context_parallel')
     ssm._undo_attention_load_balancing = lambda tensor, *args, **kwargs: tensor
-    module_mod = types.ModuleType('megatron.core.transformer.module')
-    module_mod.Float16Module = type('Float16Module', (), {})
     mtp = types.ModuleType('megatron.core.transformer.multi_token_prediction')
 
     def roll_tensor(tensor, shifts, dims):
@@ -58,11 +54,10 @@ def _load_megatron_utils():
     for name, module in {
             'megatron': megatron,
             'megatron.core': core,
-            'megatron.core.distributed': distributed,
+            'megatron.core.utils': core_utils,
             'megatron.core.ssm': types.ModuleType('megatron.core.ssm'),
             'megatron.core.ssm.mamba_context_parallel': ssm,
             'megatron.core.transformer': types.ModuleType('megatron.core.transformer'),
-            'megatron.core.transformer.module': module_mod,
             'megatron.core.transformer.multi_token_prediction': mtp,
             'megatron.core.transformer.transformer_block': block,
             'megatron.core.transformer.transformer_layer': layer,

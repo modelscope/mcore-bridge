@@ -12,6 +12,7 @@ from megatron.core.transformer import multi_token_prediction as _mtp_mod
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock as McoreMultiTokenPredictionBlock
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer
 from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
+from megatron.core.transformer.multi_token_prediction import process_mtp_loss as _upstream_process_mtp_loss
 from megatron.core.transformer.multi_token_prediction import roll_tensor as _upstream_roll_tensor
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,28 +20,32 @@ from mcore_bridge.utils import get_logger
 
 logger = get_logger()
 
-# MCore compatibility markers:
-#   COMPAT(<floor>)  only needed below <floor>; delete together with the matching
-#                    capability probe when the supported floor is raised.
-#   SEMANTICS        deliberate bridge behavior kept for legacy parity; not a bug.
-#   UPSTREAM         workaround for an upstream defect; drop once upstream fixes it.
+# MCore divergence markers:
+#   COMPAT(dev)  only needed for the unreleased Megatron-LM dev branch; the release
+#                path is unconditional.
+#   SEMANTICS    deliberate bridge behavior kept for legacy parity; not a bug.
+#   UPSTREAM     workaround for an upstream defect; drop once upstream fixes it.
+
+# `process_mtp_loss` gained `tp_group`/`input_ids` in 0.19 and more on dev. The bridge's
+# single call site passes them unconditionally, so the accepted set is probed once here.
+_PROCESS_MTP_LOSS_PARAMS = tuple(inspect.signature(_upstream_process_mtp_loss).parameters)
 
 
 @dataclass(frozen=True)
 class MtpCapabilities:
-    has_process_mtp_loss: bool = False
-    process_mtp_loss_params: Tuple[str, ...] = ()
+    """Signatures of the installed upstream MTP layer/block.
 
-    has_repeated_layer_config: bool = False
+    Releases (0.18/0.19) and dev disagree on what the layer forward accepts and
+    returns, so the bridge probes the installed code instead of branching on a
+    version number.
+    """
+
     has_detach_heads: bool = False
 
     layer_forward_params: Tuple[str, ...] = ()
     layer_returns_padding_mask: bool = False
 
     checkpointed_forward_accepts_padding_mask: bool = False
-    # COMPAT(0.17): 0.16/0.17 contract _checkpointed_forward(forward_func, *args, **kwargs),
-    # whose *kwargs.values() pass-through rejects non-tensor args.
-    checkpoint_takes_forward_func: bool = False
 
     block_forward_params: Tuple[str, ...] = ()
 
@@ -50,13 +55,8 @@ class MtpCapabilities:
     fingerprint: str = ''
 
     @property
-    def needs_repeated_shim(self) -> bool:
-        # COMPAT(0.17): mtp_use_repeated_layer was introduced in 0.17.
-        return not self.has_repeated_layer_config
-
-    @property
     def needs_padding_recompute_fix(self) -> bool:
-        # COMPAT(0.19): 0.18.x _checkpointed_forward has no padding_mask parameter.
+        # 0.18.x _checkpointed_forward has no padding_mask parameter.
         return (self.layer_returns_padding_mask and not self.checkpointed_forward_accepts_padding_mask)
 
 
@@ -81,26 +81,19 @@ def get_mtp_capabilities() -> MtpCapabilities:
     from megatron.core.transformer.transformer_config import TransformerConfig
     tc = TransformerConfig.__dataclass_fields__
 
-    proc = getattr(_mtp_mod, 'process_mtp_loss', None)
     layer_fwd = _params(McoreMultiTokenPredictionLayer.forward)
     ckpt = _params(getattr(McoreMultiTokenPredictionLayer, '_checkpointed_forward', None))
     block_fwd = _params(McoreMultiTokenPredictionBlock.forward)
 
     caps = MtpCapabilities(
-        has_process_mtp_loss=proc is not None,
-        process_mtp_loss_params=_params(proc),
-        has_repeated_layer_config='mtp_use_repeated_layer' in tc,
         has_detach_heads='mtp_detach_heads' in tc,
         layer_forward_params=layer_fwd,
         layer_returns_padding_mask='padding_mask' in layer_fwd,
         checkpointed_forward_accepts_padding_mask='padding_mask' in ckpt,
-        checkpoint_takes_forward_func='forward_func' in ckpt,
         block_forward_params=block_fwd,
         has_roll_context=hasattr(_mtp_mod, 'MTPSequenceRollContext'),
         has_mhc_multistream='mhc_multistream' in block_fwd,
-        fingerprint=(f'proc={proc is not None} rep={"mtp_use_repeated_layer" in tc} '
-                     f'pm={"padding_mask" in layer_fwd} ckpt_pm={"padding_mask" in ckpt} '
-                     f'ckpt_ff={"forward_func" in ckpt} '
+        fingerprint=(f'pm={"padding_mask" in layer_fwd} ckpt_pm={"padding_mask" in ckpt} '
                      f'roll_ctx={hasattr(_mtp_mod, "MTPSequenceRollContext")} '
                      f'mhc={"mhc_multistream" in block_fwd}'),
     )
@@ -141,19 +134,6 @@ def get_physical_mtp_depth(config) -> int:
     depth = getattr(config, 'mtp_num_layers', None) or 0
     repeated = getattr(config, 'mtp_use_repeated_layer', False) or getattr(config, 'mtp_shared_weights', False)
     return 1 if depth and repeated else depth
-
-
-def get_mtp_inner_layer(mtp_layer):
-    """Access the transformer/hybrid layer inside an MTP layer.
-
-    COMPAT(0.17): 0.16 calls it ``transformer_layer``, later versions
-    ``mtp_model_layer``; collapse this probe when the floor reaches 0.17.
-    """
-    for attr in ('mtp_model_layer', 'transformer_layer'):
-        inner = getattr(mtp_layer, attr, None)
-        if inner is not None:
-            return inner
-    return None
 
 
 class _PrecomputedEmbeddingStub:
@@ -239,12 +219,6 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
             if need_eh_fix:
                 submodules.eh_proj = saved_eh
 
-        if getattr(self, 'tp_group', None) is None:
-            # COMPAT(0.16): upstream leaves tp_group unset; without it sharded_state_dict
-            # resolves tp rank 0 on every rank and replicated enorm/hnorm collide.
-            from megatron.core import parallel_state
-            self.tp_group = parallel_state.get_tensor_model_parallel_group(check_initialized=False)
-
         if need_eh_fix:
             import transformer_engine
             from megatron.core.transformer.spec_utils import build_module
@@ -279,7 +253,7 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
         # from the sequence length (e.g. MLA get_cached_cos_sin) and would ignore
         # the shifted table; disabling fusion forces the table-consuming path.
         # Copy the config so the backbone keeps fusion enabled.
-        inner = get_mtp_inner_layer(self)
+        inner = self.mtp_model_layer
         attn = getattr(inner, 'self_attention', None) if inner else None
         if attn is not None and hasattr(attn, 'config'):
             attn.config = copy.copy(attn.config)
@@ -302,17 +276,6 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
                 return inner_orig_forward(*a, **kw)
 
             inner.forward = _inner_forward_with_extras
-
-    @property
-    def transformer_layer(self):
-        """Inner MTP block under whichever name the installed MCore registers it.
-
-        dev renamed the submodule to ``mtp_model_layer`` (checkpoints still key it as
-        ``transformer_layer``); 0.16-0.19 expose ``transformer_layer`` directly.
-        Callers (bridge export, tests) reference this name on every version.
-        """
-        # COMPAT(dev): dev renamed the submodule to mtp_model_layer.
-        return self._modules.get('mtp_model_layer', None) or self._modules.get('transformer_layer', None)
 
     def _get_inner_layer_kwargs(self, input_ids, position_ids):
         """Model-specific rolled inputs the inner transformer layer needs per depth."""
@@ -377,11 +340,10 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
             kwargs['embedding'] = _PrecomputedEmbeddingStub(kwargs['embedding'], placeholder)
         result = McoreMultiTokenPredictionLayer._get_embeddings(self, *args, **kwargs)
 
-        # Upstream returns 4 (0.16/0.17), 5 (0.18/0.19), or 6 (dev) values.
-        # Keep the tuple shape intact so the caller's unpacking matches, and
-        # retain mtp_input_mask when upstream provides it.
+        # Upstream returns 5 values on releases and 6 on dev (mtp_input_mask at
+        # index 3). Keep the tuple shape intact so the caller's unpacking matches.
         values = list(result)
-        if len(values) not in (4, 5, 6):
+        if len(values) not in (5, 6):
             raise ValueError(f'Unexpected _get_embeddings result length: {len(values)}')
         mtp_input_mask = values[3] if len(values) == 6 else None
         dec = values[-2]
@@ -448,15 +410,10 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
 
     def _checkpointed_forward(self, *args, **kwargs):
         caps = get_mtp_capabilities()
-        if caps.checkpoint_takes_forward_func:
-            # COMPAT(0.17): 0.16/0.17 splat *kwargs.values() into save_for_backward, which
-            # rejects non-tensors (PackedSeqParams) -> always bridge-owned.
-            forward_func = args[0] if args else kwargs.pop('forward_func')
-            return self._bridge_checkpoint(forward_func, kwargs, self._pending_extras)
         has_containers = any(isinstance(v, (dict, list, tuple)) for v in kwargs.values())
         if self._pending_extras or caps.needs_padding_recompute_fix or has_containers:
             # Bridge-owned when (a) extras must keep their graph boundary instead of
-            # being closure-captured through recompute, (b) COMPAT(0.19): 0.18.x lacks the
+            # being closure-captured through recompute, (b) 0.18.x lacks the
             # padding_mask parameter, or (c) a container (dict RoPE) would otherwise
             # be passed positionally into save_for_backward, which takes Tensor/None.
             return self._bridge_checkpoint(self._proj_and_transformer_layer, kwargs, self._pending_extras)
@@ -535,9 +492,8 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
 
     Per-forward bridge state lives on block attributes (no upstream block/layer
     forward takes ``**kwargs``) and is read by :class:`MultiTokenPredictionLayer` through a
-    back-reference.  On 0.16 the spec is trimmed to one physical layer and iterated
-    ``mtp_num_layers`` times; on dev (native ``roll_depth`` / ``mhc_multistream``)
-    the loop is delegated to upstream.
+    back-reference. Releases (0.18/0.19) get the manual per-depth loop; on dev
+    (native ``roll_depth`` / ``mhc_multistream``) the loop is delegated to upstream.
     """
 
     # Per-forward bridge state, consumed by MultiTokenPredictionLayer via _bridge_block.
@@ -546,13 +502,6 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
     _bridge_position_ids: Optional[torch.Tensor] = None
 
     def __init__(self, config, spec, *args, **kwargs):
-        caps = get_mtp_capabilities()
-        # COMPAT(0.16): no repeated-layer config yet; trim the spec to one physical set.
-        self._repeated_016 = (caps.needs_repeated_shim and getattr(config, 'mtp_use_repeated_layer', False))
-        if self._repeated_016:
-            sub = spec if not hasattr(spec, 'submodules') else spec.submodules
-            if hasattr(sub, 'layer_specs') and sub.layer_specs:
-                sub.layer_specs = sub.layer_specs[:1]
         super().__init__(config, spec, *args, **kwargs)
         for layer in self.layers:
             # Bypass nn.Module.__setattr__: a child registration would create a
@@ -609,7 +558,7 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
         return passed
 
     def _forward_tracked(self, input_ids, position_ids, hidden_states, attention_mask, mhc_multistream=None, **kwargs):
-        """COMPAT(<0.19 native loop): manual per-depth loop for releases without one."""
+        """Manual per-depth loop: releases' block forward accepts no per-depth hooks."""
         caps = get_mtp_capabilities()
         extra = dict(kwargs.pop('extra_block_kwargs', None) or {})
         kwargs = {**kwargs, **extra}
@@ -690,7 +639,7 @@ def prepare_mtp_loss_mask(labels: Optional[torch.Tensor], loss_mask: Optional[to
     return loss_mask & valid
 
 
-def process_mtp_loss_compat(
+def process_mtp_loss(
     hidden_states: torch.Tensor,
     labels: torch.Tensor,
     loss_mask: Optional[torch.Tensor],
@@ -704,74 +653,32 @@ def process_mtp_loss_compat(
     packed_seq_params=None,
     **extra,
 ) -> torch.Tensor:
-    """Dispatch to upstream ``process_mtp_loss`` (0.17+) or the 0.16 backport.
-    *loss_mask* must already exclude ``-100`` tokens; *output_layer* follows the
-    upstream convention ``(hs, weight=..., runtime_gather_output=...) -> (logits,
-    bias)``.  ``scale_logits_fn`` is never forwarded so the MTP loss stays in sync
+    """Call upstream ``process_mtp_loss`` with the kwargs the installed version declares.
+
+    This wrapper cannot be dropped: 0.18 has no ``tp_group``/``input_ids`` parameters, while
+    0.19+ and dev need them, and ``gpt_model`` passes them unconditionally so that one call site
+    serves every supported version. *loss_mask* must already exclude ``-100`` tokens;
+    *output_layer* follows the upstream convention ``(hs, weight=..., runtime_gather_output=...)
+    -> (logits, bias)``.  ``scale_logits_fn`` is never forwarded so the MTP loss stays in sync
     with the main loss (which does not apply MuP scaling).
     """
-    caps = get_mtp_capabilities()
-    if caps.has_process_mtp_loss:
-        from megatron.core.transformer.multi_token_prediction import process_mtp_loss
-        ok = set(caps.process_mtp_loss_params)
-        return process_mtp_loss(
-            hidden_states=hidden_states,
-            labels=labels,
-            loss_mask=loss_mask,
-            output_layer=output_layer,
-            output_weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-            is_training=is_training,
-            compute_language_model_loss=compute_language_model_loss,
-            config=config,
-            cp_group=cp_group,
-            packed_seq_params=packed_seq_params,
-            **{
-                k: v
-                for k, v in extra.items() if k in ok
-            })
-    return _loss_016(hidden_states, labels, loss_mask, output_layer, output_weight, runtime_gather_output, is_training,
-                     compute_language_model_loss, config, cp_group, packed_seq_params)
-
-
-def _loss_016(hidden_states, labels, loss_mask, output_layer, output_weight, runtime_gather_output, is_training,
-              compute_lm_loss, config, cp_group, packed_seq_params):
-    """COMPAT(0.16): backport of ``process_mtp_loss`` (landed upstream in 0.17)."""
-    from megatron.core import parallel_state
-    from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler, MTPLossLoggingHelper, roll_tensor
-
-    n = config.mtp_num_layers or 0
-    chunks = torch.chunk(hidden_states, 1 + n, dim=0)
-    hs = chunks[0]
-    if labels is None:
-        return hs
-
-    mtp_labels = labels.clone()
-    if loss_mask is None:
-        loss_mask = torch.ones_like(mtp_labels)
-    orig_tokens = loss_mask.sum()
-
-    for i in range(n):
-        logits, _ = output_layer(chunks[i + 1], weight=output_weight, runtime_gather_output=runtime_gather_output)
-        mtp_labels, _ = roll_tensor(
-            mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params)
-        loss_mask, ntok = roll_tensor(
-            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params)
-        loss = loss_mask * compute_lm_loss(mtp_labels, logits)
-        if is_training:
-            avg = (torch.sum(loss) / ntok if ntok > 0 else loss.new_tensor(0.0))
-            grp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-            if hasattr(MTPLossLoggingHelper, 'save_metrics_to_tracker'):
-                MTPLossLoggingHelper.save_metrics_to_tracker(avg, None, None, i, n, avg_group=grp)
-            else:
-                MTPLossLoggingHelper.save_loss_to_tracker(avg, i, n, avg_group=grp)
-        scale = config.mtp_loss_scaling_factor / n
-        safe = ntok.clamp(min=1)
-        if config.calculate_per_token_loss:
-            hs = MTPLossAutoScaler.apply(hs, scale * loss * (orig_tokens / safe))
-        else:
-            hs = MTPLossAutoScaler.apply(hs, scale * loss / safe)
-    return hs
+    accepted_kwargs = set(_PROCESS_MTP_LOSS_PARAMS)
+    return _upstream_process_mtp_loss(
+        hidden_states=hidden_states,
+        labels=labels,
+        loss_mask=loss_mask,
+        output_layer=output_layer,
+        output_weight=output_weight,
+        runtime_gather_output=runtime_gather_output,
+        is_training=is_training,
+        compute_language_model_loss=compute_language_model_loss,
+        config=config,
+        cp_group=cp_group,
+        packed_seq_params=packed_seq_params,
+        **{
+            k: v
+            for k, v in extra.items() if k in accepted_kwargs
+        })
 
 
 def adapt_mtp_block_spec(config, mtp_block_spec):

@@ -23,7 +23,6 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.utils import make_viewless_tensor, nvtx_range_pop, nvtx_range_push
 from torch import Tensor, nn
 from transformers import AutoModel, PretrainedConfig
-from transformers.utils.versions import require_version
 from typing import Optional, Tuple
 
 from mcore_bridge.bridge import MultimodalGPTBridge
@@ -391,7 +390,6 @@ class Gemma4MLP(MLP):
 class Gemma4MoELayer(MoELayer):
 
     def __init__(self, config, *args, **kwargs):
-        require_version('megatron-core>=0.16.0.dev', 'Gemma4MoELayer requires megatron-core>=0.16.0')
         super().__init__(config, *args, **kwargs)
         self.pre_feedforward_layernorm_2 = build_module(
             TENorm, hidden_size=config.hidden_size, config=config, eps=config.layernorm_epsilon)

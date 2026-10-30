@@ -666,7 +666,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         # Inner block: a full-attention + MoE Qwen4ExpLayer with its own gated hyper-connections.
         # layer_idx=-1 routes _set_layer_attn through linear_attention_freq[-1] (the backbone's last
         # layer, full_attention), matching the MTP head, which is always full-attention.
-        inner = None if mtp_layer is None else mtp_layer.transformer_layer
+        inner = None if mtp_layer is None else mtp_layer.mtp_model_layer
         hf_state_dict.update(self._set_layer_attn(inner, hf_state_dict, -1, to_mcore))
         hf_state_dict.update(self._set_layer_mlp(inner, hf_state_dict, -1, to_mcore, is_mtp=True))
         self._set_layer_hc(inner, hf_state_dict, to_mcore)

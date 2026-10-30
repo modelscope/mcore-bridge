@@ -72,7 +72,7 @@ def test_mtp_block_patch_noop_without_mtp():
 
 
 def test_get_embeddings_preserves_upstream_tuple_shape(monkeypatch):
-    """The override must mirror 4/5/6-value upstream returns, including mtp_input_mask."""
+    """The override must mirror 5/6-value upstream returns, including mtp_input_mask."""
 
     class _EmbeddingLayer(MultiTokenPredictionLayer):
 
@@ -94,7 +94,7 @@ def test_get_embeddings_preserves_upstream_tuple_shape(monkeypatch):
     pmask = torch.zeros(1, 2, dtype=torch.bool)
     mtp_mask = torch.ones(1, 2, dtype=torch.bool)
 
-    for result in ((ids, ids, dec, hs), (ids, ids, pmask, dec, hs), (ids, ids, pmask, mtp_mask, dec, hs)):
+    for result in ((ids, ids, pmask, dec, hs), (ids, ids, pmask, mtp_mask, dec, hs)):
         monkeypatch.setattr(
             mtp_mod.McoreMultiTokenPredictionLayer, '_get_embeddings', lambda *args, _result=result, **kwargs: _result)
         out = layer._get_embeddings(input_ids=ids, position_ids=ids)

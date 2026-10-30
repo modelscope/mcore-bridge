@@ -1,4 +1,4 @@
-megatron-core>=0.16,<0.21
+megatron-core>=0.18,<0.21
 modelscope
 peft>=0.11,<0.21
 safetensors
