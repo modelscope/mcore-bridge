@@ -308,6 +308,13 @@ def test_glm5_parser_preserves_heterogeneous_schedules():
     assert parsed['linear_lower_bound'] == -5.0
     assert parsed['index_kpool'] == 2
     assert parsed['moe_router_load_balancing_type'] == 'none'
+    assert parsed['enable_hyper_connections'] is True
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    if 'enable_mhc_connections' in TransformerConfig.__dataclass_fields__:
+        assert parsed['enable_mhc_connections'] is True
+        assert parsed['mhc_num_residual_streams'] == parsed['num_residual_streams'] == 4
+    else:
+        assert 'enable_mhc_connections' not in parsed
     # The fp32 MoE router comes from ModelConfig's own default; restating it in the parser
     # would be a second source of truth that can drift.
     assert 'moe_router_dtype' not in parsed
@@ -520,6 +527,46 @@ def test_glm5_mtp_layer_is_filtered_only_when_mtp_disabled():
     bridge_mtp.config = SimpleNamespace(num_layers=90, mtp_num_layers=1)
     kept = bridge_mtp._convert_hf_state_dict(dict(state), True)
     assert 'model.language_model.layers.45.input_layernorm.weight' in kept
+
+
+def test_glm5_bridge_deepcopy_shares_the_instance():
+    import copy
+
+    from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextBridge
+
+    class UncopyableProcessGroup:
+
+        def __deepcopy__(self, memo):
+            raise TypeError('process group cannot be pickled')
+
+    bridge = object.__new__(Glm5NextBridge)
+    bridge.tp_group = UncopyableProcessGroup()
+    config = SimpleNamespace(bridge=bridge, mutable=[1])
+    copied = copy.deepcopy(config.__dict__)
+    assert copied['bridge'] is bridge
+    assert copied['mutable'] == config.mutable
+    assert copied['mutable'] is not config.mutable
+
+
+def test_glm5_mtp_layer_disables_mhc_flags(monkeypatch):
+    from mcore_bridge.model.mm_gpts import glm5_next as glm5_next_mod
+
+    if glm5_next_mod.McoreMultiTokenPredictionLayer is object:
+        pytest.skip('hybrid MTP class unavailable')
+
+    captured = {}
+
+    def fake_init(self, config, *args, **kwargs):
+        captured['config'] = config
+
+    monkeypatch.setattr(glm5_next_mod.McoreMultiTokenPredictionLayer, '__init__', fake_init)
+    cfg = SimpleNamespace(enable_hyper_connections=True, enable_mhc_connections=True)
+    glm5_next_mod.Glm5NextMultiTokenPredictionLayer(cfg)
+    assert captured['config'] is not cfg
+    assert captured['config'].enable_hyper_connections is False
+    assert captured['config'].enable_mhc_connections is False
+    assert cfg.enable_hyper_connections is True
+    assert cfg.enable_mhc_connections is True
 
 
 def _build_glm_mtp_model(mtp=1, moe=True, dtype=torch.float32, tp=1, pp=1, ep=1, cp=1, sequence_parallel=False, seed=5):

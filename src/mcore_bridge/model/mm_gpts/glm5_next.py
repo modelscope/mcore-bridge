@@ -156,6 +156,9 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
     def __init__(self, config, *args, **kwargs):
         mtp_config = copy.copy(config)
         mtp_config.enable_hyper_connections = False
+        # Main builds mHC from enable_mhc_connections; PyPI Core through 0.19.2 does not declare it.
+        if hasattr(mtp_config, 'enable_mhc_connections'):
+            mtp_config.enable_mhc_connections = False
         super().__init__(mtp_config, *args, **kwargs)
 
     def _get_embeddings(self,
@@ -390,6 +393,12 @@ class Glm5NextBridge(MultimodalGPTBridge):
         'q_proj', 'k_proj', 'v_proj', 'beta_proj', 'f_b_proj', 'g_b_proj', 'linear_q_up_proj', 'linear_kv_up_proj'
     }
     additional_dim1_keys = {'o_proj', 'linear_proj'}
+
+    def __deepcopy__(self, memo):
+        # ModelConfig already shares `bridge`. Core `from_config` copies `__dict__` instead, which
+        # would pickle process groups held by this object.
+        memo[id(self)] = self
+        return self
 
     def _set_kda_qkv_lora(self, mg_attn, hf_state_dict, to_mcore: bool):
         """Map fused KDA adapters with shared A and rank-local [Q, K, V] rows in B."""
