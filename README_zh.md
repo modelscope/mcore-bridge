@@ -213,6 +213,10 @@ if is_rank0:
     hf_config.save_pretrained(output_dir)
 ```
 
+### 直接导出 DCP checkpoint
+
+对于 BF16 全参、TP1、纯文本 DeepSeek V4.1 checkpoint，`export_checkpoint` 直接从 DCP 记录写入 HF safetensors，不构造完整模型。参阅 [CPU 导出用法、内存开销与支持格式](docs/deepseek_v41_dcp_export_zh.md)。
+
 ### 使用Peft
 
 Mcore-Bridge完全兼容使用[Peft](https://github.com/huggingface/peft)进行LoRA训练。以下介绍如何使用peft准备PeftModel，并保存增量权重。

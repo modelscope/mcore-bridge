@@ -217,6 +217,10 @@ if is_rank0:
     hf_config.save_pretrained(output_dir)
 ```
 
+### Direct DCP checkpoint export
+
+For BF16 full-parameter, TP1, language-only DeepSeek V4.1 checkpoints, `export_checkpoint` writes HF safetensors directly from DCP records without constructing the complete model. See [CPU export usage, memory tradeoffs and supported formats](docs/deepseek_v41_dcp_export.md).
+
 ### Using Peft
 
 Mcore-Bridge is fully compatible with [Peft](https://github.com/huggingface/peft) for LoRA training. The following introduces how to use Peft to prepare a PeftModel and save the incremental weights.
