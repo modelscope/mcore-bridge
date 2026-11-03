@@ -1,10 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
+import copy
 import dataclasses
 import torch
 from torch import Tensor
 
+from ...utils import get_logger, use_ngram_embedding_cpu_offload
 from ...utils.megatron_utils import split_cp_inputs
 
 try:
@@ -238,10 +240,24 @@ def _build_ngram_hashes(
 class DeepseekV41Engram(Engram):
     """DeepSeek V4.1 Engram without projection bias or the Qwen short-conv branch."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         if EngramConfig is None:
             raise RuntimeError('The installed Megatron-Core does not provide Engram.')
-        super().__init__(*args, **kwargs)
+        cpu_offload = use_ngram_embedding_cpu_offload()
+        init_config = copy.copy(config) if cpu_offload else config
+        if cpu_offload:
+            init_config.use_cpu_initialization = True
+        super().__init__(init_config, *args, **kwargs)
+        if cpu_offload:
+            from .engram_cpu import retain_tables_on_cpu
+            retain_tables_on_cpu(self.embedding)
+            get_logger().warning_once('DeepSeek-V4.1 Engram embedding tables are frozen on CPU; '
+                                      'only requested rows are transferred to the accelerator.')
+            self.config = self.embedding.config = config
+            for table in self.embedding.tables:
+                table.config = config
+            if not config.use_cpu_initialization:
+                self.to(device=torch.cuda.current_device())
         # PR #7231's DeepSeek variant predates the released V4.1 checkpoint layout.
         # Keep its initialized weights but remove parameters absent from that checkpoint.
         self.value_projection.register_parameter('bias', None)
