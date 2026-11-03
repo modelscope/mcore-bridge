@@ -42,6 +42,15 @@ class MtpCapabilities:
 
     has_detach_heads: bool = False
 
+    # Knobs that differ across 0.20 / main / dev; gate on these, not on version numbers.
+    has_mtp_hybrid_override_pattern: bool = False
+    has_freeze_base_model_for_mtp: bool = False
+    has_mtp_loss_early_backward: bool = False
+    has_keep_mtp_in_bf16: bool = False
+
+    # `_get_embeddings` gained a trailing `mtp_input_mask`; 0.18/0.19 still return five values.
+    has_layer_input_mask: bool = False
+
     layer_forward_params: Tuple[str, ...] = ()
     layer_returns_padding_mask: bool = False
 
@@ -82,20 +91,30 @@ def get_mtp_capabilities() -> MtpCapabilities:
     tc = TransformerConfig.__dataclass_fields__
 
     layer_fwd = _params(McoreMultiTokenPredictionLayer.forward)
+    emb_fwd = _params(getattr(McoreMultiTokenPredictionLayer, '_get_embeddings', None))
     ckpt = _params(getattr(McoreMultiTokenPredictionLayer, '_checkpointed_forward', None))
     block_fwd = _params(McoreMultiTokenPredictionBlock.forward)
+    has_roll_context = hasattr(_mtp_mod, 'MTPSequenceRollContext')
 
     caps = MtpCapabilities(
         has_detach_heads='mtp_detach_heads' in tc,
+        has_mtp_hybrid_override_pattern='mtp_hybrid_override_pattern' in tc,
+        has_freeze_base_model_for_mtp='freeze_base_model_for_mtp' in tc,
+        has_mtp_loss_early_backward='mtp_loss_early_backward' in tc,
+        has_keep_mtp_in_bf16='keep_mtp_in_bf16' in tc,
+        has_layer_input_mask='mtp_input_mask' in emb_fwd,
         layer_forward_params=layer_fwd,
         layer_returns_padding_mask='padding_mask' in layer_fwd,
         checkpointed_forward_accepts_padding_mask='padding_mask' in ckpt,
         block_forward_params=block_fwd,
-        has_roll_context=hasattr(_mtp_mod, 'MTPSequenceRollContext'),
+        has_roll_context=has_roll_context,
         has_mhc_multistream='mhc_multistream' in block_fwd,
         fingerprint=(f'pm={"padding_mask" in layer_fwd} ckpt_pm={"padding_mask" in ckpt} '
-                     f'roll_ctx={hasattr(_mtp_mod, "MTPSequenceRollContext")} '
-                     f'mhc={"mhc_multistream" in block_fwd}'),
+                     f'roll_ctx={has_roll_context} mhc={"mhc_multistream" in block_fwd} '
+                     f'hybrid_pat={"mtp_hybrid_override_pattern" in tc} '
+                     f'early_bwd={"mtp_loss_early_backward" in tc} '
+                     f'keep_bf16={"keep_mtp_in_bf16" in tc} '
+                     f'layer_input_mask={"mtp_input_mask" in emb_fwd}'),
     )
     logger.debug(f'MTP capabilities: {caps.fingerprint}')
     return caps
@@ -653,23 +672,14 @@ def process_mtp_loss(
     packed_seq_params=None,
     **extra,
 ) -> torch.Tensor:
-    """Call upstream ``process_mtp_loss`` with the kwargs the installed version declares.
-
-    This wrapper cannot be dropped: 0.18 has no ``tp_group``/``input_ids`` parameters, while
-    0.19+ and dev need them, and ``gpt_model`` passes them unconditionally so that one call site
-    serves every supported version. *loss_mask* must already exclude ``-100`` tokens;
-    *output_layer* follows the upstream convention ``(hs, weight=..., runtime_gather_output=...)
-    -> (logits, bias)``.  ``scale_logits_fn`` is never forwarded so the MTP loss stays in sync
-    with the main loss (which does not apply MuP scaling).
-    """
     accepted_kwargs = set(_PROCESS_MTP_LOSS_PARAMS)
+    optional_kwargs = {'runtime_gather_output': runtime_gather_output, **extra}
     return _upstream_process_mtp_loss(
         hidden_states=hidden_states,
         labels=labels,
         loss_mask=loss_mask,
         output_layer=output_layer,
         output_weight=output_weight,
-        runtime_gather_output=runtime_gather_output,
         is_training=is_training,
         compute_language_model_loss=compute_language_model_loss,
         config=config,
@@ -677,7 +687,7 @@ def process_mtp_loss(
         packed_seq_params=packed_seq_params,
         **{
             k: v
-            for k, v in extra.items() if k in accepted_kwargs
+            for k, v in optional_kwargs.items() if k in accepted_kwargs
         })
 
 

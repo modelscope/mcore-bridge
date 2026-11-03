@@ -1,37 +1,21 @@
 # ============================================================================
 # Megatron-LM patch for GLM-5.3-Flash (shipped with mcore-bridge)
 # ============================================================================
-# Upstream base / TESTED ON:
-#   NVIDIA/Megatron-LM dev @ a5aa637fa5dbe2b08af7b413e32306dbc086aa01
-#   (megatron-core 0.20.0+a5aa637fa, 2026-10-22)
-#
-# Rebasing history: originally generated against dev ee743d3ef, rebased onto the
-# base commit above on 2026-10-23 (7 files, 30 hunks).
-#
-# Install / verify (source checkout or wheel):
-#   pip install --no-cache-dir \
-#     "git+https://github.com/NVIDIA/Megatron-LM.git@a5aa637fa5dbe2b08af7b413e32306dbc086aa01"
-#   python -m mcore_bridge.tools.apply_megatron_patch --check   # verify only
-#   python -m mcore_bridge.tools.apply_megatron_patch           # apply
-#   python -m mcore_bridge.tools.apply_megatron_patch --root <megatron-src-root>
-#
-# Still required here (upstream PRs not merged yet):
-#   * #7054  KDA two-stage gates, kda_disable_fp8, KDALayerConfig / K layer symbol
-#   * #7521  mHC precision controls (mhc_keep_mappings_in_fp32, learned output contract)
-#   * GLM's parameter-free mHC output mean + KDA in_proj width derivation
-#
-# Dropped from this rebase because upstream a5aa637fa already carries them:
-#   * dsa.py: upstream now ships a more complete KPool/NoPE implementation
-#   * optimizer/{__init__,clip_grads,optimizer}.py: expert-TP shard dedup and
-#     fp32-master allreduce backport
-#   * tests/unit_tests/tensor_parallel/test_layers.py (test-only)
+# Base: NVIDIA/Megatron-LM dev @ c4220af3a6 (2026-10-29)
+#  - dropped the `dsa_indexer_kpool*` hunk: upstream declares both since the 10-27 sync
+#  - GDN `in_proj.base_layer.weight` lookup so LoRA tuners can shard/save
+#  - re-entrant checkpoint guard in `core/recompute.py`: without an input gradient (frozen
+#    embedding) the chunk silently loses every parameter gradient
+# Not yet upstreamed: KDA two-stage gates / KDALayerConfig (#7054), mHC precision (#7521),
+#   GLM's parameter-free mHC output mean and KDA in_proj width derivation.
+# Apply: python -m mcore_bridge.tools.apply_megatron_patch [--check] [--root <megatron root>]
 # ============================================================================
 
 diff --git a/megatron/core/models/hybrid/hybrid_block.py b/megatron/core/models/hybrid/hybrid_block.py
-index f51a6180b..e94d3975f 100644
+index 8d596cbe9..591ce5d69 100644
 --- a/megatron/core/models/hybrid/hybrid_block.py
 +++ b/megatron/core/models/hybrid/hybrid_block.py
-@@ -420,14 +420,15 @@ class HybridStack(MegatronModule):
+@@ -424,14 +424,15 @@ class HybridStack(MegatronModule):
          if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
              hc_mult = self.config.mhc_num_residual_streams
              hc_dim = self.config.hidden_size * hc_mult
@@ -55,7 +39,7 @@ index f51a6180b..e94d3975f 100644
  
          self._execution_layer_indices = list(range(len(self.layers)))
          if self.config.moe_shortcut_connection:
-@@ -937,14 +938,20 @@ class HybridStack(MegatronModule):
+@@ -927,14 +928,20 @@ class HybridStack(MegatronModule):
          if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
              if (self.config.mtp_num_layers or 0) > 0:
                  mhc_multistream = hidden_states
@@ -84,8 +68,24 @@ index f51a6180b..e94d3975f 100644
  
          # Final layer norm.
          if self.post_process and self.post_layer_norm:
+diff --git a/megatron/core/recompute.py b/megatron/core/recompute.py
+index 03c0149a5..7b19e1a06 100644
+--- a/megatron/core/recompute.py
++++ b/megatron/core/recompute.py
+@@ -195,6 +195,11 @@ def checkpointed_forward(
+             input_ids,
+         )
+         if use_checkpoint:
++            if not hidden_states.requires_grad:
++                # Re-entrant checkpointing skips recompute (and drops the chunk's grads) when no
++                # input carries a gradient, e.g. a frozen embedding under LoRA.
++                hidden_states = hidden_states.detach().requires_grad_(True)
++                args = (hidden_states, *args[1:])
+             hidden_states, context = precision_aware_checkpoint(
+                 cf,
+                 self.config,
 diff --git a/megatron/core/ssm/gated_delta_net/common.py b/megatron/core/ssm/gated_delta_net/common.py
-index e9285453d..973573f42 100644
+index e9285453d..ed4e0ac72 100644
 --- a/megatron/core/ssm/gated_delta_net/common.py
 +++ b/megatron/core/ssm/gated_delta_net/common.py
 @@ -279,7 +279,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
@@ -99,6 +99,31 @@ index e9285453d..973573f42 100644
  
          if self.config.fp8:
              fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
+@@ -664,14 +666,20 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
+ 
+         # At this point the TP sharding is correctly defined for each tensor, but some of the
+         # tensors must be additionally split into separate parts
++        # A LoRA tuner publishes `in_proj.base_layer.weight` instead of `in_proj.weight`.
++        in_proj_key = f"{prefix}in_proj.weight"
++        if in_proj_key not in sharded_state_dict:
++            base_key = f"{prefix}in_proj.base_layer.weight"
++            if base_key in sharded_state_dict:
++                in_proj_key = base_key
+         in_proj_dim_local_tp = self.in_proj_dim // self.tp_size
+-        assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim_local_tp, (
++        assert sharded_state_dict[in_proj_key].data.size(0) == in_proj_dim_local_tp, (
+             in_proj_dim_local_tp,
+-            sharded_state_dict[f"{prefix}in_proj.weight"],
++            sharded_state_dict[in_proj_key],
+         )
+ 
+-        sharded_state_dict[f"{prefix}in_proj.weight"] = _split_tensor_factory(
+-            sharded_state_dict[f"{prefix}in_proj.weight"],
++        sharded_state_dict[in_proj_key] = _split_tensor_factory(
++            sharded_state_dict[in_proj_key],
+             list(self.in_proj_split_sections),
+             self.in_proj_split_names,
+             0,
 diff --git a/megatron/core/ssm/gated_delta_net/kda.py b/megatron/core/ssm/gated_delta_net/kda.py
 index dfa49da69..6999ee38d 100644
 --- a/megatron/core/ssm/gated_delta_net/kda.py
@@ -323,7 +348,7 @@ index dfa49da69..6999ee38d 100644
 +            self.g_a_proj.backward_dw()
 +            self.g_b_proj.backward_dw()
 diff --git a/megatron/core/tensor_parallel/layers.py b/megatron/core/tensor_parallel/layers.py
-index 073857ae7..9b1c945db 100644
+index 9246894ea..63d9101b9 100644
 --- a/megatron/core/tensor_parallel/layers.py
 +++ b/megatron/core/tensor_parallel/layers.py
 @@ -235,6 +235,14 @@ def copy_tensor_model_parallel_attributes(destination_tensor, source_tensor):
@@ -428,10 +453,10 @@ index 28d93bd0c..27c7c9866 100644
                  # q_no_pe: [num_tokens, n, qk_head_dim]
                  # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
 diff --git a/megatron/core/transformer/hyper_connection.py b/megatron/core/transformer/hyper_connection.py
-index c78a3adbb..b5f409d16 100644
+index bd7cdbacb..aba05b17f 100644
 --- a/megatron/core/transformer/hyper_connection.py
 +++ b/megatron/core/transformer/hyper_connection.py
-@@ -193,11 +193,30 @@ def native_h_post_bda(
+@@ -180,11 +180,30 @@ def native_h_post_bda(
      return x_expanded + mixed
  
  
@@ -463,7 +488,7 @@ index c78a3adbb..b5f409d16 100644
      norm = x.norm(dim=-1, keepdim=True)
      K = x.shape[-1]
      v = norm / math.sqrt(K) + eps
-@@ -313,7 +332,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -300,7 +319,7 @@ class HyperConnectionModule(MegatronModule):
          mark_keep_in_fp32(self.alpha_post)
          mark_keep_in_fp32(self.alpha_res)
          mark_keep_in_fp32(self.bias)
@@ -472,7 +497,7 @@ index c78a3adbb..b5f409d16 100644
  
          # Choose implementation: unified fused kernels vs reference modules.
          # The fused public API selects the backend per operation internally.
-@@ -325,9 +344,12 @@ class HyperConnectionModule(MegatronModule):
+@@ -312,9 +331,12 @@ class HyperConnectionModule(MegatronModule):
          # The fused path computes the projection and compute_h in one op, so
          # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
          # reached on the unfused path.
@@ -486,7 +511,7 @@ index c78a3adbb..b5f409d16 100644
              from megatron.core.fusions.fused_mhc_kernels import (
                  fused_h_aggregate,
                  fused_h_aggregate_into,
-@@ -346,9 +368,9 @@ class HyperConnectionModule(MegatronModule):
+@@ -333,9 +355,9 @@ class HyperConnectionModule(MegatronModule):
              self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
          else:
              self._sinkhorn_op = native_sinkhorn
@@ -498,7 +523,7 @@ index c78a3adbb..b5f409d16 100644
              self._proj_rms_compute_h_op = None
  
          self._init_weights()
-@@ -470,7 +492,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -457,7 +479,7 @@ class HyperConnectionModule(MegatronModule):
          # The mixing weights are bounded (sigmoid outputs / doubly stochastic
          # matrix), so after the FP32 computation they are safe to apply to the
          # streams in the activation dtype.
@@ -507,7 +532,7 @@ index c78a3adbb..b5f409d16 100644
          return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
  
      # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@@ -594,7 +616,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -581,7 +603,7 @@ class HyperConnectionModule(MegatronModule):
          # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
          h_res_batched = h_res.view(s * b, n, n)
          # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
@@ -516,7 +541,7 @@ index c78a3adbb..b5f409d16 100644
  
          # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
          mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
-@@ -881,7 +903,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -868,7 +890,7 @@ class HyperConnectionModule(MegatronModule):
          bda_func = get_bias_dropout_add(training, fused)
          with torch.cuda.nvtx.range("HyperConnection::bda"):
              output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
@@ -525,7 +550,7 @@ index c78a3adbb..b5f409d16 100644
  
      @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
      def _fused_h_res_h_post_bda_with_checkpoint(
-@@ -956,7 +978,7 @@ class HyperConnectionModule(MegatronModule):
+@@ -943,7 +965,7 @@ class HyperConnectionModule(MegatronModule):
                          bias_expanded = None
                  with torch.cuda.nvtx.range("HyperConnection::bda"):
                      output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
@@ -535,23 +560,10 @@ index c78a3adbb..b5f409d16 100644
              ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
              if has_bias:
 diff --git a/megatron/core/transformer/transformer_config.py b/megatron/core/transformer/transformer_config.py
-index cd49637f4..121fe7fe4 100644
+index c9383b157..cdad34115 100644
 --- a/megatron/core/transformer/transformer_config.py
 +++ b/megatron/core/transformer/transformer_config.py
-@@ -463,6 +463,12 @@ class TransformerConfig(ModelParallelConfig):
-     dsa_indexer_k_norm_fp32: bool = False
-     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
- 
-+    dsa_indexer_kpool: int = 1
-+    """Tokens per index pool; 1 keeps the original per-token top-k."""
-+
-+    dsa_indexer_kpool_always_select_tail: bool = False
-+    """Append the incomplete causal tail pool of every query."""
-+
-     dsa_indexer_weights_proj_use_quantization: bool = True
-     """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
-     quantization context. Disable this to keep the projection parameter outside FP8/FP4;
-@@ -597,6 +603,10 @@ class TransformerConfig(ModelParallelConfig):
+@@ -640,6 +640,10 @@ class TransformerConfig(ModelParallelConfig):
      linear_num_value_heads: Optional[int] = 32
      """Number of value and gate heads for the gated delta net."""
  
@@ -562,7 +574,7 @@ index cd49637f4..121fe7fe4 100644
      kda_safe_gate: bool = False
      """Whether the KDA kernel should use bounded gate values."""
  
-@@ -1558,6 +1568,15 @@ class TransformerConfig(ModelParallelConfig):
+@@ -1620,6 +1624,15 @@ class TransformerConfig(ModelParallelConfig):
      mhc_init_gating_factor: float = 0.01
      """Initial value of Gating Factor (alpha in paper)."""
  
