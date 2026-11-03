@@ -329,6 +329,12 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         # field); Megatron dev's hybrid transformer block, which expands the residual into mHC
         # streams, reads `hc_count` for the same thing.
         res['hc_count'] = res['num_residual_streams']
+        # dev splits mHC into two interfaces; the hybrid stack reads the new one.
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        tc = TransformerConfig.__dataclass_fields__
+        if 'enable_mhc_connections' in tc:
+            res['enable_mhc_connections'] = True
+            res['mhc_num_residual_streams'] = res['num_residual_streams']
         pattern = ''.join(('K' if attn == 'linear_attention' else 'D') + ('E' if mlp == 'sparse' else '-')
                           for attn, mlp in zip(layer_types, mlp_layer_types))
         res['hybrid_layer_pattern'] = pattern

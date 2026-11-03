@@ -56,6 +56,11 @@ class GPTBridge:
     additional_dim1_keys = set()
     _support_hf_grouped_lora = True
 
+    def __deepcopy__(self, memo):
+        # Bridges hold process groups; per-layer config copies must share, not copy, them.
+        memo[id(self)] = self
+        return self
+
     def __init__(self, config: ModelConfig):
         self.config = config
         self._disable_tqdm = False
