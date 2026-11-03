@@ -91,8 +91,10 @@ def get_mtp_capabilities() -> MtpCapabilities:
     tc = TransformerConfig.__dataclass_fields__
 
     layer_fwd = _params(McoreMultiTokenPredictionLayer.forward)
+    emb_fwd = _params(getattr(McoreMultiTokenPredictionLayer, '_get_embeddings', None))
     ckpt = _params(getattr(McoreMultiTokenPredictionLayer, '_checkpointed_forward', None))
     block_fwd = _params(McoreMultiTokenPredictionBlock.forward)
+    has_roll_context = hasattr(_mtp_mod, 'MTPSequenceRollContext')
 
     caps = MtpCapabilities(
         has_detach_heads='mtp_detach_heads' in tc,
@@ -100,21 +102,19 @@ def get_mtp_capabilities() -> MtpCapabilities:
         has_freeze_base_model_for_mtp='freeze_base_model_for_mtp' in tc,
         has_mtp_loss_early_backward='mtp_loss_early_backward' in tc,
         has_keep_mtp_in_bf16='keep_mtp_in_bf16' in tc,
-        has_layer_input_mask='mtp_input_mask' in _params(
-            getattr(McoreMultiTokenPredictionLayer, '_get_embeddings', None)),
+        has_layer_input_mask='mtp_input_mask' in emb_fwd,
         layer_forward_params=layer_fwd,
         layer_returns_padding_mask='padding_mask' in layer_fwd,
         checkpointed_forward_accepts_padding_mask='padding_mask' in ckpt,
         block_forward_params=block_fwd,
-        has_roll_context=hasattr(_mtp_mod, 'MTPSequenceRollContext'),
+        has_roll_context=has_roll_context,
         has_mhc_multistream='mhc_multistream' in block_fwd,
         fingerprint=(f'pm={"padding_mask" in layer_fwd} ckpt_pm={"padding_mask" in ckpt} '
-                     f'roll_ctx={hasattr(_mtp_mod, "MTPSequenceRollContext")} '
-                     f'mhc={"mhc_multistream" in block_fwd} '
+                     f'roll_ctx={has_roll_context} mhc={"mhc_multistream" in block_fwd} '
                      f'hybrid_pat={"mtp_hybrid_override_pattern" in tc} '
                      f'early_bwd={"mtp_loss_early_backward" in tc} '
                      f'keep_bf16={"keep_mtp_in_bf16" in tc} '
-                     f'layer_input_mask={"mtp_input_mask" in _params(getattr(McoreMultiTokenPredictionLayer, "_get_embeddings", None))}'),
+                     f'layer_input_mask={"mtp_input_mask" in emb_fwd}'),
     )
     logger.debug(f'MTP capabilities: {caps.fingerprint}')
     return caps

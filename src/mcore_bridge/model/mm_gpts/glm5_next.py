@@ -375,6 +375,7 @@ class Glm5NextVit(HuggingFaceVit):
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from transformers.models.glm5_next import Glm5NextVisionModel
+
         # This vision tower only implements sdpa; transformers would otherwise pick flash-attn.
         self.visual = Glm5NextVisionModel._from_config(hf_config.vision_config, attn_implementation='sdpa')
 
