@@ -214,7 +214,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
             else:
                 native_row = isinstance(self.base_layer, RowParallelLinear)
-                row_input_size = self.in_features if native_row or is_torch_npu_available() else in_features
+                # TE (including TENPU) expects the global input size; native layers already expose it.
+                row_input_size = self.in_features if native_row else in_features
                 row_linear_cls = RowParallelLinear if native_row else TERowParallelLinear
                 lora_a = row_linear_cls(
                     input_size=row_input_size,
