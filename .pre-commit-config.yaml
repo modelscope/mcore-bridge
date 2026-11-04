@@ -15,10 +15,15 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        exclude: '\.patch$'
       - id: check-yaml
       - id: end-of-file-fixer
+        exclude: '\.patch$'
       - id: requirements-txt-fixer
       - id: double-quote-string-fixer
+        exclude: '\.patch$'
       - id: check-merge-conflict
+        exclude: '\.patch$'
       - id: mixed-line-ending
         args: ["--fix=lf"]
+        exclude: '\.patch$'

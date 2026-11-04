@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+import inspect
 import torch
 import torch.nn as nn
 from copy import deepcopy
@@ -12,6 +13,7 @@ from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
+from ..mtp import get_mtp_capabilities, get_physical_mtp_depth
 from ..register import ModelLoader, ModelMeta, register_model
 from .utils import HuggingFaceVit
 
@@ -25,14 +27,23 @@ try:
 
     from ..hybrid_model import HybridModel
 except ImportError:
-    # Released Megatron has no hybrid stack for this model (0.18 has no mark_keep_in_fp32, 0.16 no
-    # models.hybrid). The package must still import for every other model, so fall back to a base
-    # that lets the class definitions below succeed; a GLM config is rejected before any of this is
-    # used, by require_glm5_hybrid(), which names the missing dev patch.
+    # Released Megatron has no hybrid stack for this model (0.18 has no mark_keep_in_fp32). The package
+    # must still import for every other model, so fall back to a base that lets the class definitions
+    # below succeed; a GLM config is rejected before any of this is used, by require_glm5_hybrid(),
+    # which names the missing dev patch.
     HybridModel = HybridStack = McoreMultiTokenPredictionLayer = object
     parse_hybrid_pattern = select_pipeline_segment = mark_keep_in_fp32 = None
 
 logger = get_logger()
+
+# Megatron 0.20 added a required `config` argument to select_pipeline_segment (the hybrid stack now
+# returns per-layer TransformerConfig objects instead of layer symbols); 0.18/0.19 take
+# `(main_pattern, pp_group, vp_stage, ...)`. GLM-5.3 itself is a dev-only feature -- a release without
+# the packaged patch is rejected earlier by require_glm5_hybrid() -- so only the 0.20 signature runs
+# today. Probe it anyway so a backport (or a release that grows the hybrid stack) cannot silently
+# turn this call site into a TypeError.
+_SELECT_PIPELINE_SEGMENT_TAKES_CONFIG = (
+    select_pipeline_segment is not None and 'config' in inspect.signature(select_pipeline_segment).parameters)
 
 # Probes for require_glm5_hybrid(): the hybrid-stack APIs this model is built on, and the
 # TransformerConfig fields that only the packaged patch provides.
@@ -145,6 +156,9 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
     def __init__(self, config, *args, **kwargs):
         mtp_config = copy.copy(config)
         mtp_config.enable_hyper_connections = False
+        # Keep the fused `eh_proj` shape the checkpoint stores (no mHC in the MTP head).
+        if hasattr(mtp_config, 'enable_mhc_connections'):
+            mtp_config.enable_mhc_connections = False
         super().__init__(mtp_config, *args, **kwargs)
 
     def _get_embeddings(self,
@@ -155,20 +169,23 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
                         packed_seq_params=None,
                         padding_mask=None,
                         sequence_roll_context=None,
-                        roll_depth=0):
+                        roll_depth=0,
+                        mtp_input_mask=None):
         # Decoder/MoE routing consumes the sequence-parallel shard, but MTP must roll the mask
         # beside the unsharded input_ids. Reconstruct it only around the roll, then restore the
         # shard expected by the nested HybridStack.
         sequence_parallel_mask = (
             padding_mask is not None and self.config.sequence_parallel and self.tp_group.size() > 1)
+        full_padding_len = None
         if sequence_parallel_mask:
             padding_mask = gather_from_sequence_parallel_region(
                 padding_mask.transpose(0, 1).contiguous(),
                 tensor_parallel_output_grad=False,
                 group=self.tp_group,
             ).transpose(0, 1).contiguous()
+            full_padding_len = padding_mask.shape[1]
 
-        input_ids, position_ids, padding_mask, decoder_input, hidden_states = super()._get_embeddings(
+        super_kwargs = dict(
             input_ids=input_ids,
             position_ids=position_ids,
             embedding=embedding,
@@ -176,12 +193,16 @@ class Glm5NextMultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
             sequence_roll_context=sequence_roll_context,
-            roll_depth=roll_depth,
-        )
-
-        if sequence_parallel_mask:
-            padding_mask = padding_mask.chunk(self.tp_group.size(), dim=-1)[self.tp_group.rank()].contiguous()
-        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
+            roll_depth=roll_depth)
+        # dev forwards `mtp_input_mask` unconditionally.
+        if get_mtp_capabilities().has_layer_input_mask:
+            super_kwargs['mtp_input_mask'] = mtp_input_mask
+        # dev returns six values (mask included), releases five; keep upstream's shape.
+        outputs = list(super()._get_embeddings(**super_kwargs))
+        # Upstream already scatters the mask under sequence parallel; chunk only if it did not.
+        if (sequence_parallel_mask and outputs[2] is not None and outputs[2].shape[1] == full_padding_len):
+            outputs[2] = outputs[2].chunk(self.tp_group.size(), dim=-1)[self.tp_group.rank()].contiguous()
+        return tuple(outputs)
 
 
 class Glm5NextHybridModel(HybridModel):
@@ -216,7 +237,7 @@ class Glm5NextHybridModel(HybridModel):
         # parse_hybrid_pattern splits on '/' and keeps '|' inside the main pattern for PP boundaries;
         # the MTP inner block (DSA + MoE, no hyper-connections) is described by mtp_hybrid_override_pattern.
         mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
-        mtp_num_layers = getattr(config, 'mtp_num_layers', None)
+        mtp_num_layers = get_physical_mtp_depth(config)
         if mtp_pattern and mtp_num_layers and '/' not in main:
             main = main + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
         return main
@@ -227,15 +248,17 @@ class Glm5NextHybridModel(HybridModel):
         from megatron.core.process_groups_config import ProcessGroupCollection
         pg = ProcessGroupCollection.use_mpu_process_groups()
         pattern = self._resolve_hybrid_layer_pattern(config)
-        segment, offset = select_pipeline_segment(
-            parse_hybrid_pattern(pattern).main_pattern,
-            pg.pp,
-            vp_stage,
-            first_stage_layers=config.num_layers_in_first_pipeline_stage,
-            last_stage_layers=config.num_layers_in_last_pipeline_stage,
-            tp_group=pg.tp,
-            dp_cp_group=pg.dp_cp,
-        )
+        segment_kwargs = {
+            'first_stage_layers': config.num_layers_in_first_pipeline_stage,
+            'last_stage_layers': config.num_layers_in_last_pipeline_stage,
+            'tp_group': pg.tp,
+            'dp_cp_group': pg.dp_cp,
+        }
+        main_pattern = parse_hybrid_pattern(pattern).main_pattern
+        if _SELECT_PIPELINE_SEGMENT_TAKES_CONFIG:
+            segment, offset = select_pipeline_segment(main_pattern, config, pg.pp, vp_stage, **segment_kwargs)
+        else:
+            segment, offset = select_pipeline_segment(main_pattern, pg.pp, vp_stage, **segment_kwargs)
         if offset % 2 or len(segment) % 2:
             raise ValueError(
                 f'Pipeline stage boundaries of the current model must fall on complete attention+FFN blocks, '
@@ -352,7 +375,9 @@ class Glm5NextVit(HuggingFaceVit):
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from transformers.models.glm5_next import Glm5NextVisionModel
-        self.visual = Glm5NextVisionModel._from_config(hf_config.vision_config)
+
+        # This vision tower only implements sdpa; transformers would otherwise pick flash-attn.
+        self.visual = Glm5NextVisionModel._from_config(hf_config.vision_config, attn_implementation='sdpa')
 
     def prepare_language_model(self, hf_config: PretrainedConfig):
         self.visual = None
@@ -697,4 +722,5 @@ register_model(
         bridge_cls=Glm5NextBridge,
         visual_cls=Glm5NextVit,
         loader=Glm5NextLoader,
+        mtp_prefix='model.layers',
     ))

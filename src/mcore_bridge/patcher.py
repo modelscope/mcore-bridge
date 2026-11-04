@@ -9,7 +9,6 @@ from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.models.common.embeddings.rotary_pos_embedding import MultimodalRotaryEmbedding
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.moe.router import TopKRouter
-from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock, get_mtp_layer_offset
 from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
 from torch import nn
@@ -238,69 +237,6 @@ def _patch_mrope():
     rope_utils.apply_rotary_pos_emb = apply_rotary_pos_emb
 
 
-def _patch_mtp():
-    """Unroll the MTP block over `mtp_unroll_steps` for the GPTModel build.
-
-    This rewrite drives the layer with `decoder_input` / `layer_number`, which only the
-    GPTModel-path MTP layer accepts. `HybridStack`-based MTP layers take neither, and
-    upstream's own `MultiTokenPredictionBlock.forward` already unrolls them, so hybrid
-    models must keep the upstream implementation.
-    """
-    origin_forward = MultiTokenPredictionBlock.forward
-
-    def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor, hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor, **kwargs) -> torch.Tensor:
-        if getattr(self.config, 'is_hybrid_model', False):
-            return origin_forward(
-                self,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                **kwargs)
-        # get hidden states from previous mtp stages
-        get_offset_kwargs = {} if self.vp_stage is None else {'vp_stage': self.vp_stage}
-        mtp_decoder_input = decoder_input = kwargs.pop('decoder_input', None)
-        mhc_multistream = kwargs.pop('mhc_multistream', None)
-
-        offset = get_mtp_layer_offset(self.config, **get_offset_kwargs)
-        assert offset == 0, 'not support offset'
-        hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
-        if mhc_multistream is not None:
-            # mHC mode: use multi-stream for MTP depth input, contracted for loss list.
-            mhc_chunks = list(torch.chunk(mhc_multistream, 1 + offset, dim=0))
-            hidden_states = mhc_chunks[offset]
-        else:
-            hidden_states = hidden_states_list[offset]
-        for layer_number in range(self.config.mtp_unroll_steps):
-            layer = self.layers[layer_number % len(self.layers)]
-            (hidden_states, input_ids, position_ids, decoder_input) = layer(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=attention_mask,
-                decoder_input=decoder_input,
-                layer_number=layer_number + 1,
-                **kwargs,
-            )
-            if mtp_decoder_input is None:
-                decoder_input = None
-
-            if mhc_multistream is not None:
-                mhc_chunks.append(hidden_states)
-                hidden_states_list.append(layer._postprocess(hidden_states))
-            else:
-                # append the output hidden states of the current mtp layer
-                # to the hidden_states_list
-                hidden_states_list.append(hidden_states)
-
-        # concat the hidden states of all mtp layers
-        hidden_states = torch.cat(hidden_states_list, dim=0)
-        return hidden_states
-
-    MultiTokenPredictionBlock.forward = forward
-
-
 def _patch_moe_expert_bias_padding_mask():
     """Align the padding mask with `routing_map` in `TopKRouter._apply_expert_bias`.
 
@@ -335,6 +271,5 @@ def apply_patch():
     _patch_TEGroupedLinear()
     _patch_TELinear()
     _patch_mrope()
-    _patch_mtp()
     _patch_moe_expert_bias_padding_mask()
     from mcore_bridge import tuners  # apply patch

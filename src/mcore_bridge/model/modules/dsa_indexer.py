@@ -1,15 +1,12 @@
 import torch
 import transformer_engine
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import DSAIndexer as McoreDSAIndexer
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.spec_utils import build_module
 from typing import Optional, Tuple
-
-try:
-    from megatron.core.models.gpt.experimental_attention_variant_module_specs import DSAIndexer as McoreDSAIndexer
-except ImportError:
-    McoreDSAIndexer = None
 
 
 class DSAIndexer(McoreDSAIndexer):
@@ -144,10 +141,6 @@ class DSAIndexer(McoreDSAIndexer):
             index_scores: Index scores [batch, seqlen, seqlen].
             topk_indices: Top-k indices [batch, seqlen, index_topk].
         """
-        try:
-            from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
-        except ImportError:
-            raise ImportError('fused_qk_topk_naive is not available. Please install "megatron-core>=0.17.0"')
         # [seqlen, batch, index_n_heads * index_head_dim]
         # [seqlen, batch, index_head_dim]
         # [seqlen, batch, index_n_heads]

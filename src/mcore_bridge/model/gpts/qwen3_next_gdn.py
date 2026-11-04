@@ -159,4 +159,6 @@ if use_mcore_gdn:
             ['qwen3_next'],
             bridge_cls=Qwen3NextGDNBridge,
             loader=Qwen3NextLoader,
+            mtp_prefix='mtp',
+            mtp_depth_field='mtp_num_hidden_layers',
         ))

@@ -1,6 +1,6 @@
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0,1,2,3')
 os.environ['SWIFT_TEST_CONVERT_PRECISION'] = '1'
 
 
@@ -126,6 +126,10 @@ def test_minicpmv4_6():
 
 def test_muse_glimmer():
     _test_model('meta-models/Muse-Glimmer-30B')
+
+
+def test_nemotron_h_omni():
+    _test_model('nv-community/NVIDIA-Nemotron-3.5-Super-VL-120B-A12B-BF16', attn_impl='eager', device_map='balanced')
 
 
 if __name__ == '__main__':

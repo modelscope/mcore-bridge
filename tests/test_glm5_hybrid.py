@@ -193,6 +193,31 @@ def test_pipeline_pattern_keeps_hf_block_pairs(pp):
     assert max(map(len, segments)) - min(map(len, segments)) <= 2
 
 
+def test_mtp_pattern_uses_physical_depth_for_repeated():
+    from types import SimpleNamespace
+
+    from mcore_bridge.model.mm_gpts.glm5_next import Glm5NextHybridModel
+
+    config = SimpleNamespace(
+        num_layers=90,
+        hybrid_layer_pattern='K-' * 3 + 'DE' * 42,
+        pipeline_model_parallel_size=1,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        num_layers_in_first_pipeline_stage=None,
+        num_layers_in_last_pipeline_stage=None,
+        mtp_num_layers=3,
+        mtp_use_repeated_layer=True,
+        mtp_hybrid_override_pattern='DE',
+    )
+    pattern = Glm5NextHybridModel._resolve_hybrid_layer_pattern(config)
+    assert pattern.count('/DE') == 1
+
+    config.mtp_use_repeated_layer = False
+    pattern = Glm5NextHybridModel._resolve_hybrid_layer_pattern(config)
+    assert pattern.count('/DE') == 3
+
+
 def test_unpatched_dev_is_rejected_at_glm_boundary(monkeypatch):
     from mcore_bridge.model.mm_gpts.glm5_next import require_glm5_hybrid
 

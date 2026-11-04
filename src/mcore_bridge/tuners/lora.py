@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import megatron.core
 import peft
 import torch
 import torch.nn as nn
@@ -8,7 +7,6 @@ import torch.nn.functional as F
 import transformer_engine
 import warnings
 from contextlib import contextmanager, nullcontext
-from importlib import metadata
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (TEColumnParallelGroupedLinear, TEColumnParallelLinear,
@@ -16,6 +14,7 @@ from megatron.core.extensions.transformer_engine import (TEColumnParallelGrouped
                                                          TERowParallelGroupedLinear, TERowParallelLinear)
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.parallel_state import get_expert_tensor_parallel_world_size, get_tensor_model_parallel_world_size
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker, get_expert_parallel_rng_tracker_name
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
 from megatron.core.transformer.module import MegatronModule
@@ -32,38 +31,10 @@ from mcore_bridge.utils import get_current_device
 from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
-mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 peft_019 = version.parse(peft.__version__) >= version.parse('0.19.0')
-MINDSPEED_015 = version.parse('0.15.0')
-
-
-def _get_mindspeed_version():
-    try:
-        return version.parse(metadata.version('mindspeed'))
-    except metadata.PackageNotFoundError:
-        return None
-    except Exception:
-        return None
-
-
-def _use_legacy_npu_local_linear() -> bool:
-    if not is_torch_npu_available():
-        return False
-    mindspeed_version = _get_mindspeed_version()
-    if mindspeed_version is None:
-        # Fall back to the conservative path when the version is unknown so we
-        # do not force an older NPU stack onto the 0.15 TE semantics.
-        return True
-    return mindspeed_version < MINDSPEED_015
 
 
 def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwargs):
-    if _use_legacy_npu_local_linear():
-        return nn.Linear(
-            in_features=input_size,
-            out_features=output_size,
-            bias=bias,
-        )
     local_kwargs = dict(kwargs)
     local_kwargs.pop('tp_group', None)
     return TELinear(
@@ -77,19 +48,42 @@ def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwar
 
 
 def _get_tensor_parallel_group_for_lora(base_layer):
-    """Resolve the tensor-parallel group across TE and MindSpeed TE variants.
-
-    Megatron's TE layers expose ``tp_group`` directly, but MindSpeed 0.15.x
-    replaces some TE classes (for example
-    ``MindSpeedTELayerNormColumnParallelLinear``) with implementations that keep
-    the same tensor-parallel semantics under ``parallel_group`` instead. LoRA
-    still needs to forward the right group into the newly created parallel
-    adapter layers, otherwise adapter injection fails before training starts.
-    """
+    """Resolve the tensor-parallel group from the standard TE/MCore contract."""
     tp_group = getattr(base_layer, 'tp_group', None)
     if tp_group is not None:
         return tp_group
-    return getattr(base_layer, 'parallel_group', None)
+    return getattr(base_layer, '_tp_group', None)
+
+
+def _forward_npu_layernorm_column(base_layer, x, args, kwargs):
+    """Run TENPU LayerNormLinear once and retain its normalized activation."""
+    original_return_layernorm_output = base_layer.return_layernorm_output
+    base_layer.return_layernorm_output = True
+    try:
+        out = base_layer(x, *args, **kwargs)
+    finally:
+        base_layer.return_layernorm_output = original_return_layernorm_output
+
+    if base_layer.te_return_bias:
+        result, bias, layernorm_output = out
+    else:
+        (result, layernorm_output), bias = out
+    return result, bias, layernorm_output
+
+
+def _is_replicated_base(base_layer) -> bool:
+    """Whether a TELinear base keeps its full weight on every TP rank.
+
+    Megatron's TELinear passes ``parallel_mode=None`` to TE for ``'duplicated'`` layers, so
+    the tag is gone after construction; the layout is recorded on the weight instead
+    (``tensor_model_parallel=False``, while TE flags every other linear weight as tensor
+    parallel). MindSpeed keeps the original tag.
+    """
+    if not isinstance(base_layer, TELinear):
+        return False
+    if getattr(base_layer, 'parallel_mode', None) == 'duplicated':
+        return True
+    return getattr(getattr(base_layer, 'weight', None), 'tensor_model_parallel', None) is False
 
 
 class LoraParallelLinear(MegatronModule, LoraLayer):
@@ -117,7 +111,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         if use_dora:
             raise ValueError(f'{self.__class__.__name__} does not support DoRA yet, please set it to False')
 
-        self.is_parallel_a = isinstance(base_layer, (TERowParallelLinear, TERowParallelGroupedLinear))
+        self.is_parallel_a = isinstance(base_layer,
+                                        (TERowParallelLinear, TERowParallelGroupedLinear, RowParallelLinear))
         self.is_grouped = isinstance(base_layer, TEGroupedLinear)
         self.fan_in_fan_out = fan_in_fan_out
         self._active_adapter = adapter_name
@@ -165,6 +160,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
 
         self.lora_dropout[adapter_name] = lora_dropout_layer
 
+        replicated_base = _is_replicated_base(self.base_layer)
         # lora needs to be forced to upgrade to 32-bit precision, otherwise it will overflow
         kwargs = {
             'skip_bias_add': False,
@@ -172,7 +168,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'config': self.config,
             'is_expert': self.is_expert,
         }
-        if not (mcore_016 and self.is_grouped):
+        # Grouped TE linears take a `pg_collection`, not a `tp_group`; only the
+        # non-grouped adapters forward the base layer's tensor-parallel group.
+        if not self.is_grouped:
             tp_group = _get_tensor_parallel_group_for_lora(self.base_layer)
             if tp_group is not None:
                 kwargs['tp_group'] = tp_group
@@ -215,20 +213,21 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                         **kwargs,
                     )
             else:
-                lora_a = TERowParallelLinear(
-                    input_size=in_features,
+                native_row = isinstance(self.base_layer, RowParallelLinear)
+                row_input_size = self.in_features if native_row or is_torch_npu_available() else in_features
+                row_linear_cls = RowParallelLinear if native_row else TERowParallelLinear
+                lora_a = row_linear_cls(
+                    input_size=row_input_size,
                     output_size=r,
                     bias=False,
-                    input_is_parallel=True,
+                    input_is_parallel=getattr(self.base_layer, 'input_is_parallel', True),
                     **kwargs,
                 )
                 lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
-                lora_a.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                lora_a.parallel_mode = getattr(self.base_layer, 'parallel_mode', None)  # fix moe_shared_expert_overlap
         else:
-            if is_torch_npu_available():
-                out_features = self.out_features
-            else:
-                out_features = self.out_features * self.tp_size
+            # PEFT reports local features; MCore's constructor expects the global size.
+            out_features = self.out_features * self.tp_size
             if self.is_grouped:
                 if is_torch_npu_available():
                     lora_a = NpuGroupedLoraLinear(
@@ -262,14 +261,19 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
             else:
                 lora_a = _build_local_te_linear(self.in_features, r, lora_bias, **kwargs)
-                lora_b = TEColumnParallelLinear(
-                    input_size=r,
-                    output_size=out_features,
-                    bias=lora_bias,
-                    gather_output=False,
-                    **kwargs,
-                )
-                lora_b.parallel_mode = self.base_layer.parallel_mode  # fix moe_shared_expert_overlap
+                if replicated_base:
+                    # Match the base layer's replicated output.
+                    lora_b = _build_local_te_linear(r, self.out_features, lora_bias, **kwargs)
+                else:
+                    lora_b = TEColumnParallelLinear(
+                        input_size=r,
+                        output_size=out_features,
+                        bias=lora_bias,
+                        gather_output=False,
+                        **kwargs,
+                    )
+                    lora_b.parallel_mode = getattr(self.base_layer, 'parallel_mode',
+                                                   None)  # fix moe_shared_expert_overlap
         for lora in [lora_a, lora_b]:
             # When parallel_mode is set to None by moe_shared_expert_overlap,
             # disable UB comm overlap; the corresponding collectives are driven
@@ -280,18 +284,20 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 lora.ub_overlap_ag_fprop = False
                 lora.ub_overlap_rs_dgrad = False
 
-        # With sequence parallelism the replicated (non-sharded) LoRA factor only sees this TP
-        # rank's sequence shard: for RowParallel targets lora_A reduce-scatters its output before
-        # lora_B, and for ColumnParallel targets lora_A consumes the sequence-sharded input. Its
-        # gradient must therefore be summed over the TP group. Megatron does this in
-        # finalize_model_grads for parameters flagged `sequence_parallel` (same as layernorm
-        # weights); without the flag each TP rank trains a different copy and export_weights
-        # saves rank 0 only (observed: last layer linear_proj.lora_B saved as all zeros).
+        # Sequence-parallel inputs need TP reduction for replicated LoRA weights.
+        # Both factors are replicated when the base layer is duplicated.
         if (self.tp_size > 1 and not isinstance(self.base_layer, TopKRouter)
                 and (getattr(self.config, 'sequence_parallel', False) or self.sequence_parallel)):
-            replicated = lora_b if self.is_parallel_a else lora_a
-            for p in replicated.parameters():
-                p.sequence_parallel = True
+            replicated_factors = (lora_a, lora_b) if replicated_base else (lora_b if self.is_parallel_a else lora_a, )
+            complete_grads = replicated_base and getattr(
+                getattr(self.base_layer, 'weight', None), 'average_gradients_across_tp_domain', False)
+            for factor in replicated_factors:
+                for p in factor.parameters():
+                    if complete_grads:
+                        p.sequence_parallel = False
+                        p.average_gradients_across_tp_domain = True
+                    else:
+                        p.sequence_parallel = True
         self.lora_A[adapter_name] = lora_a
         self.lora_B[adapter_name] = lora_b
         if hasattr(self, 'lora_bias'):
@@ -393,39 +399,12 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 self.base_layer.return_layernorm_output = False
                 result, bias = self.base_layer(x, *args, **kwargs)
             else:
-                self.base_layer.return_layernorm_output = True
                 if is_torch_npu_available():
-                    # NPU: base_layer only returns (output, bias); it does not expose the LayerNorm/RMSNorm output.
-                    inp = x  # Keep the original pre-norm input.
-                    result, bias = self.base_layer(inp, *args, **kwargs)
-
-                    # Key: For LoRA we need the same "x" as in the non-NPU branch, i.e. the post-norm activation
-                    # (LayerNorm/RMSNorm output, which is the actual input to the fused linear).
-                    if hasattr(self.base_layer, 'config') and (hasattr(self.base_layer, '_layernorm')
-                                                               or hasattr(self.base_layer, '_rmsnorm')):
-                        norm_type = getattr(self.base_layer.config, 'normalization', None)
-
-                        if norm_type == 'LayerNorm':
-                            if not hasattr(self.base_layer, '_layernorm'):
-                                raise RuntimeError(
-                                    'NPU LoRA path expects base_layer to provide `_layernorm`, but it is missing. '
-                                    'Cannot reconstruct the post-LayerNorm activation for LoRA.')
-                            x = self.base_layer._layernorm(inp)
-                        else:
-                            # Default to RMSNorm path when normalization is not LayerNorm.
-                            if not hasattr(self.base_layer, '_rmsnorm'):
-                                raise RuntimeError(
-                                    'NPU LoRA path expects base_layer to provide `_rmsnorm`, but it is missing. '
-                                    'Cannot reconstruct the post-RMSNorm activation for LoRA.')
-                            x = self.base_layer._rmsnorm(inp)
-                    else:
-                        raise RuntimeError('NPU LoRA path requires base_layer to expose post-norm activations '
-                                           '(LayerNorm/RMSNorm output). Expected base_layer to have `config` '
-                                           'and either `_layernorm` or `_rmsnorm`. '
-                                           f'Got base_layer type: {type(self.base_layer)}. ')
+                    result, bias, x = _forward_npu_layernorm_column(self.base_layer, x, args, kwargs)
                 else:
+                    self.base_layer.return_layernorm_output = True
                     (result, x), bias = self.base_layer(x, *args, **kwargs)
-        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear)):
+        elif isinstance(self.base_layer, (TELinear, TEGroupedLinear, ColumnParallelLinear, RowParallelLinear)):
             result, bias = self.base_layer(x, *args, **kwargs)
         elif isinstance(self.base_layer, TopKRouter):
             with self._patch_router_gating():

@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import inspect
 import math
 import torch
 from megatron.core import mpu
@@ -8,6 +9,8 @@ from typing import Optional
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import split_cp_inputs
+
+from .mtp import get_physical_mtp_depth
 
 
 class HybridModel(McoreHybridModel):
@@ -24,6 +27,11 @@ class HybridModel(McoreHybridModel):
     """
 
     config: ModelConfig
+    # These kwargs would otherwise be cleared by the multimodal embedding hook / PP stage.
+    extra_forward_keys = ('loss_mask', 'padding_mask')
+    _upstream_forward_keys = set(inspect.signature(McoreHybridModel.forward).parameters) - {
+        'self', 'input_ids', 'position_ids', 'attention_mask', 'packed_seq_params', 'padding_mask'
+    }
 
     def __init__(
         self,
@@ -54,7 +62,9 @@ class HybridModel(McoreHybridModel):
     def _resolve_hybrid_layer_pattern(config: ModelConfig) -> Optional[str]:
         pattern = config.hybrid_layer_pattern
         mtp_pattern = getattr(config, 'mtp_hybrid_override_pattern', None)
-        mtp_num_layers = config.mtp_num_layers
+        mtp_num_layers = get_physical_mtp_depth(config)
+        # Pattern entries describe PHYSICAL MTP layers: repeated (shared-weight)
+        # mode collapses the logical depth to one physical layer.
         if (pattern and mtp_pattern and mtp_num_layers and '/' not in pattern):
             pattern = pattern + '/' + '/'.join([mtp_pattern] * mtp_num_layers)
         return pattern
@@ -65,7 +75,7 @@ class HybridModel(McoreHybridModel):
             attention_mask = attention_mask['full_attention']
         if attention_mask is None:
             return None
-        padding_mask = attention_mask.all(dim=(1, 2))
+        padding_mask = ~attention_mask.bool() if attention_mask.dim() == 2 else attention_mask.all(dim=(1, 2))
         if self.config.context_parallel_size > 1:
             padding_mask = split_cp_inputs(padding_mask, None, 1)
         tp_size = self.config.tensor_model_parallel_size
@@ -81,7 +91,16 @@ class HybridModel(McoreHybridModel):
                 *args,
                 packed_seq_params=None,
                 padding_mask=None,
+                extra_block_kwargs=None,
                 **kwargs):
+        # MMGPT separates media kwargs from forward controls; Hybrid has no extra_block_kwargs.
+        extra_block_kwargs = extra_block_kwargs or {}
+        if padding_mask is None:
+            padding_mask = extra_block_kwargs.get('padding_mask')
+        for key in self.extra_forward_keys:
+            if key != 'padding_mask' and key in extra_block_kwargs:
+                kwargs.setdefault(key, extra_block_kwargs[key])
+        kwargs = {key: value for key, value in kwargs.items() if key in self._upstream_forward_keys}
         if padding_mask is None and packed_seq_params is None:
             padding_mask = self._get_padding_mask(attention_mask)
         return super().forward(

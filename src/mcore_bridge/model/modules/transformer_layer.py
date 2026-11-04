@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import enum
 import inspect
 import torch
 from contextlib import contextmanager
@@ -9,6 +8,7 @@ from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
                                                     scatter_to_sequence_parallel_region)
+from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
@@ -22,23 +22,22 @@ from typing import Optional
 
 from mcore_bridge.utils import get_logger, split_cp_inputs
 
-try:
-    from megatron.core.transformer.enums import CudaGraphScope
-except ImportError:
-
-    class CudaGraphScope(enum.Enum):
-        """Cuda Graph Scope - defines which parts of the model to capture."""
-
-        full_iteration = 1  # Captures the entire training/inference iteration
-        attn = 2  # Captures attention layers
-        mlp = 3  # Captures MLP layers (dense layers only)
-        moe = 4  # Captures MoE layers (drop-and-pad MoE layers only)
-        moe_router = 5  # Captures MoE router part
-        moe_preprocess = 6  # Captures MoE preprocessing part (requires moe_router)
-        mamba = 7  # Captures Mamba layers
-
-
 logger = get_logger()
+
+
+def _mlp_needs_custom_build(mlp_spec):
+    """Whether the MLP spec is a mcore-bridge-specific class that upstream's TransformerLayer
+    __init__ cannot build. Upstream constructs the MLP by exact-type matching MLP/MoELayer/
+    TEGroupedMLP/... and passing pg_collection/is_mtp_layer, whereas these subclasses take
+    tp_group/layer_number; only glm4 / gemma4 use them, so everything else is delegated upstream.
+    """
+    if mlp_spec is None:
+        return False
+    from mcore_bridge.model.gpts.glm4 import Glm4MLP
+    from mcore_bridge.model.mm_gpts.gemma4 import Gemma4MLP, Gemma4MoELayer
+    module = mlp_spec.module if isinstance(mlp_spec, ModuleSpec) else getattr(mlp_spec, 'func', None)
+    module = getattr(module, '__self__', module)  # unwrap a bound classmethod (as_mlp_submodule)
+    return isinstance(module, type) and issubclass(module, (Glm4MLP, Gemma4MLP, Gemma4MoELayer))
 
 
 class TransformerLayer(McoreTransformerLayer):
@@ -56,7 +55,29 @@ class TransformerLayer(McoreTransformerLayer):
         pp_layer_offset: Optional[int] = None,
         **kwargs,
     ):
+        # Upstream accepts is_mtp_layer/add_layer_offset/pp_layer_offset since 0.17, so every
+        # supported release delegates; only the bridge-specific MLPs need the forked body.
+        if not _mlp_needs_custom_build(getattr(submodules, 'mlp', None)):
+            init_kwargs = dict(
+                layer_number=layer_number,
+                hidden_dropout=hidden_dropout,
+                pg_collection=pg_collection,
+                vp_stage=vp_stage,
+                is_mtp_layer=is_mtp_layer,
+                add_layer_offset=add_layer_offset,
+                pp_layer_offset=pp_layer_offset,
+                **kwargs)
+            params = inspect.signature(McoreTransformerLayer.__init__).parameters
+            if not any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+                init_kwargs = {k: v for k, v in init_kwargs.items() if k in params}
+            super().__init__(config, submodules, **init_kwargs)
+            return
+        # Forked body for bridge-specific MLP subclasses.
         self.submodules_config = submodules
+        # mcore main: GraphableMegatronModule.__init__ may build a local CUDA-graph manager that
+        # reads is_moe_layer, so dense layers need the default before super().__init__ runs (an
+        # MoETransformerLayer sets it True beforehand). Mirrors upstream; a no-op on mcore dev.
+        self.is_moe_layer = getattr(self, 'is_moe_layer', False)
         super(McoreTransformerLayer, self).__init__(config=config, vp_stage=vp_stage)
 
         if pg_collection is None:
@@ -109,6 +130,9 @@ class TransformerLayer(McoreTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        # mcore main's _run_input_layernorm / _run_pre_*_layernorm read these residual flags;
+        # mirror upstream so the forked __init__ stays compatible. All are no-ops on mcore dev.
+        self._input_layernorm_returns_residual = getattr(self.input_layernorm, 'returns_residual', False)
 
         attention_optional_kwargs = {}
         if config.context_parallel_size > 1 and config.cp_comm_type is not None:
@@ -139,6 +163,8 @@ class TransformerLayer(McoreTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self._pre_cross_attn_layernorm_returns_residual = getattr(self.pre_cross_attn_layernorm, 'returns_residual',
+                                                                  False)
 
         # [Module 5: CrossAttention]
         self.cross_attention = build_module(
@@ -157,6 +183,7 @@ class TransformerLayer(McoreTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+        self._pre_mlp_layernorm_returns_residual = getattr(self.pre_mlp_layernorm, 'returns_residual', False)
 
         # [Module 8: MLP block]
         self.mlp = self._build_mlp(submodules.mlp)
@@ -238,6 +265,9 @@ class TransformerLayer(McoreTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        # mcore main's _apply_mlp_bda_step consults this to honor legacy _forward_post_mlp
+        # overrides; mcore-bridge defines none, so None is correct. No-op on mcore dev.
+        self._legacy_forward_post_mlp = None
 
     @contextmanager
     def _patch_apply_rotary_pos_emb(self):
@@ -355,7 +385,7 @@ class TransformerLayer(McoreTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        # Compatible with megatron-core 0.15
+        # The padding-free MLP gather path needs the same mask attention consumes.
         padding_mask = kwargs.pop('padding_mask', None)
         mlp_kwargs = {}
         if padding_mask is not None:

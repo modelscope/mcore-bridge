@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from functools import partial
 from megatron.core.activations import squared_relu
 from transformers import PretrainedConfig
-from typing import Any, Dict
+from typing import Any, Dict, Tuple
 
 from mcore_bridge.utils import get_env_args
 
@@ -122,6 +122,8 @@ config_mapping = {
     'mamba_num_groups': ['n_groups', 'mamba_num_groups'],
     'hybrid_layer_pattern': ['hybrid_override_pattern'],
     'fp32_residual_connection': ['residual_in_fp32'],
+    'moe_shared_expert_overlap': ['moe_shared_expert_overlap'],
+    'moe_latent_size': ['moe_latent_size'],
     'mtp_hybrid_override_pattern': ['mtp_hybrid_override_pattern'],
     # other
     'original_max_position_embeddings': ['original_max_position_embeddings'],
@@ -134,10 +136,40 @@ config_mapping = {
 }
 
 
+# transformers>=5.15 (huggingface/transformers#47384) keeps attributes that differ across layers in
+# `config.per_layer_config`; reading them on the global config raises AmbiguousGlobalPerLayerAttributeError.
+def has_per_layer_config(config) -> bool:
+    return getattr(config, 'per_layer_config', None) is not None
+
+
+def get_gemma4_attention_dims(text_config, layer_type: str) -> Tuple[int, int]:
+    """Return `(head_dim, num_key_value_heads)` used by Gemma 4 layers of `layer_type`."""
+    if has_per_layer_config(text_config):
+        layer_config = text_config.per_layer_config[layer_type]
+        return layer_config.head_dim, layer_config.num_key_value_heads
+    # transformers<5.15: full-attention layers read `global_head_dim` / `num_global_key_value_heads`.
+    is_sliding = layer_type == 'sliding_attention'
+    head_dim = text_config.global_head_dim if not is_sliding and text_config.global_head_dim else text_config.head_dim
+    if not is_sliding and text_config.attention_k_eq_v:
+        num_key_value_heads = text_config.num_global_key_value_heads
+    else:
+        num_key_value_heads = text_config.num_key_value_heads
+    return head_dim, num_key_value_heads
+
+
+def get_gemma4_rope_head_dim_key(text_config) -> str:
+    # transformers>=5.15 resolves `per_layer_config['full_attention']` in the RoPE init (global head_dim there).
+    return 'head_dim' if has_per_layer_config(text_config) else 'global_head_dim'
+
+
 def _convert_config(config, _internal_call=False) -> Dict[str, Any]:
     megatron_config = {}
+    # Per-layer attributes have no single global value; model-specific code reads them per layer.
+    per_layer_attributes = getattr(config, 'per_layer_attributes', None) or ()
     for k, hf_keys in config_mapping.items():
         for hf_k in hf_keys:
+            if hf_k in per_layer_attributes:
+                continue
             if hasattr(config, hf_k):
                 hf_v = getattr(config, hf_k)
                 if hf_v is None:
@@ -195,7 +227,28 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     res['hf_config'] = hf_config
     hf_model_type = res.get('hf_model_type')
     llm_model_type = res.get('llm_model_type') or hf_model_type
+    if hf_model_type in {'nemotron_h_omni', 'nemo_speechlm'}:
+        llm_model_type = 'nemotron_h'
     res['llm_model_type'] = llm_model_type
+    if hf_model_type == 'nemo_speechlm':
+        if not res.get('hybrid_layer_pattern'):
+            raise ValueError('Nemotron Transcribe requires text_config.hybrid_override_pattern.')
+        res['num_layers'] = len(res['hybrid_layer_pattern'])
+        res['moe_aux_loss_coeff'] = hf_config.aux_loss_coeff
+        res['actual_vocab_size'] = hf_config.text_config.vocab_size
+        # The audio placeholder is appended after the text vocabulary and has no source embedding row.
+        res['padded_vocab_size'] = max(int(res.get('padded_vocab_size') or 0), int(hf_config.audio_token_id) + 1)
+
+        mtp = getattr(hf_config, 'mtp', None) or {}
+        get_mtp = mtp.get if isinstance(mtp, dict) else lambda key, default=None: getattr(mtp, key, default)
+        depth = int(get_mtp('num_nextn_predict_layers', 0) or 0)
+        if get_mtp('enabled', False) and depth > 0:
+            pattern = get_mtp('hybrid_override_pattern')
+            if not pattern:
+                raise ValueError('nemo_speechlm MTP requires mtp.hybrid_override_pattern.')
+            res['hybrid_layer_pattern'] += ''.join(f'/{pattern}' for _ in range(depth))
+            res['mtp_hybrid_override_pattern'] = pattern
+            res['mtp_use_repeated_layer'] = bool(get_mtp('use_repeated_layer', False))
 
     first_k_dense_replace = res.pop('first_k_dense_replace', None)
     n_shared_experts = res.pop('n_shared_experts', None)
@@ -276,6 +329,12 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         # field); Megatron dev's hybrid transformer block, which expands the residual into mHC
         # streams, reads `hc_count` for the same thing.
         res['hc_count'] = res['num_residual_streams']
+        # dev splits mHC into two interfaces; the hybrid stack reads the new one.
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        tc = TransformerConfig.__dataclass_fields__
+        if 'enable_mhc_connections' in tc:
+            res['enable_mhc_connections'] = True
+            res['mhc_num_residual_streams'] = res['num_residual_streams']
         pattern = ''.join(('K' if attn == 'linear_attention' else 'D') + ('E' if mlp == 'sparse' else '-')
                           for attn, mlp in zip(layer_types, mlp_layer_types))
         res['hybrid_layer_pattern'] = pattern
@@ -297,6 +356,9 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
     elif llm_model_type in {'ernie4_5', 'ernie4_5_moe', 'glm4'}:
         res['rotary_interleaved'] = True
     elif hf_model_type in {'gemma4', 'gemma4_unified'}:
+        # Global defaults follow the sliding layers; `Gemma4SelfAttention` overrides them for full-attention layers.
+        res['kv_channels'], res['num_query_groups'] = get_gemma4_attention_dims(hf_config.text_config,
+                                                                                'sliding_attention')
         res['qk_layernorm'] = True
         res['window_size'] = f'{window_size - 1},0'
         window_attn_skip_freq = ','.join(['1' if lt == 'sliding_attention' else '0' for lt in layer_types])

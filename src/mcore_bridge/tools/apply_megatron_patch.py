@@ -4,11 +4,11 @@
     pip install git+https://github.com/NVIDIA/Megatron-LM.git@dev
     python -m mcore_bridge.tools.apply_megatron_patch
 
-The patch (`patches/megatron_glm53_dev.patch`, generated against dev ee743d3ef) backports the
-unmerged Megatron-LM #7054 GLM numerics -- KDA two-stage gates, mHC precision, KPool DSA -- plus two
-Megatron fixes that are not model specific (expert shards deduplicated over the expert TP group when
-the gradient norm is computed, and `allreduce` preserved on fp32 master parameters). Both parts go
-away once they land upstream.
+The patch (`patches/megatron_glm53_dev.patch`) is rebased onto dev c4220af3a (2026-10-29) and backports
+the unmerged Megatron-LM #7054 GLM numerics -- KDA two-stage gates, mHC precision -- plus GLM's
+parameter-free mHC output mean and KDA in_proj width derivation. KPool DSA / NoPE MLA and the two
+non-model-specific optimizer fixes are no longer in the patch: upstream a5aa637fa already carries
+them. Everything here goes away once #7054 / #7521 land upstream.
 
 #7054 is tracked by content, not by branch: the numerics come from its `be805e55`, and the chunked
 index-score computation from its current head `3fceb0715`. The chunking matters at real scale --
@@ -55,7 +55,11 @@ def git_root(root: pathlib.Path) -> bool:
 def patch_files(source_checkout: bool) -> Dict[str, str]:
     """Select existing-file diffs, preserving test changes only for source checkouts."""
     entries = {}
-    for section in re.split(r'(?=^diff --git )', PATCH.read_text(), flags=re.MULTILINE):
+    # The patch starts with an informational header (leading `#`/blank lines) that records the
+    # tested upstream commit and the install steps. `git apply` skips it, so strip it before
+    # parsing `diff --git` sections.
+    body = re.sub(r'\A(?:[ \t]*#.*\n|[ \t]*\n)+', '', PATCH.read_text())
+    for section in re.split(r'(?=^diff --git )', body, flags=re.MULTILINE):
         if not section.strip():
             continue
         match = re.match(r'diff --git a/(\S+) b/\1\n', section)

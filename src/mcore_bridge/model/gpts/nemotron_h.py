@@ -9,6 +9,8 @@ and MTP can span several heterogeneous inner layers.
 import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -16,23 +18,11 @@ from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
-from mcore_bridge.utils import get_logger
+from mcore_bridge.utils import deep_getattr, get_logger
 
 from ..constant import ModelType
+from ..hybrid_model import HybridModel
 from ..register import ModelLoader, ModelMeta, register_model
-
-try:
-    from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-
-    from ..hybrid_model import HybridModel
-
-    _HYBRID_MODEL_AVAILABLE = True
-except ImportError as error:
-    if not (error.name or '').startswith('megatron.core.models.hybrid'):
-        raise
-    HybridModel = HybridStack = HybridStackSubmodules = hybrid_stack_spec = None
-    _HYBRID_MODEL_AVAILABLE = False
 
 logger = get_logger()
 
@@ -226,18 +216,22 @@ class NemotronHBridge(GPTBridge):
         mg_param = None if mg_mixer is None else mg_mixer.in_proj.weight
         self._set_mamba_packed(mg_param, hf_state_dict, 'in_proj.weight', self._mamba_block_sizes(), to_mcore)
 
+    @staticmethod
+    def _mamba_conv1d_mg_key(mg_mixer, suffix):
+        if mg_mixer is not None and hasattr(mg_mixer, f'conv1d_{suffix}'):
+            return f'conv1d_{suffix}'
+        return f'conv1d.{suffix}'
+
     def _set_mamba_conv1d(self, mg_mixer, hf_state_dict, to_mcore: bool):
         """conv1d mirrors `in_proj` minus the dt block: [x, B, C] along dim 0."""
-        if self.tp_size == 1:
-            self._set_state_dict(mg_mixer, 'conv1d_weight', hf_state_dict, 'conv1d.weight', to_mcore)
-            self._set_state_dict(mg_mixer, 'conv1d_bias', hf_state_dict, 'conv1d.bias', to_mcore)
-            return
-        d_inner = self.config.mamba_num_heads * self.config.mamba_head_dim
-        bc = self.config.mamba_num_groups * self.config.mamba_state_dim
-        blocks = [d_inner, bc, bc]
-        for mg_name, hf_name in (('conv1d_weight', 'conv1d.weight'), ('conv1d_bias', 'conv1d.bias')):
-            mg_param = None if mg_mixer is None else getattr(mg_mixer, mg_name)
-            self._set_mamba_packed(mg_param, hf_state_dict, hf_name, blocks, to_mcore)
+        blocks = self._mamba_block_sizes()[1:-1]
+        for suffix in ('weight', 'bias'):
+            mg_key = self._mamba_conv1d_mg_key(mg_mixer, suffix)
+            mg_param = deep_getattr(mg_mixer, mg_key)
+            if self.tp_size == 1:
+                self._set_state_dict(mg_mixer, mg_key, hf_state_dict, f'conv1d.{suffix}', to_mcore)
+            else:
+                self._set_mamba_packed(mg_param, hf_state_dict, f'conv1d.{suffix}', blocks, to_mcore)
 
     def _set_layer_mlp(self, mg_layer, hf_state_dict, layer_idx: int, to_mcore: bool, is_mtp: bool = False):
         """Convert the channel-mixing half of a layer: MoE for 'E'."""
@@ -246,6 +240,11 @@ class NemotronHBridge(GPTBridge):
             hf_state_dict.update(
                 self._set_moe_state(
                     mg_mlp, hf_state_dict, f'{self.hf_mlp_prefix}.', layer_idx, to_mcore, is_mtp=is_mtp))
+            # nemotron3.5-super-vl
+            if self.config.moe_latent_size:
+                for name in ('fc1_latent_proj', 'fc2_latent_proj'):
+                    self._set_state_dict(mg_mlp, f'{name}.weight', hf_state_dict, f'{self.hf_mlp_prefix}.{name}.weight',
+                                         to_mcore)
             self._set_state_dict(mg_layer, 'pre_mlp_layernorm.weight', hf_state_dict, self.hf_input_layernorm_key,
                                  to_mcore)
         # mamba / attention layers have no MLP sub-module.
@@ -333,7 +332,7 @@ class NemotronHBridge(GPTBridge):
         them as two `mtp.layers.{0,1}` entries: index 0 carries `enorm`/`hnorm`/`eh_proj`
         plus the attention mixer, index 1 the MoE mixer plus `final_layernorm`. mcore keeps
         both under `mtp.layers[depth].mtp_model_layer.layers[i]`, so the base class
-        assumption of a single `mtp_layer.transformer_layer` does not hold.
+        assumption of a single `mtp_layer.mtp_model_layer` does not hold.
         """
         pattern = self.config.mtp_hybrid_override_pattern
         mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
@@ -420,11 +419,12 @@ class NemotronHLoader(ModelLoader):
         return model
 
 
-if _HYBRID_MODEL_AVAILABLE:
-    register_model(
-        ModelMeta(
-            ModelType.nemotron_h,
-            ['nemotron_h'],
-            bridge_cls=NemotronHBridge,
-            loader=NemotronHLoader,
-        ))
+register_model(
+    ModelMeta(
+        ModelType.nemotron_h,
+        ['nemotron_h'],
+        bridge_cls=NemotronHBridge,
+        loader=NemotronHLoader,
+        mtp_prefix='mtp',
+        mtp_depth_field='mtp_num_hidden_layers',
+    ))

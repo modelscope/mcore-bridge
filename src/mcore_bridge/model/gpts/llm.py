@@ -10,4 +10,5 @@ register_model(
             'deepseek_v3', 'deepseek_v32', 'kimi_k2', 'dots1', 'ernie4_5', 'ernie4_5_moe', 'glm4_moe', 'glm4_moe_lite',
             'gpt_oss'
         ],
+        mtp_prefix='model.layers',
     ))

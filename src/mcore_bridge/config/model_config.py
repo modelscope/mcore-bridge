@@ -5,11 +5,11 @@ import re
 import torch.nn.functional as F
 from dataclasses import dataclass
 from megatron.core import mpu
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
-from transformers.utils.versions import require_version
 from typing import List, Literal, Optional, Union
 
 from mcore_bridge.utils import get_logger, json_parse_to_dict
@@ -250,6 +250,11 @@ class ModelConfig(TransformerConfig):
     csa_compress_rotary_base: float = 40000.0
     o_groups: int = 8
     o_lora_rank: int = 1024
+
+    # Canonical names consumed by TransformerConfig.__post_init__ since the main->dev sync (0.20+);
+    # `o_groups` / `o_lora_rank` remain the dev-era aliases and are reconciled against these.
+    output_projection_groups: int = 8
+    output_projection_lora_rank: int = 1024
     enable_hyper_connections: bool = False
     num_residual_streams: int = 4
     mhc_sinkhorn_iterations: int = 20
@@ -283,6 +288,9 @@ class ModelConfig(TransformerConfig):
 
     # mtp
     mtp_decoder_input_detach: bool = False
+    # Allow a full-finetune checkpoint that carries no MTP weights to random-init them.
+    # Off by default: a missing MTP key set is usually a wrong path/name, not intent.
+    mtp_allow_random_init: bool = False
     mtp_shared_weights: bool = False
     #: Keep the MTP layers out of the optimizer. They are still built, loaded and exported, so the
     #: saved checkpoint stays usable for speculative decoding -- only the gradient is dropped.
@@ -322,53 +330,12 @@ class ModelConfig(TransformerConfig):
     num_labels: Optional[int] = None
     mlp_padding_free: bool = False
 
-    _mindspeed_defaults_cache = None
-
-    def _augment_mindspeed_defaults(self):
-        if not is_torch_npu_available():
-            return
-
-        if ModelConfig._mindspeed_defaults_cache is None:
-            defaults = {}
-            try:
-                import mindspeed.features_manager as mfm
-                from argparse import ArgumentParser
-                from mindspeed.arguments import process_args
-
-                original_features = list(mfm.FEATURES_LIST)
-                full_features = mfm.create_features_list()
-                mfm.FEATURES_LIST.clear()
-                mfm.FEATURES_LIST.extend(full_features)
-                try:
-                    parser = ArgumentParser()
-                    process_args(parser)
-                    # Parse args from sys.argv
-                    args, _ = parser.parse_known_args([])
-                    defaults = vars(args)
-                finally:
-                    mfm.FEATURES_LIST.clear()
-                    mfm.FEATURES_LIST.extend(original_features)
-            except Exception as e:
-                logger.warning(f'Failed to get MindSpeed defaults, which may cause issues on NPU: {e}')
-                defaults = {}
-            ModelConfig._mindspeed_defaults_cache = defaults
-
-        for name, value in ModelConfig._mindspeed_defaults_cache.items():
-            if not hasattr(self, name):
-                setattr(self, name, value)
-            elif hasattr(self, name) and getattr(self, name) is None and value is not None:
-                setattr(self, name, value)
-
     def __post_init__(self):
         from mcore_bridge.model import get_mcore_model_type, get_model_meta
-        self._augment_mindspeed_defaults()
         self._format_config()
         if self.hf_model_type == 'glm5_next':
             from mcore_bridge.model.mm_gpts.glm5_next import require_glm5_hybrid
             require_glm5_hybrid()
-        if self.experimental_attention_variant is not None:
-            require_version('megatron-core>=0.16.0.dev',
-                            'experimental attention variant requires megatron-core>=0.16.0')
         if isinstance(self.moe_router_dtype, str) and self.moe_router_dtype.lower() == 'none':
             self.moe_router_dtype = None
         if self.moe_shared_expert_intermediate_size == 0:
@@ -395,11 +362,6 @@ class ModelConfig(TransformerConfig):
             self.activation_func = F.silu
             self.gated_linear_unit = True
         if self.quick_geglu:
-            # megatron-core>=0.14.0
-            try:
-                from megatron.core.fusions.fused_bias_geglu import quick_gelu
-            except ImportError:
-                from megatron.core.activations import quick_gelu
             assert not self.swiglu
             self.gated_linear_unit = True
             self.activation_func = quick_gelu
@@ -409,8 +371,14 @@ class ModelConfig(TransformerConfig):
             self.apply_query_key_layer_scaling = self.fp16
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
+        # mtp_num_layers is always the *logical* prediction depth.
+        # mtp_shared_weights=True switches MTP to the unrolled layout: mtp_num_layers is
+        # folded into mtp_unroll_steps and the block is built once (v5 path).
+        if isinstance(self.mtp_num_layers, str):
+            raise TypeError('mtp_num_layers must be an int or None; '
+                            'use resolve_mtp_config() to resolve "auto".')
         if self.mtp_shared_weights:
-            assert self.mtp_num_layers is not None
+            assert self.mtp_num_layers is not None and self.mtp_num_layers > 0
             self.mtp_unroll_steps = self.mtp_num_layers
             self.mtp_num_layers = 1
         else:
@@ -538,7 +506,7 @@ class ModelConfig(TransformerConfig):
             required_ep = (num_experts + MAX_NPU_EXPERTS_PER_EP - 1) // MAX_NPU_EXPERTS_PER_EP
             if expert_model_parallel_size < required_ep:
                 logger.warning(f'{">" * 20} WARNING {"<" * 20}\n'
-                               f'MindSpeed on NPU supports up to {MAX_NPU_EXPERTS_PER_EP} experts per EP group. '
+                               f'NPU grouped matmul supports up to {MAX_NPU_EXPERTS_PER_EP} experts per EP group. '
                                f'num_experts={num_experts}, '
                                f'expert_model_parallel_size={expert_model_parallel_size}. '
                                f'Please set expert_model_parallel_size (EP) to {required_ep} '

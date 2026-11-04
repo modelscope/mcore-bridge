@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.router import TopKRouter
 from peft import LoraModel
@@ -7,6 +8,7 @@ from peft.tuners.lora import Linear as LoraLinear
 from peft.tuners.lora import model
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch import nn
+from transformers.utils import is_torch_npu_available
 from typing import Optional
 
 from mcore_bridge.utils import patch_deepcopy
@@ -28,6 +30,9 @@ def dispatch_megatron(
         target_base_layer = target
 
     linear_cls = (TELayerNormColumnParallelLinear, TELinear, TEGroupedLinear, TopKRouter)
+    if is_torch_npu_available():
+        # MindSpeed uses native mcore classes for TE parallel linears.
+        linear_cls += (ColumnParallelLinear, RowParallelLinear)
     if isinstance(target_base_layer, linear_cls):
         new_module = LoraParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
 

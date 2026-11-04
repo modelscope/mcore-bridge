@@ -26,10 +26,11 @@ from typing import List, Optional
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
-from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, MultiTokenPredictionLayer, QSAIndexer,
-                       QSASparseCoreAttention, Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock,
-                       TransformerLayer, qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
+                       Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
+                       qsa_sparse_supported, use_qsa_sparse_kernel)
 from ..modules.ple import Qwen4ExpTextNGramEmbedding
+from ..mtp import MultiTokenPredictionLayer
 from ..register import ModelLoader
 from .qwen3_next import Qwen3NextBridge, Qwen3NextRMSNorm, Qwen3NextSelfAttention
 
@@ -543,7 +544,8 @@ class Qwen4ExpBridge(Qwen3NextBridge):
             # them instead of KeyError-ing on `ple.ple_embedding.layer_multipliers`.
             skip_ngram_state = self._peft_format
         else:
-            skip_ngram_state = not self._is_saving and (self._peft_format or ple_offloaded)
+            # Adapter saves must also omit the base n-gram buffers and table.
+            skip_ngram_state = self._peft_format or (not self._is_saving and ple_offloaded)
         for buf in () if skip_ngram_state else self._PLE_NGRAM_BUFFERS:
             if to_mcore:
                 buffer = getattr(ple.ple_embedding, buf)
@@ -664,7 +666,7 @@ class Qwen4ExpBridge(Qwen3NextBridge):
         # Inner block: a full-attention + MoE Qwen4ExpLayer with its own gated hyper-connections.
         # layer_idx=-1 routes _set_layer_attn through linear_attention_freq[-1] (the backbone's last
         # layer, full_attention), matching the MTP head, which is always full-attention.
-        inner = None if mtp_layer is None else mtp_layer.transformer_layer
+        inner = None if mtp_layer is None else mtp_layer.mtp_model_layer
         hf_state_dict.update(self._set_layer_attn(inner, hf_state_dict, -1, to_mcore))
         hf_state_dict.update(self._set_layer_mlp(inner, hf_state_dict, -1, to_mcore, is_mtp=True))
         self._set_layer_hc(inner, hf_state_dict, to_mcore)
@@ -763,15 +765,10 @@ class Qwen4ExpLoader(ModelLoader):
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 sub = layer_spec.submodules
-                # The residual_linear_shared head needs Megatron's mHC *projection* form (separate
-                # e_proj/h_proj slots). megatron-core <= 0.18 only has the fused eh_proj slot, and
-                # assigning e_proj/h_proj there would silently no-op and surface later as an
-                # AttributeError on self.e_proj -- so reject early and name the fix.
                 if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
-                    raise NotImplementedError(
-                        'Qwen3.8-Flash-Next MTP requires a Megatron whose MultiTokenPredictionLayerSubmodules '
-                        'exposes e_proj/h_proj (megatron-core >= 0.19 / dev); got '
-                        f'{megatron.core.__version__}.')
+                    raise NotImplementedError('Qwen3.8-Flash-Next MTP requires a Megatron dev build exposing separate '
+                                              f'e_proj/h_proj, got {megatron.core.__version__}.'
+                                              'run pip install "git+https://github.com/NVIDIA/Megatron-LM.git@dev"')
                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm

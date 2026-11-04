@@ -1,7 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import copy
 import math
-import megatron.core
 import os
 import torch
 import torch.nn.functional as F
@@ -18,22 +16,18 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import (copy_to_tensor_model_parallel_region,
                                                     gather_from_sequence_parallel_region,
                                                     reduce_from_tensor_model_parallel_region)
-from megatron.core.transformer.multi_token_prediction import (MTPLossAutoScaler, MTPLossLoggingHelper,
-                                                              tie_word_embeddings_state_dict)
+from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from packaging import version
 from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
+from mcore_bridge.utils import get_logger, split_cp_inputs
 
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
-
-mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
-mcore_019 = version.parse(megatron.core.__version__) >= version.parse('0.19.0rc0')
 
 
 class OutputLayerLinear(TELinear):
@@ -345,7 +339,7 @@ class GPTModel(McoreGPTModel):
         full_attention_mask = attention_mask
         if isinstance(full_attention_mask, dict):
             full_attention_mask = full_attention_mask['full_attention']
-        if mcore_016 and full_attention_mask is not None:
+        if full_attention_mask is not None:
             assert packed_seq_params is None
             padding_mask = full_attention_mask.all(dim=(1, 2))
             if self.config.context_parallel_size > 1:
@@ -535,6 +529,12 @@ class GPTModel(McoreGPTModel):
         # received a single gradient, with no error and no mtp_loss in the logs to show it.
         mtp_targets = labels if labels is not None else mtp_labels
         if self.mtp_process and mtp_targets is not None and not in_inference_mode:
+            # Extract bridge-specific params from extra_block_kwargs before
+            # forwarding to the MTP block.
+            ebk = dict(extra_block_kwargs or {})
+            mhc_multistream = ebk.pop('mhc_multistream', None)
+            padding_mask = ebk.pop('padding_mask', None)
+
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -548,8 +548,11 @@ class GPTModel(McoreGPTModel):
                 sequence_len_offset=sequence_len_offset,
                 embedding=self.embedding,
                 decoder_input=decoder_input if self.config.is_multimodal else None,
-                **(extra_block_kwargs or {}),
+                padding_mask=padding_mask,
+                mhc_multistream=mhc_multistream,
+                **ebk,
             )
+
             mtp_labels = mtp_targets.clone()
             hidden_states_list = torch.chunk(hidden_states, 1 + self.config.mtp_unroll_steps, dim=0)
             hidden_states = hidden_states_list[0]
@@ -691,12 +694,8 @@ class GPTModel(McoreGPTModel):
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
 
         assert not sharded_offsets, 'Unexpected sharded offsets'
-        if mcore_016:
-            from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
-            metadata = ensure_metadata_has_dp_cp_group(metadata)
-            kwargs = {'tp_group': self.tp_group, 'dp_cp_group': metadata['dp_cp_group']}
-        else:
-            kwargs = {}
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        kwargs = {'tp_group': self.tp_group, 'dp_cp_group': metadata['dp_cp_group']}
         # Skip LanguageModule.sharded_state_dict to avoid KeyError on output_layer.weight.
         sharded_state_dict = super(LanguageModule, self).sharded_state_dict(prefix, sharded_offsets, metadata)
 

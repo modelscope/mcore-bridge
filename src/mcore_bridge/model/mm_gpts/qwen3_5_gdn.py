@@ -23,4 +23,6 @@ if use_mcore_gdn:
             bridge_cls=Qwen3_5Bridge,
             visual_cls=Qwen3_5Vit,
             loader=Qwen3NextLoader,
+            mtp_prefix='mtp',
+            mtp_depth_field='mtp_num_hidden_layers',
         ))

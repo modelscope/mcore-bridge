@@ -18,12 +18,6 @@ _GMM_GROUP_BY_K_AXIS = 2
 _GMM_GROUP_LIST_IS_EXPERT_SIZES = 1
 
 
-def _is_mindspeed_grouped_linear(base_layer) -> bool:
-    if not (is_torch_npu_available() and isinstance(base_layer, TEGroupedLinear)):
-        return False
-    return type(base_layer).__module__.startswith('mindspeed.')
-
-
 def _has_moe_local_expert_grouping(base_layer) -> bool:
     config = getattr(base_layer, 'config', None)
     num_moe_experts = getattr(config, 'num_moe_experts', None)
@@ -41,16 +35,16 @@ def is_expert_layer(base_layer) -> bool:
     is_expert = getattr(base_layer, 'is_expert', None)
     if is_expert is not None:
         return bool(is_expert)
-    if _is_mindspeed_grouped_linear(base_layer):
+    if is_torch_npu_available() and isinstance(base_layer, TEGroupedLinear):
         if getattr(base_layer, 'explicit_expert_comm', False):
             return True
         has_moe_local_expert_grouping = _has_moe_local_expert_grouping(base_layer)
         if getattr(base_layer, 'expert_parallel', False):
             return has_moe_local_expert_grouping
-        # MindSpeedTEGroupedLinear receives is_expert but does not keep it as
-        # an attribute. When EP/ETP does not trigger explicit expert comm,
-        # fall back to the TEGroupedMLP invariant: one grouped slot per local
-        # expert.
+        # MCore's TEGroupedLinear requires is_expert=True at construction but
+        # does not retain that argument. With EP=ETP=1 there is no explicit
+        # expert communication, so use the TEGroupedMLP invariant: one grouped
+        # GEMM slot per local expert.
         return has_moe_local_expert_grouping
     return False
 
@@ -76,15 +70,25 @@ class NpuGroupedLoraLinear(nn.Module):
         device = torch.device('cpu') if config.use_cpu_initialization else get_current_device()
         dtype = config.params_dtype
         for i in range(num_gemms):
-            self.register_parameter(
-                f'weight{i}',
-                nn.Parameter(torch.empty(output_size, input_size, device=device, dtype=dtype)),
-            )
+            weight = nn.Parameter(torch.empty(output_size, input_size, device=device, dtype=dtype))
+            bias_param = None
             if bias:
-                self.register_parameter(
-                    f'bias{i}',
-                    nn.Parameter(torch.empty(output_size, device=device, dtype=dtype)),
-                )
+                bias_param = nn.Parameter(torch.empty(output_size, device=device, dtype=dtype))
+            if is_expert:
+                # Mark expert adapter parameters with the same topology metadata
+                # Megatron attaches to expert layers. Consumers such as the
+                # parameter/gradient buffer classify a parameter as expert from
+                # ``not getattr(param, 'allreduce', True)``; without it these
+                # per-expert adapters are treated as ordinary dense parameters
+                # and can be reduced over the wrong (dense TP/DP) group.
+                # ``allreduce=False`` still synchronizes replicas of the *same*
+                # expert through expert data parallel.
+                weight.allreduce = False
+                if bias_param is not None:
+                    bias_param.allreduce = False
+            self.register_parameter(f'weight{i}', weight)
+            if bias_param is not None:
+                self.register_parameter(f'bias{i}', bias_param)
 
     @property
     def weight(self):
@@ -138,6 +142,8 @@ class NpuGroupedLoraLinear(nn.Module):
                     param,
                     f'{key_prefix}{param_name}',
                     prepend_offsets=new_sharded_offsets,
+                    tp_group=parallel_state.get_expert_tensor_parallel_group(),
+                    dp_cp_group=parallel_state.get_expert_data_parallel_group(),
                 )
                 sharded_state_dict[f'{prefix}{local_name}'] = self._set_expert_replica_id(sharded_tensor)
 
