@@ -90,6 +90,11 @@ def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
     # cp_size > 1, assumes Megatron's zigzag split. DSv4 uses a contiguous split and already
     # stores the absolute position in row i of `freqs`, so the elementwise bshd path is the
     # one that matches this tensor. The argument stays so existing callers keep working.
+    # Packed shared K has shape [tokens, dim], while the pre-indexed table may
+    # retain singleton batch/head axes. Align ranks before elementwise rotation
+    # so broadcasting cannot introduce another token axis.
+    while freqs.ndim > t.ndim and freqs.shape[-2] == 1:
+        freqs = freqs.squeeze(-2)
     return apply_rotary_pos_emb(
         t,
         freqs,
