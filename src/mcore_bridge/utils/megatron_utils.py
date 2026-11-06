@@ -136,6 +136,7 @@ def reconstruct_tensor_cp(tensor, packed_seq_params, dim: int, cp_partition_mode
     return out
 
 
+# Upstream slices inside get_gpt_decoder_block_spec and exposes no helper; mirror that slice here.
 def get_local_layer_specs(config, layer_specs, vp_stage=None):
     num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage)
 

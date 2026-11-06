@@ -35,14 +35,14 @@ _PROCESS_MTP_LOSS_PARAMS = tuple(inspect.signature(_upstream_process_mtp_loss).p
 class MtpCapabilities:
     """Signatures of the installed upstream MTP layer/block.
 
-    Releases (0.18/0.19) and dev disagree on what the layer forward accepts and
+    Releases (0.18-0.20) and dev disagree on what the layer forward accepts and
     returns, so the bridge probes the installed code instead of branching on a
     version number.
     """
 
     has_detach_heads: bool = False
 
-    # Knobs that differ across 0.20 / main / dev; gate on these, not on version numbers.
+    # Knobs that differ across releases (0.18-0.20) and dev; gate on these, not on version numbers.
     has_mtp_hybrid_override_pattern: bool = False
     has_freeze_base_model_for_mtp: bool = False
     has_mtp_loss_early_backward: bool = False
@@ -511,8 +511,8 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
 
     Per-forward bridge state lives on block attributes (no upstream block/layer
     forward takes ``**kwargs``) and is read by :class:`MultiTokenPredictionLayer` through a
-    back-reference. Releases (0.18/0.19) get the manual per-depth loop; on dev
-    (native ``roll_depth`` / ``mhc_multistream``) the loop is delegated to upstream.
+    back-reference. 0.18/0.19 get the bridge's manual per-depth loop; 0.20+ and dev
+    (native ``roll_depth`` / ``mhc_multistream``) delegate the loop to upstream.
     """
 
     # Per-forward bridge state, consumed by MultiTokenPredictionLayer via _bridge_block.

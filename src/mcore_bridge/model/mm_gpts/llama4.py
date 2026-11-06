@@ -1,10 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
-from copy import deepcopy
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from transformers import PretrainedConfig
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 
@@ -70,16 +67,12 @@ class Llama4Bridge(GPTBridge):
 
 class Llama4Loader(ModelLoader):
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        layer_specs = super().get_transformer_layer_spec(vp_stage)
-        for i, layer_spec in enumerate(layer_specs.layer_specs):
-            global_i = i + get_transformer_layer_offset(self.config, vp_stage)
-            no_rope = self.config.no_rope_freq[global_i]
-            layer_spec = deepcopy(layer_spec)
-            if no_rope:
+    def _build_decoder_layer_specs(self):
+        layer_specs = super()._build_decoder_layer_specs()
+        for layer_idx, layer_spec in enumerate(layer_specs):
+            if self.config.no_rope_freq[layer_idx]:
                 layer_spec.submodules.self_attention.submodules.q_layernorm = IdentityOp
                 layer_spec.submodules.self_attention.submodules.k_layernorm = IdentityOp
-                layer_specs.layer_specs[i] = layer_spec
         return layer_specs
 
 

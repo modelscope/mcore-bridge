@@ -13,14 +13,13 @@ from megatron.core.tensor_parallel import (all_gather_last_dim_from_tensor_paral
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import build_module
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.utils import deprecate_inference_params, is_fa_min_version, nvtx_range_pop, nvtx_range_push
 from transformers.utils import is_torch_npu_available
 from typing import Optional, Tuple, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, get_num_samples
+from mcore_bridge.utils import get_env_args, get_logger, get_num_samples
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
@@ -525,8 +524,9 @@ class Qwen3NextBridge(GPTBridge):
 
 class Qwen3NextLoader(ModelLoader):
     gated_delta_net = Qwen3NextGatedDeltaNet
+    final_layer_norm_cls = Qwen3NextRMSNorm
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
+    def _build_decoder_layer_specs(self):
         config = self.config
         config.hetereogenous_dist_checkpoint = True
         # compat Qwen3NextGatedDeltaNet
@@ -534,8 +534,6 @@ class Qwen3NextLoader(ModelLoader):
         config.rms_norm_eps = config.layernorm_epsilon
         config.dtype = config.params_dtype
 
-        # Use Zero-Centered RMSNorm to match HuggingFace exactly (no +1/-1 conversion needed)
-        layer_norm_impl = Qwen3NextRMSNorm
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
             moe_grouped_gemm=config.moe_grouped_gemm,
@@ -544,34 +542,29 @@ class Qwen3NextLoader(ModelLoader):
             use_kitchen=config.use_kitchen,
         )
         layer_specs = []
-        for is_linear_attention in self.config.linear_attention_freq:
+        for is_linear_attention in config.linear_attention_freq:
             layer_spec = deepcopy(moe_layer_spec)
             if is_linear_attention:
                 layer_spec.submodules.self_attention.module = self.gated_delta_net
             else:
                 layer_spec.submodules.self_attention.submodules.linear_qkv = TEColumnParallelLinear
                 layer_spec.submodules.self_attention.module = Qwen3NextSelfAttention
-            # Replace ALL layernorms with Qwen3NextRMSNorm (Zero-Centered)
-            layer_spec.submodules.input_layernorm = layer_norm_impl
+            # Zero-centered RMSNorm everywhere, matching HuggingFace without a +1/-1 conversion.
+            layer_spec.submodules.input_layernorm = Qwen3NextRMSNorm
             if hasattr(layer_spec.submodules, 'pre_mlp_layernorm'):
-                layer_spec.submodules.pre_mlp_layernorm = layer_norm_impl
+                layer_spec.submodules.pre_mlp_layernorm = Qwen3NextRMSNorm
             # qwen3.5 dense
             if config.hf_model_type == 'qwen3_5':
                 layer_spec.submodules.mlp.submodules.linear_fc1 = TEColumnParallelLinear
             # Replace qk_layernorm if present
             if hasattr(layer_spec.submodules.self_attention.submodules, 'q_layernorm'):
-                layer_spec.submodules.self_attention.submodules.q_layernorm = layer_norm_impl
+                layer_spec.submodules.self_attention.submodules.q_layernorm = Qwen3NextRMSNorm
             if hasattr(layer_spec.submodules.self_attention.submodules, 'k_layernorm'):
-                layer_spec.submodules.self_attention.submodules.k_layernorm = layer_norm_impl
+                layer_spec.submodules.self_attention.submodules.k_layernorm = Qwen3NextRMSNorm
             layer_specs.append(layer_spec)
+        return layer_specs
 
-        local_layer_specs = get_local_layer_specs(config, layer_specs, vp_stage=vp_stage)
-        block_spec = TransformerBlockSubmodules(layer_specs=local_layer_specs, layer_norm=layer_norm_impl)
-
-        return block_spec
-
-    def get_mtp_block_spec(self, *args, **kwargs):
-        mtp_block_spec = super().get_mtp_block_spec(*args, **kwargs)
+    def _patch_mtp_block_spec(self, mtp_block_spec):
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 layer_spec.submodules.enorm = Qwen3NextRMSNorm
