@@ -5,7 +5,6 @@ from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_par
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
@@ -103,11 +102,11 @@ class MinimaxM2Bridge(GPTBridge):
 
 class MinimaxM2Loader(ModelLoader):
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        transformer_layer_spec = super().get_transformer_layer_spec(vp_stage)
-        for layer_spec in transformer_layer_spec.layer_specs:
+    def _build_decoder_layer_specs(self):
+        layer_specs = super()._build_decoder_layer_specs()
+        for layer_spec in layer_specs:
             layer_spec.submodules.self_attention.module = MinimaxM2SelfAttention
-        return transformer_layer_spec
+        return layer_specs
 
 
 register_model(ModelMeta(

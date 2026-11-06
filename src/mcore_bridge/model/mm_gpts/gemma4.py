@@ -843,6 +843,7 @@ class Gemma4Loader(ModelLoader):
             for layer_spec, moe_layer_spec in zip(layer_specs.layer_specs, moe_layer_specs.layer_specs):
                 layer_spec.submodules.experts_mlp = moe_layer_spec.submodules.mlp
                 self._set_mlp_spec(layer_spec.submodules, Gemma4MoELayer, mlp_key='experts_mlp')
+        layer_specs.layer_specs = self._patch_layer_specs(layer_specs.layer_specs)
         return layer_specs
 
     def _set_transformer_layer(self, transformer_layer_spec):

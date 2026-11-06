@@ -318,6 +318,7 @@ class MuseGlimmerLoader(ModelLoader):
             self.config, use_transformer_engine=True, normalization=self.config.normalization, vp_stage=vp_stage)
         for layer_spec in layer_specs.layer_specs:
             layer_spec.submodules.self_attention.module = MuseGlimmerSelfAttention
+        layer_specs.layer_specs = self._patch_layer_specs(layer_specs.layer_specs)
         return layer_specs
 
     def _set_transformer_layer(self, transformer_layer_spec):

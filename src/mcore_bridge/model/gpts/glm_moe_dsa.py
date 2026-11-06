@@ -3,7 +3,6 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (DSAInd
                                                                           DSAIndexerLossLoggingHelper)
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention as McoreDSAttention
 from megatron.core.transformer.experimental_attention_variant.dsa import FusedDSAIndexerLoss, unfused_dsa_fn
-from typing import Optional
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
@@ -20,19 +19,18 @@ class DSAttention(McoreDSAttention):
 
 class GlmMoeDsaLoader(ModelLoader):
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        transformer_layer_spec = super().get_transformer_layer_spec(vp_stage)
-        if self.config.dsa_indexer_topk_freq > 1 and getattr(DSAttention, '_HOLDER_ATTR', None) is None:
-            raise ImportError(
-                'Please install the megatron-core main branch to support the "shared" indexer layer of `glm_moe_dsa`: '
-                '`pip install git+https://github.com/NVIDIA/Megatron-LM.git`')
+    def _build_decoder_layer_specs(self):
+        layer_specs = super()._build_decoder_layer_specs()
         if self.config.dsa_indexer_topk_freq > 1:
-            for layer_spec in transformer_layer_spec.layer_specs:
+            if getattr(DSAttention, '_HOLDER_ATTR', None) is None:
+                raise ImportError('glm_moe_dsa with dsa_indexer_topk_freq > 1 requires megatron-core >= 0.19: '
+                                  'the shared-indexer carrier (`DSAttention._HOLDER_ATTR`) entered the release in 0.19 '
+                                  'and is absent from 0.18.')
+            for layer_spec in layer_specs:
                 core_attn = layer_spec.submodules.self_attention.submodules.core_attention
                 if hasattr(core_attn, 'module') and issubclass(core_attn.module, McoreDSAttention):
                     core_attn.module = DSAttention
-
-        return transformer_layer_spec
+        return layer_specs
 
 
 register_model(ModelMeta(

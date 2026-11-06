@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from contextlib import contextmanager
 from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_mtp_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
@@ -17,13 +17,12 @@ from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_par
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.utils import make_viewless_tensor
 from torch import nn
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_env_args, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
 from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
@@ -680,6 +679,9 @@ class Qwen4ExpBridge(Qwen3NextBridge):
 
 class Qwen4ExpLoader(ModelLoader):
     transformer_block = Qwen4ExpTransformerBlock
+    # No final layernorm in this model; keep the slot so the HC mixer stage logic
+    # (has_final_layernorm_in_this_stage) still triggers.
+    final_layer_norm_cls = IdentityOp
 
     def _get_moe_layer_pattern(self) -> List[bool]:
         config = self.config
@@ -689,7 +691,7 @@ class Qwen4ExpLoader(ModelLoader):
         # int N: one MoE every N layers (mcore convention: i % N == N - 1).
         return [i % freq == freq - 1 for i in range(config.num_layers)]
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
+    def _build_decoder_layer_specs(self):
         config = self.config
         config.hetereogenous_dist_checkpoint = True
         if config.context_parallel_size > 1 and getattr(config, 'cp_comm_type', None) in (None, 'p2p'):
@@ -741,17 +743,13 @@ class Qwen4ExpLoader(ModelLoader):
                 layer_spec.submodules.pre_mlp_layernorm = IdentityOp
             layer_specs.append(layer_spec)
 
-        local_layer_specs = get_local_layer_specs(config, layer_specs, vp_stage=vp_stage)
-        # No final layernorm in this model; keep the slot so the HC mixer
-        # stage logic (has_final_layernorm_in_this_stage) still triggers.
-        block_spec = TransformerBlockSubmodules(layer_specs=local_layer_specs, layer_norm=IdentityOp)
-        return block_spec
+        return layer_specs
 
     def _set_transformer_layer(self, transformer_layer_spec):
         for layer_spec in transformer_layer_spec.layer_specs:
             layer_spec.module = Qwen4ExpLayer
 
-    def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+    def _patch_mtp_block_spec(self, mtp_block_spec):
         if (self.config.mtp_num_layers or 0) > 1 and not self.config.mtp_shared_weights:
             # HF exposes a single top-level `mtp.*` head; multiple independent heads would all map
             # to the same `mtp.*` keys on export and overwrite each other (no lossless round-trip).
@@ -760,15 +758,14 @@ class Qwen4ExpLoader(ModelLoader):
                 'MTP heads (mtp_num_layers>1 without mtp_shared_weights) cannot round-trip through HF. '
                 'Use mtp_shared_weights=True to reuse one head across prediction depths, or '
                 'mtp_num_layers=1.')
-        mtp_block_spec = get_gpt_mtp_block_spec(
-            self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
         if mtp_block_spec is not None:
             for layer_spec in mtp_block_spec.layer_specs:
                 sub = layer_spec.submodules
                 if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
-                    raise NotImplementedError('Qwen3.8-Flash-Next MTP requires a Megatron dev build exposing separate '
-                                              f'e_proj/h_proj, got {megatron.core.__version__}.'
-                                              'run pip install "git+https://github.com/NVIDIA/Megatron-LM.git@dev"')
+                    raise NotImplementedError(
+                        'Qwen3.8-Flash-Next MTP requires megatron-core >= 0.20, whose MTP layer spec '
+                        'exposes separate e_proj/h_proj (added in the 0.20 release); '
+                        f'got {megatron.core.__version__}.')
                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm

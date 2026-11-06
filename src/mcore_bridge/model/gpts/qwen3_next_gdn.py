@@ -16,6 +16,14 @@ from ..modules import GatedDeltaNet, GatedSelfAttention
 from ..register import ModelLoader, ModelMeta, register_model
 from .qwen3_next import Qwen3NextBridge
 
+try:
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+        get_transformer_layer_with_experimental_attention_variant_spec as _build_all_layer_specs
+except ImportError:  # megatron-core 0.18: block-level entry point only
+    _build_all_layer_specs = None
+from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+    get_transformer_block_with_experimental_attention_variant_spec as _build_block_spec
+
 
 class Qwen3NextGDNBridgeMixin(GPTBridge):
     hf_mtp_prefix = 'mtp.layers'
@@ -115,11 +123,23 @@ class Qwen3NextGDNBridge(Qwen3NextGDNBridgeMixin):
 class Qwen3NextLoader(ModelLoader):
     gated_delta_net = GatedDeltaNet
 
+    def _build_decoder_layer_specs(self):
+        if _build_all_layer_specs is None:
+            raise NotImplementedError('An MTP-only stage needs the full layer list, which requires the layer-level '
+                                      'experimental entry point (megatron-core >= 0.19). Put `m` on a stage that also '
+                                      'holds decoder layers, or upgrade megatron-core.')
+        layer_specs = [copy.deepcopy(spec) for spec in _build_all_layer_specs(self.config)]
+        return self._patch_gdn_layer_specs(layer_specs)
+
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
-        layer_specs = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
-        for layer_spec in layer_specs.layer_specs:
+        if _build_all_layer_specs is not None:
+            return super().get_transformer_layer_spec(vp_stage)
+        block = _build_block_spec(self.config, vp_stage)
+        block.layer_specs = self._patch_layer_specs(self._patch_gdn_layer_specs(block.layer_specs))
+        return block
+
+    def _patch_gdn_layer_specs(self, layer_specs):
+        for layer_spec in layer_specs:
             attn_module = layer_spec.submodules.self_attention.module
             if issubclass(attn_module, SelfAttention):
                 layer_spec.submodules.self_attention.module = GatedSelfAttention

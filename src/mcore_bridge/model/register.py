@@ -5,22 +5,31 @@ from dataclasses import dataclass
 from functools import partial
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
+from megatron.core.extensions.transformer_engine import (TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear,
+                                                         TENorm)
 from megatron.core.models.gpt import gpt_model
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec, get_gpt_mtp_block_spec
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_layer_specs, get_gpt_mtp_block_spec
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
+from megatron.core.transformer.multi_token_prediction import get_mtp_num_layers_to_build
+from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from torch import nn
 from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger
+from mcore_bridge.utils import get_local_layer_specs, get_logger
 
 from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, TopKRouter, TransformerBlock,
                       TransformerLayer)
 from .mtp import adapt_mtp_block_spec, get_mtp_block_cls
+
+try:
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+        get_transformer_layer_with_experimental_attention_variant_spec as _build_experimental_layer_specs
+except ImportError:  # megatron-core 0.18: layer-level entry point absent
+    _build_experimental_layer_specs = None
 
 if TYPE_CHECKING:
     from .gpt_model import GPTModel
@@ -82,6 +91,7 @@ def get_model_meta(mcore_model_type: str) -> ModelMeta:
 class ModelLoader:
     model_cls = None
     transformer_block = TransformerBlock
+    final_layer_norm_cls = TENorm
 
     def __init__(self, config: ModelConfig):
         from mcore_bridge.model import GPTModel, MultimodalGPTModel
@@ -99,56 +109,84 @@ class ModelLoader:
         else:
             mlp_spec.module = mlp_module
 
-    def _replace_spec_dsa(self, layer_spec):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            _get_backend_spec_provider, get_dsa_module_spec_for_backend)
-        backend = _get_backend_spec_provider(config=self.config)
-        dsa_spec = get_dsa_module_spec_for_backend(self.config, backend)
-        if getattr(dsa_spec.submodules.core_attention.submodules, 'indexer', None) is not None:
-            dsa_spec.submodules.core_attention.submodules.indexer.module = DSAIndexer
-        if self.config.qk_layernorm:
-            linear_q_up_proj = backend.column_parallel_linear()
-            # fix megatron-core
-            dsa_spec.submodules.q_layernorm = backend.layer_norm(for_qk=True)
-            dsa_spec.submodules.kv_layernorm = backend.layer_norm(for_qk=True)
-            dsa_spec.submodules.linear_q_up_proj = linear_q_up_proj
-            dsa_spec.submodules.linear_kv_up_proj = linear_q_up_proj
-        layer_spec.submodules.self_attention = dsa_spec
+    def decoder_layer_specs(self):
+        """All decoder layer specs, model-patched, independent of pp/vpp slicing.
 
-    @contextmanager
-    def _patch_experimental_attention_variant(self):
-        experimental_attention_variant = self.config.experimental_attention_variant
-        self.config.experimental_attention_variant = None
-        try:
-            yield
-        finally:
-            self.config.experimental_attention_variant = experimental_attention_variant
+        Final entry point. Subclasses extend `_build_decoder_layer_specs` (construction) and,
+        rarely, `_patch_layer_specs` (class replacement) so the model-level patch below can
+        never be skipped.
+        """
+        return self._patch_layer_specs(self._build_decoder_layer_specs())
 
-    def _deepcopy_layer_spec(self, transformer_layer_spec):
-        for i, layer_spec in enumerate(transformer_layer_spec.layer_specs):
-            transformer_layer_spec.layer_specs[i] = deepcopy(layer_spec)
+    def _build_decoder_layer_specs(self):
+        """Construct every decoder layer; subclasses replace this when upstream cannot."""
+        variant = self.config.experimental_attention_variant
+        if variant is None:
+            layer_specs = self._plain_decoder_layer_specs()
+        elif _build_experimental_layer_specs is None:
+            raise NotImplementedError(f'{type(self).__name__} with experimental_attention_variant={variant!r} requires '
+                                      'megatron-core >= 0.19 (the layer-level experimental entry point).')
+        else:
+            layer_specs = _build_experimental_layer_specs(self.config)
+        layer_specs = [deepcopy(layer_spec) for layer_spec in layer_specs]
+        if variant == 'dsa':
+            self._replace_dsa_indexer(layer_specs)
+        return layer_specs
+
+    def _plain_decoder_layer_specs(self):
+        return get_gpt_decoder_layer_specs(
+            self.config,
+            use_transformer_engine=True,
+            normalization=self.config.normalization,
+            qk_l2_norm=self.config.qk_l2_norm)
+
+    def _replace_dsa_indexer(self, layer_specs):
+        # Upstream's indexer lacks bridge's FP8 init / SP gather / rope mscale.
+        for layer_spec in layer_specs:
+            core_attention = layer_spec.submodules.self_attention.submodules.core_attention
+            core_attention.submodules.indexer.module = DSAIndexer
+
+    def _patch_layer_specs(self, layer_specs):
+        # The three helpers below take a block spec, so wrap the list once.
+        block = TransformerBlockSubmodules(layer_specs=layer_specs)
+        self._set_transformer_layer(block)
+        self._replace_mla_attention(block)
+        self._replace_router(block)
+        return layer_specs
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        with self._patch_experimental_attention_variant():
-            transformer_layer_spec = get_gpt_decoder_block_spec(
-                self.config,
-                use_transformer_engine=True,
-                normalization=self.config.normalization,
-                qk_l2_norm=self.config.qk_l2_norm,
-                vp_stage=vp_stage)
-            self._deepcopy_layer_spec(transformer_layer_spec)
-        if self.config.experimental_attention_variant == 'dsa':
-            for layer_spec in transformer_layer_spec.layer_specs:
-                self._replace_spec_dsa(layer_spec)
-        return transformer_layer_spec
+        """The local block of one pipeline stage (historical name: returns a block spec)."""
+        return TransformerBlockSubmodules(
+            layer_specs=get_local_layer_specs(self.config, self.decoder_layer_specs(), vp_stage=vp_stage),
+            layer_norm=self.final_layer_norm_cls)
 
     def get_mtp_block_spec(self, transformer_layer_spec, vp_stage: Optional[int] = None):
+        # Upstream returns None for stages that hold no MTP layer. Check that first so
+        # embedding-only / loss-only stages never build a full spec (or hit a version error).
+        if get_mtp_num_layers_to_build(self.config, vp_stage=vp_stage) == 0:
+            return None
+        if not transformer_layer_spec.layer_specs:
+            cls = type(self)
+            if (cls._build_decoder_layer_specs is ModelLoader._build_decoder_layer_specs
+                    and cls.get_transformer_layer_spec is not ModelLoader.get_transformer_layer_spec):
+                raise NotImplementedError(
+                    f'{cls.__name__} only overrides get_transformer_layer_spec; its extra spec '
+                    'changes never reach decoder_layer_specs(), so an MTP-only stage would build a '
+                    'template that differs from the normal layout. Override `_build_decoder_layer_specs` '
+                    '(and call super()) instead.')
+            transformer_layer_spec = TransformerBlockSubmodules(
+                layer_specs=[self.decoder_layer_specs()[-1]], layer_norm=transformer_layer_spec.layer_norm)
         mtp_block_spec = get_gpt_mtp_block_spec(
             self.config, transformer_layer_spec, use_transformer_engine=True, vp_stage=vp_stage)
-        return adapt_mtp_block_spec(self.config, mtp_block_spec)
+        return self._patch_mtp_block_spec(adapt_mtp_block_spec(self.config, mtp_block_spec))
+
+    def _patch_mtp_block_spec(self, mtp_block_spec):
+        """Model-level MTP tweaks; subclasses replace the module/norm classes here."""
+        return mtp_block_spec
 
     def _set_transformer_layer(self, transformer_layer_spec):
-        if self.config.enable_hyper_connections:
+        # HC models pick their own layer class; only the vanilla one is swapped.
+        if getattr(self.config, 'enable_hyper_connections', False):  # field exists from 0.20
             return
         for layer_spec in transformer_layer_spec.layer_specs:
             if layer_spec.module is McoreTransformerLayer:
@@ -184,9 +222,6 @@ class ModelLoader:
         vp_stage: Optional[int] = None,
     ) -> Union['GPTModel', 'MultimodalGPTModel']:
         transformer_layer_spec = self.get_transformer_layer_spec(vp_stage=vp_stage)
-        self._set_transformer_layer(transformer_layer_spec)
-        self._replace_mla_attention(transformer_layer_spec)
-        self._replace_router(transformer_layer_spec)
         mtp_block_spec = None
         if self.config.mtp_num_layers is not None:
             mtp_block_spec = self.get_mtp_block_spec(transformer_layer_spec, vp_stage=vp_stage)
@@ -202,6 +237,7 @@ class ModelLoader:
         self._set_linear_is_expert(model)
         return model
 
+    # GPTModel picks its block class at construction time; swap it while the model is built.
     @contextmanager
     def _patch_transformer_block(self):
         TransformerBlock = gpt_model.TransformerBlock
