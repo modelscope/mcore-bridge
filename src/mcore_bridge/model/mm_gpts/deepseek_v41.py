@@ -56,6 +56,7 @@ from tqdm import tqdm
 from types import SimpleNamespace
 from typing import List, Optional, Sequence, Union
 
+from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
@@ -1369,6 +1370,8 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        if self.config.language_model_only:
+            return GPTBridge._convert_pre_process(self, mg_model, hf_state_dict, hf_prefix, to_mcore)
         # Runs the vision/aligner + image_* block unconditionally instead of branching on *this*
         # rank's ``mg_model.visual``. On export every pipeline stage runs ``_convert`` ->
         # ``_convert_pre_process``, and this path issues the *same* pp-group collective sequence on
