@@ -625,12 +625,19 @@ class GPTBridge:
             is_lora, is_modules_to_save = state
         if is_lora and self._peft_format and param_key != 'layer_norm_weight':
             if to_mcore:
+                # MultiLora pre-wraps every linear in LoraParallelLinear, but only
+                # target_modules actually carry LoRA; a missing lora key means the layer
+                # was never a target, and peft checkpoints never touch base weights.
+                hf_lora_A_key = f'{hf_module_key}.lora_A.{hf_param_key}'
+                hf_lora_B_key = f'{hf_module_key}.lora_B.{hf_param_key}'
+                if hf_lora_A_key not in hf_state_dict:
+                    return
                 lora_A_key = f'{module_key}.lora_A.{self._adapter_name}.{param_key}'
                 lora_B_key = f'{module_key}.lora_B.{self._adapter_name}.{param_key}'
                 mg_lora_A = deep_getattr(mg_module, f'{lora_A_key}')
                 mg_lora_B = deep_getattr(mg_module, f'{lora_B_key}')
-                hf_lora_A = hf_state_dict[f'{hf_module_key}.lora_A.{hf_param_key}'].load()
-                hf_lora_B = hf_state_dict[f'{hf_module_key}.lora_B.{hf_param_key}'].load()
+                hf_lora_A = hf_state_dict[hf_lora_A_key].load()
+                hf_lora_B = hf_state_dict[hf_lora_B_key].load()
                 self._set_weight(mg_lora_A, hf_lora_A, lora_A_key, offset, is_expert)
                 self._set_weight(mg_lora_B, hf_lora_B, lora_B_key, offset, is_expert)
             else:
@@ -714,7 +721,11 @@ class GPTBridge:
         if kv_channels is None:
             kv_channels = self.config.kv_channels
         if to_mcore:
-            if isinstance(mg_attn.linear_qkv, LoraParallelLinear):
+            # MultiLora pre-wraps every linear, but only target_modules carry LoRA; a missing
+            # lora key means the layer was never a target, and peft checkpoints never touch
+            # base weights.
+            if isinstance(mg_attn.linear_qkv, LoraParallelLinear) and \
+                    'q_proj.lora_A.weight' in hf_state_dict:
                 lora_A = hf_state_dict['q_proj.lora_A.weight'].load()
                 assert all((lora_A == hf_state_dict[f'{k}.lora_A.weight'].load()).all()
                            for k in kv_proj_list), 'Need to ensure QKV\'s lora_A are consistent'
@@ -964,7 +975,16 @@ class GPTBridge:
         # linear_fc1
         if to_mcore:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())
-            if isinstance(mg_mlp.linear_fc1, LoraParallelLinear):
+            # The presence probe must use the SAME key shape the branch below consumes:
+            # dense models use the bare HF name, experts prefix it with the expert index.
+            if is_expert:
+                first_expert = f'{ep_rank * num_local_experts}.'
+                fc1_lora_key = f'{first_expert}gate_up_proj.lora_A.weight' if is_gate_up \
+                    else f'{first_expert}gate_proj.lora_A.weight'
+            else:
+                fc1_lora_key = 'gate_up_proj.lora_A.weight' if is_gate_up \
+                    else 'gate_proj.lora_A.weight'
+            if isinstance(mg_mlp.linear_fc1, LoraParallelLinear) and fc1_lora_key in hf_state_dict:
                 mg_lora_B = mg_mlp.linear_fc1.lora_B[self._adapter_name]
                 mg_lora_B = [getattr(mg_lora_B, f'weight{i}')
                              for i in range(num_local_experts)] if is_expert else mg_lora_B.weight
@@ -1278,7 +1298,11 @@ class GPTBridge:
         # linear_fc2
         if is_expert:
             if to_mcore:
-                if isinstance(mg_mlp.linear_fc2, LoraParallelLinear):
+                # MultiLora pre-wraps every linear, but only target_modules carry LoRA; a
+                # peft checkpoint without the expert down_proj lora keys leaves this layer
+                # untouched (see the fc1 probe above for the same pattern).
+                fc2_lora_key = f'{ep_rank * num_local_experts}.down_proj.lora_A.weight'
+                if isinstance(mg_mlp.linear_fc2, LoraParallelLinear) and fc2_lora_key in hf_state_dict:
                     mg_lora_A = mg_mlp.linear_fc2.lora_A[self._adapter_name]
                     mg_lora_A = [getattr(mg_lora_A, f'weight{i}')
                                  for i in range(num_local_experts)] if is_expert else mg_lora_A.weight
@@ -1465,7 +1489,11 @@ class GPTBridge:
         value_dim = config.linear_value_head_dim * config.linear_num_value_heads // num_key_heads
         hidden_size_block = config.hidden_size // self.fp8_block_size
         if to_mcore:
-            if isinstance(mg_attn.in_proj_qkvz, LoraParallelLinear):
+            # MultiLora pre-wraps EVERY linear in LoraParallelLinear, but only target_modules
+            # actually carry LoRA; a checkpoint without the layer's lora keys means the layer
+            # was never a target, and a peft checkpoint never touches base weights.
+            if isinstance(mg_attn.in_proj_qkvz, LoraParallelLinear) and \
+                    'in_proj_qkv.lora_A.weight' in hf_state_dict:
                 lora_A = hf_state_dict['in_proj_qkv.lora_A.weight'].load()
                 assert (lora_A == hf_state_dict['in_proj_z.lora_A.weight'].load()).all(), \
                        'Need to ensure QKVZ\'s lora_A are consistent'
@@ -1551,7 +1579,10 @@ class GPTBridge:
                     hf_state_dict['in_proj_z.weight_scale_inv'] = scale_inv[:, qkv_block:].reshape(
                         -1, hidden_size_block).clone()
         if to_mcore:
-            if isinstance(mg_attn.in_proj_ba, LoraParallelLinear):
+            # See the in_proj_qkvz guard above: a pre-wrapped but non-target layer carries
+            # no LoRA keys, and peft checkpoints leave base weights alone.
+            if isinstance(mg_attn.in_proj_ba, LoraParallelLinear) and \
+                    'in_proj_b.lora_A.weight' in hf_state_dict:
                 lora_A = hf_state_dict['in_proj_b.lora_A.weight'].load()
                 assert (lora_A == hf_state_dict['in_proj_a.lora_A.weight'].load()).all(), \
                     'Need to ensure BA\'s lora_A are consistent'
@@ -1610,7 +1641,10 @@ class GPTBridge:
         key_dim = config.linear_key_head_dim
         value_dim = config.linear_value_head_dim * config.linear_num_value_heads // num_key_heads
         if to_mcore:
-            if isinstance(mg_attn.in_proj, LoraParallelLinear):
+            # See the in_proj_qkvz guard above: a pre-wrapped but non-target layer carries
+            # no LoRA keys, and peft checkpoints leave base weights alone.
+            if isinstance(mg_attn.in_proj, LoraParallelLinear) and \
+                    'in_proj_qkv.lora_A.weight' in hf_state_dict:
                 lora_A = hf_state_dict['in_proj_qkv.lora_A.weight'].load()
                 assert (lora_A == hf_state_dict['in_proj_z.lora_A.weight'].load()).all() and \
                        (lora_A == hf_state_dict['in_proj_b.lora_A.weight'].load()).all() and \
