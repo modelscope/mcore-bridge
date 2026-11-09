@@ -1381,6 +1381,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
+        if self.config.language_model_only:
+            return result
         # Runs the vision/aligner + image_* block unconditionally instead of branching on *this*
         # rank's ``mg_model.visual``. On export every pipeline stage runs ``_convert`` ->
         # ``_convert_pre_process``, and this path issues the *same* pp-group collective sequence on
@@ -1393,7 +1396,6 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         # collectives so the last stage's later per-layer ``has_model`` all-reduce reads a stale
         # value -> ``next(mg_models)`` -> ``StopIteration``. On load only the first stage reaches
         # this method (see ``_convert``'s ``is_pp_first_stage`` guard).
-        result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
         target = hf_state_dict if to_mcore else result
         for name in ('image_start', 'image_end', 'image_newline'):
             self._set_state_dict(mg_model, f'visual.{name}', target, f'model.{name}', to_mcore)
