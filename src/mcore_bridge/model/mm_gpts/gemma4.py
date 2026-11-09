@@ -236,24 +236,35 @@ class Gemma4SelfAttention(SelfAttention):
         if not self.is_kv_shared_layer:
             self.v_norm = Gemma4RMSNormNoScale(self.head_dim, eps=self.config.layernorm_epsilon)
 
-        # Hopper has no fused TE backward for head_dim 512, so TE falls back to unfused attention on the
-        # full-attention layers. GEMMA4_FFPA_ATTN=1 runs these layers with ffpa-attn when inputs are packed (THD).
-        self.use_ffpa_attn = not self.is_sliding and get_env_args('GEMMA4_FFPA_ATTN', bool, False)
-        if self.use_ffpa_attn:
-            try:
-                import ffpa_attn  # noqa
-            except ImportError as e:
-                raise ImportError('GEMMA4_FFPA_ATTN=1 requires ffpa-attn: `pip install ffpa-attn`.') from e
-            if self.pg_collection.cp.size() > 1:
-                raise NotImplementedError('GEMMA4_FFPA_ATTN does not support context parallelism.')
-            if self.config.attention_dropout > 0:
-                raise NotImplementedError('GEMMA4_FFPA_ATTN does not support attention dropout.')
-            self.ffpa_softmax_scale = get_ffpa_softmax_scale(self.config, self.head_dim)
+        # On Hopper, TE uses unfused attention for the head_dim 512 full-attention layers in training.
+        # GEMMA4_FFPA_ATTN=1 runs these layers with ffpa-attn when inputs are packed (THD).
+        self._init_ffpa_attn()
+
+    def _init_ffpa_attn(self):
+        self.use_ffpa_attn = (not self.is_sliding and self.head_dim == 512
+                              and get_env_args('GEMMA4_FFPA_ATTN', bool, False))
+        if not self.use_ffpa_attn:
+            return
+        # `import ffpa_attn` succeeds even when its CuTeDSL backend fails to load; the varlen kernel is then None.
+        try:
+            from ffpa_attn.cute import _ffpa_attn_varlen_cute  # noqa
+        except Exception as e:
+            raise ImportError('GEMMA4_FFPA_ATTN=1 requires ffpa-attn with its CuTeDSL backend: '
+                              '`pip install ffpa-attn`.') from e
+        if torch.cuda.get_device_capability()[0] != 9:
+            raise NotImplementedError('GEMMA4_FFPA_ATTN is only supported on Hopper (SM90).')
+        if self.pg_collection.cp.size() > 1:
+            raise NotImplementedError('GEMMA4_FFPA_ATTN does not support context parallelism.')
+        if self.config.attention_dropout > 0:
+            raise NotImplementedError('GEMMA4_FFPA_ATTN does not support attention dropout.')
+        self.ffpa_softmax_scale = get_ffpa_softmax_scale(self.config, self.head_dim)
 
     def _forward_ffpa_attention(self, query, key, value, attention_bias, packed_seq_params):
         mask_type = self.attn_mask_type
-        if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal) or attention_bias is not None:
+        if mask_type not in (AttnMaskType.causal, AttnMaskType.padding_causal):
             raise NotImplementedError(f'GEMMA4_FFPA_ATTN supports causal masks only, got {mask_type}.')
+        if attention_bias is not None:
+            raise NotImplementedError('GEMMA4_FFPA_ATTN does not support attention_bias.')
 
         def custom_forward(query, key, value):
             return ffpa_varlen_attention(query, key, value, packed_seq_params, self.ffpa_softmax_scale)
