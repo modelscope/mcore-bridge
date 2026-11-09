@@ -71,6 +71,19 @@ def test_language_only_exports_embeddings_without_visual_markers(bridge, wrapped
 
 
 @pytest.mark.parametrize('to_mcore', [False, True])
+def test_language_only_preprocessing_preserves_parent_result(bridge, to_mcore):
+    model = object()
+    state = {}
+    parent_result = {bridge.hf_embed_key: object()}
+    with patch.object(DeepseekV4Bridge, '_convert_pre_process', return_value=parent_result) as parent, \
+            patch.object(bridge, '_set_state_dict') as setter:
+        result = bridge._convert_pre_process(model, state, 'checkpoint.', to_mcore)
+    parent.assert_called_once_with(model, state, 'checkpoint.', to_mcore)
+    assert result is parent_result
+    setter.assert_not_called()
+
+
+@pytest.mark.parametrize('to_mcore', [False, True])
 def test_multimodal_preprocessing_keeps_image_marker_order(bridge, to_mcore):
     bridge.config.language_model_only = False
     model = object()
