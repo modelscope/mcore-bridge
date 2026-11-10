@@ -60,6 +60,7 @@ from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
+from mcore_bridge.model.modules.engram_fp8 import is_fp8_table
 from mcore_bridge.utils import Fp8Dequantizer, is_master
 
 from ..constant import ModelType
@@ -1616,6 +1617,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     def _load_engram_embedding(self, engram, hf_state_dict):
         weight = hf_state_dict['engram.embed.weight']
         scale = hf_state_dict.get('engram.embed.weight_scale_inv')
+        if is_fp8_table(engram.embedding.tables[0]) and scale is None:
+            raise ValueError('The Engram table store is fp8 because quantization_config declares an FP8 '
+                             'source, but `engram.embed.weight_scale_inv` is missing from this checkpoint.')
         flat_offset = 0
         for table in engram.embedding.tables:
             table_offset = flat_offset
@@ -1626,6 +1630,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 source_end = table_offset + table.row_start + local_end
                 rows = self._load_lazy_slice(weight, source_start, source_end)
                 row_scales = None if scale is None else self._load_lazy_slice(scale, source_start, source_end)
+                if is_fp8_table(table):
+                    # Byte copy: the checkpoint already holds the fp8 payload and e8m0 scales.
+                    table.fill_rows(local_start, local_end, rows, row_scales)
+                    continue
                 rows = self._dequantize_engram_rows(rows, row_scales)
                 table.weight.data[local_start:local_end].copy_(
                     rows.to(device=table.weight.device, dtype=table.weight.dtype))
@@ -1663,11 +1671,17 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 return
             if engram is None:
                 return
-            # --- export embedding tables to a single flat tensor (bf16, no FP8) ---
-            all_rows = []
-            for table in engram.embedding.tables:
-                all_rows.append(table.weight.data.cpu())
-            hf_state_dict['engram.embed.weight'] = torch.cat(all_rows, dim=0)
+            # --- export embedding tables to a single flat tensor ---
+            if is_fp8_table(engram.embedding.tables[0]):
+                hf_state_dict['engram.embed.weight'] = torch.cat(
+                    [t.fp8_rows.view(torch.float8_e4m3fn).cpu() for t in engram.embedding.tables], dim=0)
+                hf_state_dict['engram.embed.weight_scale_inv'] = torch.cat(
+                    [t.fp8_scales.view(torch.float8_e8m0fnu).cpu() for t in engram.embedding.tables], dim=0)
+            else:
+                all_rows = []
+                for table in engram.embedding.tables:
+                    all_rows.append(table.weight.data.cpu())
+                hf_state_dict['engram.embed.weight'] = torch.cat(all_rows, dim=0)
             # --- export key+value projections as combined wkv ---
             key_w = engram.key_projection.weight.data.cpu()  # [stream_width, total_memory_dim]
             val_w = engram.value_projection.weight.data.cpu()  # [hidden, total_memory_dim]
