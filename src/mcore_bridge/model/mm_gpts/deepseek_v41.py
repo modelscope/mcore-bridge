@@ -60,7 +60,7 @@ from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
-from mcore_bridge.model.modules.engram_fp8 import fp8_engram_tables_declared, is_fp8_table
+from mcore_bridge.model.modules.engram_fp8 import fp8_quant_declared, is_fp8_table
 from mcore_bridge.utils import Fp8Dequantizer, is_master, quantize_dsv41_export_value
 
 from ..constant import ModelType
@@ -1347,10 +1347,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
 
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
-        if to_mcore or self._peft_format or not fp8_engram_tables_declared(self.config):
+        if to_mcore or self._peft_format or not fp8_quant_declared(self.config):
             return res
-        # Restore the official quantized layout the BF16 training parameters were loaded from; the gate is the
-        # checkpoint's own declaration (the same one the fp8 Engram tables follow).
+        # Restore the official quantized layout the BF16 training parameters were loaded from; gated on the
+        # checkpoint's own declaration, not on a user switch.
         requantized = {}
         for key, value in res.items():
             converted = quantize_dsv41_export_value(key, value)

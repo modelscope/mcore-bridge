@@ -7,7 +7,7 @@ from torch import Tensor
 
 from ...utils import gc_collect, get_logger
 from ...utils.megatron_utils import split_cp_inputs
-from .engram_fp8 import Fp8EngramEmbedding, fp8_engram_tables_declared
+from .engram_fp8 import Fp8EngramEmbedding, fp8_quant_declared
 
 # Per-row scale block of the released V4.1 tables (32x32 quantize_config, row-scaled table).
 DEEPSEEK_V41_ENGRAM_BLOCK_SIZE = 32
@@ -261,7 +261,7 @@ class DeepseekV41Engram(Engram):
         """Swap the bf16 row shards for the fp8-resident store when the checkpoint declares them."""
         if Fp8EngramEmbedding is None or isinstance(self.embedding, Fp8EngramEmbedding):
             return
-        if not fp8_engram_tables_declared(getattr(self, 'config', None)):
+        if not fp8_quant_declared(getattr(self, 'config', None)):
             return
         source = self.embedding
         first = source.tables[0]

@@ -30,11 +30,12 @@ except ImportError:
 logger = get_logger()
 
 
-def fp8_engram_tables_declared(config) -> bool:
-    """Whether the source checkpoint declares an FP8/e8m0 Engram table.
+def fp8_quant_declared(config) -> bool:
+    """Whether the checkpoint declares DeepSeek-V4.1's official quantized layout.
 
-    The tables are a pure optimization, so the storage follows the checkpoint declaration rather than
-    a user switch: DeepSeek-V4.1 ships ``scale_fmt: ue8m0`` with a 32x32 block scale.
+    ``scale_fmt: ue8m0`` or a 32x32 block scale is what both consumers key off: the fp8-resident
+    Engram store and the export requantizer. The storage follows the checkpoint declaration rather
+    than a user switch.
     """
     hf_config = getattr(config, 'hf_config', None)
     quantization = getattr(hf_config, 'quantization_config', None)

@@ -182,16 +182,16 @@ def test_multitable_requires_one_head_per_table(fp8_module):
 
 
 def test_fp8_tables_follow_the_checkpoint_declaration(fp8_module):
-    assert not fp8_module.fp8_engram_tables_declared(SimpleNamespace())
-    assert not fp8_module.fp8_engram_tables_declared(SimpleNamespace(hf_config=None))
+    assert not fp8_module.fp8_quant_declared(SimpleNamespace())
+    assert not fp8_module.fp8_quant_declared(SimpleNamespace(hf_config=None))
     ue8m0 = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'scale_fmt': 'ue8m0'}))
-    assert fp8_module.fp8_engram_tables_declared(ue8m0)
+    assert fp8_module.fp8_quant_declared(ue8m0)
     block32 = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'weight_block_size': (32, 32)}))
-    assert fp8_module.fp8_engram_tables_declared(block32)
+    assert fp8_module.fp8_quant_declared(block32)
     block128 = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'weight_block_size': [128, 128]}))
-    assert not fp8_module.fp8_engram_tables_declared(block128)
+    assert not fp8_module.fp8_quant_declared(block128)
     as_object = SimpleNamespace(hf_config=SimpleNamespace(quantization_config=SimpleNamespace(scale_fmt='ue8m0')))
-    assert fp8_module.fp8_engram_tables_declared(as_object)
+    assert fp8_module.fp8_quant_declared(as_object)
 
 
 def test_state_dict_round_trip_carries_the_fp8_payload(fp8_module):
