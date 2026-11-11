@@ -43,11 +43,12 @@ def per_block_cast_to_fp8(weight: torch.Tensor, block: int = 32) -> Tuple[torch.
 
 
 def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
-    """Round-to-nearest e2m1 codes {0..7} with the sign in bit 3 (zero never carries a sign)."""
+    """Round-to-nearest-even e2m1 codes; ties at 0.75/1.75/3.5 go to the even code (``cvt.rn``)."""
     magnitude = x.abs()
     code = torch.zeros_like(x, dtype=torch.uint8)
-    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        code += (magnitude > boundary).to(torch.uint8)
+    for boundary, round_up in zip((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
+                                  (False, True, False, True, False, True, False)):
+        code += (magnitude >= boundary if round_up else magnitude > boundary).to(torch.uint8)
     sign = (x < 0) & (code != 0)
     code = code | (sign.to(torch.uint8) << 3)
     return code.view(torch.int8)
