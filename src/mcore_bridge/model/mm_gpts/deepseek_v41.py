@@ -1349,12 +1349,8 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
         if to_mcore or self._peft_format or not fp8_engram_tables_declared(self.config):
             return res
-        # The load direction dequantizes the official FP8/MXFP4 source into BF16 training parameters, but
-        # vLLM only serves the official quantized layout (its SM100 attention reads ``weight_scale`` during
-        # construction), so the export restores that layout key-by-key: dense block32 fp8 + e8m0 scales and
-        # packed MXFP4 experts, each under the ``<name>.scale`` companion key the source uses. Gated on the
-        # same checkpoint declaration as the fp8 Engram tables (no user switch); an undeclared (BF16) source
-        # exports unchanged, and already-quantized payloads such as the Engram tables pass through.
+        # Restore the official quantized layout the BF16 training parameters were loaded from; the gate is the
+        # checkpoint's own declaration (the same one the fp8 Engram tables follow).
         requantized = {}
         for key, value in res.items():
             converted = quantize_dsv41_export_value(key, value)

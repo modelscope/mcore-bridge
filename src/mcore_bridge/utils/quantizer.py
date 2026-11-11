@@ -1,17 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Re-quantization primitives: the inverse direction of ``dequantizer.py``.
-
-DeepSeek-V4.1 loads the official quantized source into BF16 training parameters (block32 FP8 dequantization,
-MXFP4 experts via ``fp4_to_fp8``), but vLLM only serves the official quantized layout, so the HF export has to
-restore it:
-
-* dense/attention linears -> fp8-e4m3 weights + 32x32-block e8m0 scales (``<name>.weight`` + ``<name>.scale``);
-* routed experts -> MXFP4 (two e2m1 nibbles per int8, even element in the low nibble) + one e8m0 scale per
-  32-element group along the last (K) dimension.
-
-Numeric semantics mirror the DeepGEMM reference implementation (``deep_gemm/utils/math.py``): amax clamped to
-1e-4, ``scale = ceil_to_ue8m0(amax / 448)`` for fp8 and ``ceil_to_ue8m0(amax / 6)`` for fp4, e2m1
-round-to-nearest via the midpoints {0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0}. Pure torch and device-agnostic.
+"""Re-quantization primitives (the inverse of ``dequantizer.py``) that restore the official DeepSeek-V4.1
+checkpoint layout on export: fp8-e4m3 with 32x32-block e8m0 scales for linears, packed MXFP4 with per-32
+scales for routed experts. Numerics mirror the DeepGEMM reference (``deep_gemm/utils/math.py``).
 """
 import re
 import torch
@@ -38,11 +28,7 @@ def _to_e8m0(scale: torch.Tensor) -> torch.Tensor:
 
 
 def per_block_cast_to_fp8(weight: torch.Tensor, block: int = 32) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2-D weight to fp8-e4m3 with ``block x block`` e8m0 scales.
-
-    Shapes follow the official checkpoint: weight ``[R, C]`` -> scale ``[ceil(R/block), ceil(C/block)]``;
-    partial edge blocks are quantized against their zero-padded amax (DeepGEMM semantics).
-    """
+    """Quantize a 2-D weight ``[R, C]`` to fp8-e4m3 + e8m0 scales ``[ceil(R/block), ceil(C/block)]``."""
     if weight.ndim != 2:
         raise ValueError(f'block fp8 quantization expects a 2-D weight, got shape {tuple(weight.shape)}')
     rows, cols = weight.shape
@@ -68,11 +54,7 @@ def _quantize_to_fp4_e2m1(x: torch.Tensor) -> torch.Tensor:
 
 
 def per_token_cast_to_mxfp4(weight: torch.Tensor, group: int = 32) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize a 2-D weight to packed MXFP4: one e8m0 scale per ``group`` elements along the last dimension.
-
-    Returns ``(packed, scale)`` with ``packed`` int8 ``[R, C/2]`` (even element in the low nibble) and ``scale``
-    e8m0fnu ``[R, ceil(C/group)]``, matching the official ``experts.*.w{1,2,3}`` layout.
-    """
+    """Quantize ``[R, C]`` to packed MXFP4 ``[R, C/2]`` (even element in the low nibble) + e8m0 ``[R, C/group]``."""
     if weight.ndim != 2:
         raise ValueError(f'MXFP4 quantization expects a 2-D weight, got shape {tuple(weight.shape)}')
     rows, cols = weight.shape
@@ -90,25 +72,16 @@ def per_token_cast_to_mxfp4(weight: torch.Tensor, group: int = 32) -> Tuple[torc
     return packed[:, :cols // 2].contiguous(), _to_e8m0(scale)
 
 
-# Official DeepSeek-V4.1 checkpoint keys carrying a ``.scale`` companion, normalized to regexes over the final
-# HF export names (derived from model.safetensors.index.json; ``mtp.*`` reuses the same suffixes). Deliberately
-# absent because the source keeps them in bf16: compressor.wkv/wgate, indexer.wk, gate, norms, hc_*, engram
-# q_weight/k_weight, markov_head, vision/aligner, embed/head.
+# Official keys carrying a ``.scale`` companion (``mtp.*`` reuses the suffixes). compressor/indexer.wk/gate/
+# norms/hc_*/engram q,k_weight/markov_head stay bf16 in the source and are deliberately not matched.
 _DSV41_FP8_BLOCK32_RE = re.compile(r'(?:^|\.)(?:attn\.(?:wq_a|wq_b|wo_a|wo_b|wkv|indexer\.wq_b)'
                                    r'|ffn\.shared_experts\.w[123]|engram\.wkv|main_proj)\.weight$')
 _DSV41_MXFP4_RE = re.compile(r'(?:^|\.)ffn\.experts\.\d+\.w[123]\.weight$')
 
-_REQUANTIZABLE_DTYPES = (torch.bfloat16, torch.float32)
-
 
 def quantize_dsv41_export_value(key: str, tensor) -> Optional[dict]:
-    """Re-quantize one exported HF tensor to its official source format, keyed by the final checkpoint names.
-
-    Returns ``{key: quantized, <base>.scale: e8m0}`` when ``key`` is an official quantized weight carrying a
-    trainable-dtype payload, otherwise ``None`` (already-quantized fp8/int8 stores such as the Engram tables,
-    bf16-only keys, lazy/None values on non-master ranks, and non-2-D tensors all pass through untouched).
-    """
-    if not isinstance(tensor, torch.Tensor) or tensor.dtype not in _REQUANTIZABLE_DTYPES:
+    """Return ``{key: quantized, <base>.scale: e8m0}`` for an official quantized key, else ``None``."""
+    if not isinstance(tensor, torch.Tensor) or tensor.dtype not in (torch.bfloat16, torch.float32):
         return None
     if tensor.ndim != 2:
         return None
