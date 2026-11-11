@@ -8,12 +8,11 @@ under test is re-imported against a stub that mirrors the documented contract:
 import importlib
 import importlib.util
 import os
+import pytest
 import sys
+import torch
 import types
 from types import SimpleNamespace
-
-import pytest
-import torch
 
 import mcore_bridge.model.modules.engram_fp8 as engram_fp8
 
@@ -33,8 +32,14 @@ def _install_stub_upstream(monkeypatch):
 
     class EPShardedEmbeddingTable(MegatronModule):
 
-        def __init__(self, config, global_num_embeddings, embedding_dim, init_method=None, ep_group=None,
-                     tp_group=None, expt_dp_group=None):
+        def __init__(self,
+                     config,
+                     global_num_embeddings,
+                     embedding_dim,
+                     init_method=None,
+                     ep_group=None,
+                     tp_group=None,
+                     expt_dp_group=None):
             super().__init__(config=config)
 
         @property
@@ -84,8 +89,8 @@ def fp8_module(monkeypatch):
 
 
 def _config(**overrides):
-    base = dict(use_cpu_initialization=True, params_dtype=torch.bfloat16, sequence_parallel=False,
-                deterministic_mode=False)
+    base = dict(
+        use_cpu_initialization=True, params_dtype=torch.bfloat16, sequence_parallel=False, deterministic_mode=False)
     base.update(overrides)
     return SimpleNamespace(**base)
 
@@ -155,8 +160,7 @@ def test_unfilled_table_decodes_to_zero_without_raising(fp8_module):
 
 
 def test_multitable_forward_shape_and_table_order(fp8_module):
-    embedding = fp8_module.Fp8EngramEmbedding(
-        config=_config(), table_sizes=(5, 7), embedding_dim=32, ep_group=None)
+    embedding = fp8_module.Fp8EngramEmbedding(config=_config(), table_sizes=(5, 7), embedding_dim=32, ep_group=None)
     assert [tuple(t.fp8_rows.shape) for t in embedding.tables] == [(5, 32), (7, 32)]
     payloads, scales = zip(*[_bits(rows, 32, 32, seed=10 + i) for i, rows in enumerate((5, 7))])
     for table, payload, scale in zip(embedding.tables, payloads, scales):
@@ -166,14 +170,12 @@ def test_multitable_forward_shape_and_table_order(fp8_module):
     out = embedding(hash_ids)
     assert out.shape == (2, 2, 2, 32)
     for table_index, payload in enumerate(payloads):
-        expected = fp8_module.decode_fp8_rows(
-            payload.view(torch.uint8), scales[table_index], 32, torch.bfloat16)
+        expected = fp8_module.decode_fp8_rows(payload.view(torch.uint8), scales[table_index], 32, torch.bfloat16)
         assert torch.equal(out[..., table_index, :], expected[hash_ids[..., table_index]])
 
 
 def test_multitable_requires_one_head_per_table(fp8_module):
-    embedding = fp8_module.Fp8EngramEmbedding(
-        config=_config(), table_sizes=(5, 7), embedding_dim=32, ep_group=None)
+    embedding = fp8_module.Fp8EngramEmbedding(config=_config(), table_sizes=(5, 7), embedding_dim=32, ep_group=None)
     # the inherited forward keeps upstream's head/table guard
     with pytest.raises(ValueError, match='hash heads'):
         embedding(torch.zeros(2, 2, 3, dtype=torch.int64))
@@ -188,8 +190,7 @@ def test_fp8_tables_follow_the_checkpoint_declaration(fp8_module):
     assert fp8_module.fp8_engram_tables_declared(block32)
     block128 = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'weight_block_size': [128, 128]}))
     assert not fp8_module.fp8_engram_tables_declared(block128)
-    as_object = SimpleNamespace(
-        hf_config=SimpleNamespace(quantization_config=SimpleNamespace(scale_fmt='ue8m0')))
+    as_object = SimpleNamespace(hf_config=SimpleNamespace(quantization_config=SimpleNamespace(scale_fmt='ue8m0')))
     assert fp8_module.fp8_engram_tables_declared(as_object)
 
 
@@ -203,8 +204,7 @@ def test_state_dict_round_trip_carries_the_fp8_payload(fp8_module):
     assert state['weight'].dtype == torch.float8_e4m3fn and tuple(state['weight'].shape) == (8, 64)
     assert state['weight_scale_inv'].dtype == torch.float8_e8m0fnu
 
-    restored = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64,
-                                        ep_group=None)
+    restored = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64, ep_group=None)
     restored.load_state_dict(state)
     assert torch.equal(restored.fp8_rows, table.fp8_rows)
     assert torch.equal(restored.fp8_scales, table.fp8_scales)
@@ -220,24 +220,24 @@ def test_state_dict_rejects_pre_fp8_and_partial_checkpoints(fp8_module):
     with pytest.raises(RuntimeError, match='needs both weight and weight_scale_inv'):
         table.load_state_dict({'weight': torch.zeros(8, 64, dtype=torch.float8_e4m3fn)})
     with pytest.raises(RuntimeError, match='not e8m0'):
-        table.load_state_dict({'weight': torch.zeros(8, 64, dtype=torch.float8_e4m3fn),
-                               'weight_scale_inv': torch.zeros(8, 2, dtype=torch.float32)})
+        table.load_state_dict({
+            'weight': torch.zeros(8, 64, dtype=torch.float8_e4m3fn),
+            'weight_scale_inv': torch.zeros(8, 2, dtype=torch.float32)
+        })
     assert table._filled_rows == 0
 
 
 def test_torch_dist_round_trip_restores_the_table(fp8_module, single_rank_group, tmp_path):
     from megatron.core.dist_checkpointing import load, save
 
-    table = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64,
-                                     ep_group=None)
+    table = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64, ep_group=None)
     payload, scales = _bits(8, 64, 32, seed=7)
     table.fill_rows(0, 8, payload, scales)
     ids = torch.tensor([[0, 1, 7]])
     expected = table(ids)
 
     save(table.sharded_state_dict(), str(tmp_path))
-    restored = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64,
-                                        ep_group=None)
+    restored = fp8_module.Fp8EngramTable(config=_config(), global_num_embeddings=8, embedding_dim=64, ep_group=None)
     restored.load_state_dict(load(restored.sharded_state_dict(), str(tmp_path)))
     assert torch.equal(restored.fp8_rows, table.fp8_rows)
     assert torch.equal(restored.fp8_scales, table.fp8_scales)

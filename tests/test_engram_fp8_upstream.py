@@ -4,10 +4,9 @@
 Skipped when Megatron ships no ``megatron.core.models.engram``; the hermetic stub-based coverage
 lives in ``test_engram_fp8_tables.py``.
 """
-from types import SimpleNamespace
-
 import pytest
 import torch
+from types import SimpleNamespace
 
 upstream_embedding = pytest.importorskip('megatron.core.models.engram.distributed_embedding')
 
@@ -21,11 +20,13 @@ SIZES = (96, 128)
 
 
 def _config(*, fp8_declared=False):
-    return SimpleNamespace(use_cpu_initialization=True, params_dtype=torch.bfloat16,
-                           sequence_parallel=False, deterministic_mode=False,
-                           perform_initialization=False,
-                           hf_config=SimpleNamespace(quantization_config={
-                               'scale_fmt': 'ue8m0'} if fp8_declared else None))
+    return SimpleNamespace(
+        use_cpu_initialization=True,
+        params_dtype=torch.bfloat16,
+        sequence_parallel=False,
+        deterministic_mode=False,
+        perform_initialization=False,
+        hf_config=SimpleNamespace(quantization_config={'scale_fmt': 'ue8m0'} if fp8_declared else None))
 
 
 def _bits(total_rows, seed=0):
@@ -37,10 +38,21 @@ def _bits(total_rows, seed=0):
 
 def _build_pair():
     upstream = upstream_embedding.EPShardedMultiTableEmbedding(
-        config=_config(), table_sizes=SIZES, embedding_dim=WIDTH, init_method=None,
-        ep_group=None, tp_group=None, expt_dp_group=None)
-    ours = Fp8EngramEmbedding(config=_config(), table_sizes=SIZES, embedding_dim=WIDTH,
-                              ep_group=None, tp_group=None, expt_dp_group=None, block_size=BLOCK)
+        config=_config(),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        init_method=None,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None)
+    ours = Fp8EngramEmbedding(
+        config=_config(),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None,
+        block_size=BLOCK)
     payload, scales = _bits(sum(SIZES))
     offset = 0
     for table, fp8_table in zip(upstream.tables, ours.tables):
@@ -73,8 +85,7 @@ def test_fp8_store_holds_no_bf16_shard_and_halves_storage():
 
 def test_row_ranges_follow_the_upstream_partition():
     upstream, ours = _build_pair()
-    assert [(t.row_start, t.row_end) for t in ours.tables] == [(t.row_start, t.row_end)
-                                                              for t in upstream.tables]
+    assert [(t.row_start, t.row_end) for t in ours.tables] == [(t.row_start, t.row_end) for t in upstream.tables]
 
 
 def test_fp8_tables_subclass_the_real_upstream_table():
@@ -87,8 +98,13 @@ def test_fp8_tables_subclass_the_real_upstream_table():
 
 def test_swap_replace_the_bf16_embedding_with_untrainable_tables():
     upstream = upstream_embedding.EPShardedMultiTableEmbedding(
-        config=_config(fp8_declared=True), table_sizes=SIZES, embedding_dim=WIDTH, init_method=None,
-        ep_group=None, tp_group=None, expt_dp_group=None)
+        config=_config(fp8_declared=True),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        init_method=None,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None)
     holder = SimpleNamespace(config=_config(fp8_declared=True), embedding=upstream)
 
     DeepseekV41Engram._maybe_use_fp8_tables(holder)
@@ -109,13 +125,17 @@ def _export_bridge():
 
 
 def _fake_layer(embedding):
-    return SimpleNamespace(engram=SimpleNamespace(
-        embedding=embedding, layer_number=3, num_streams=2, hidden_size=4,
-        engram_config=SimpleNamespace(total_memory_dim=WIDTH),
-        key_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, WIDTH, dtype=torch.bfloat16))),
-        value_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(4, WIDTH, dtype=torch.bfloat16))),
-        query_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, dtype=torch.bfloat16))),
-        key_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, dtype=torch.bfloat16)))))
+    return SimpleNamespace(
+        engram=SimpleNamespace(
+            embedding=embedding,
+            layer_number=3,
+            num_streams=2,
+            hidden_size=4,
+            engram_config=SimpleNamespace(total_memory_dim=WIDTH),
+            key_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, WIDTH, dtype=torch.bfloat16))),
+            value_projection=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(4, WIDTH, dtype=torch.bfloat16))),
+            query_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, dtype=torch.bfloat16))),
+            key_norm=SimpleNamespace(weight=torch.nn.Parameter(torch.zeros(8, dtype=torch.bfloat16)))))
 
 
 def test_export_writes_fp8_planes_and_round_trips_into_both_stores():
@@ -129,18 +149,31 @@ def test_export_writes_fp8_planes_and_round_trips_into_both_stores():
     assert torch.equal(hf['engram.embed.weight'].view(torch.uint8),
                        torch.cat([t.fp8_rows for t in fp8_embedding.tables], dim=0))
 
-    state = {'engram.embed.weight': _Tensor(hf['engram.embed.weight']),
-             'engram.embed.weight_scale_inv': _Tensor(hf['engram.embed.weight_scale_inv'])}
-    ids = torch.stack([torch.randint(0, SIZES[0], (8,)), torch.randint(0, SIZES[1], (8,))], dim=-1)
+    state = {
+        'engram.embed.weight': _Tensor(hf['engram.embed.weight']),
+        'engram.embed.weight_scale_inv': _Tensor(hf['engram.embed.weight_scale_inv'])
+    }
+    ids = torch.stack([torch.randint(0, SIZES[0], (8, )), torch.randint(0, SIZES[1], (8, ))], dim=-1)
 
-    fp8_reload = Fp8EngramEmbedding(config=_config(), table_sizes=SIZES, embedding_dim=WIDTH,
-                                    ep_group=None, tp_group=None, expt_dp_group=None, block_size=BLOCK)
+    fp8_reload = Fp8EngramEmbedding(
+        config=_config(),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None,
+        block_size=BLOCK)
     bridge._load_engram_embedding(_fake_layer(fp8_reload).engram, state)
     assert torch.equal(fp8_reload(ids), fp8_embedding(ids))
 
     bf16_reload = upstream_embedding.EPShardedMultiTableEmbedding(
-        config=_config(), table_sizes=SIZES, embedding_dim=WIDTH, init_method=None,
-        ep_group=None, tp_group=None, expt_dp_group=None)
+        config=_config(),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        init_method=None,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None)
     bridge._load_engram_embedding(_fake_layer(bf16_reload).engram, state)
     reference = torch.cat([fp8_embedding.tables[0].fp8_rows, fp8_embedding.tables[1].fp8_rows])
     scales = torch.cat([fp8_embedding.tables[0].fp8_scales, fp8_embedding.tables[1].fp8_scales])
@@ -157,8 +190,7 @@ def test_export_keeps_bf16_tables_as_one_flat_tensor():
     bridge._set_layer_engram(_fake_layer(upstream), hf, to_mcore=False)
     assert hf['engram.embed.weight'].dtype == torch.bfloat16
     assert 'engram.embed.weight_scale_inv' not in hf
-    assert torch.equal(hf['engram.embed.weight'],
-                       torch.cat([t.weight.data for t in upstream.tables], dim=0))
+    assert torch.equal(hf['engram.embed.weight'], torch.cat([t.weight.data for t in upstream.tables], dim=0))
 
 
 class _Tensor:
@@ -175,8 +207,13 @@ class _Tensor:
 
 def test_swap_keeps_upstream_trainability_on_the_bf16_path():
     upstream = upstream_embedding.EPShardedMultiTableEmbedding(
-        config=_config(), table_sizes=SIZES, embedding_dim=WIDTH, init_method=None,
-        ep_group=None, tp_group=None, expt_dp_group=None)
+        config=_config(),
+        table_sizes=SIZES,
+        embedding_dim=WIDTH,
+        init_method=None,
+        ep_group=None,
+        tp_group=None,
+        expt_dp_group=None)
     holder = SimpleNamespace(config=_config(), embedding=upstream)
     DeepseekV41Engram._maybe_use_fp8_tables(holder)
     assert holder.embedding is upstream

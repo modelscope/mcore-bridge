@@ -7,7 +7,7 @@ import pytest  # noqa: E402
 
 from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HyperConnectionHybridLayer  # noqa: E402
 from mcore_bridge.model.mm_gpts.deepseek_v41 import (HybridLayerConfig, HyperConnectionHybridLayer,
-                                                  derive_hybrid_layer_config)
+                                                     derive_hybrid_layer_config)
 
 
 def test_tiny_all_moe_zero_ratio():
@@ -478,8 +478,8 @@ def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
 def test_multimodal_wrapper_hosts_hybrid_backbone():
     # The wrapper is the stock multimodal model with the language-model class swapped for the
     # PP-capable hybrid backbone; everything else (vision tower, image-embed injection) is inherited.
-    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HybridStackModel, DeepseekV41MultimodalModel
     from mcore_bridge.model.mm_gpt_model import MultimodalGPTModel
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HybridStackModel, DeepseekV41MultimodalModel
     assert issubclass(DeepseekV41MultimodalModel, MultimodalGPTModel)
     assert DeepseekV41MultimodalModel.language_model_cls is DeepseekV41HybridStackModel
 

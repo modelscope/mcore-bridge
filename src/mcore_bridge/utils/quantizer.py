@@ -94,9 +94,8 @@ def per_token_cast_to_mxfp4(weight: torch.Tensor, group: int = 32) -> Tuple[torc
 # HF export names (derived from model.safetensors.index.json; ``mtp.*`` reuses the same suffixes). Deliberately
 # absent because the source keeps them in bf16: compressor.wkv/wgate, indexer.wk, gate, norms, hc_*, engram
 # q_weight/k_weight, markov_head, vision/aligner, embed/head.
-_DSV41_FP8_BLOCK32_RE = re.compile(
-    r'(?:^|\.)(?:attn\.(?:wq_a|wq_b|wo_a|wo_b|wkv|indexer\.wq_b)'
-    r'|ffn\.shared_experts\.w[123]|engram\.wkv|main_proj)\.weight$')
+_DSV41_FP8_BLOCK32_RE = re.compile(r'(?:^|\.)(?:attn\.(?:wq_a|wq_b|wo_a|wo_b|wkv|indexer\.wq_b)'
+                                   r'|ffn\.shared_experts\.w[123]|engram\.wkv|main_proj)\.weight$')
 _DSV41_MXFP4_RE = re.compile(r'(?:^|\.)ffn\.experts\.\d+\.w[123]\.weight$')
 
 _REQUANTIZABLE_DTYPES = (torch.bfloat16, torch.float32)

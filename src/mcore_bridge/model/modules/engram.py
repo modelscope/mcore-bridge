@@ -2,7 +2,6 @@
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
 import dataclasses
-
 import torch
 from torch import Tensor
 
@@ -266,15 +265,18 @@ class DeepseekV41Engram(Engram):
             return
         source = self.embedding
         first = source.tables[0]
-        spec = dict(table_sizes=source.table_sizes, embedding_dim=source.embedding_dim,
-                    ep_group=source.ep_group, tp_group=first.tp_group, expt_dp_group=first.expt_dp_group)
+        spec = dict(
+            table_sizes=source.table_sizes,
+            embedding_dim=source.embedding_dim,
+            ep_group=source.ep_group,
+            tp_group=first.tp_group,
+            expt_dp_group=first.expt_dp_group)
         # Drop the bf16 shards before allocating the fp8 store, otherwise both exist at once and
         # the build peaks at 3x the checkpoint bytes instead of 1x.
         self.embedding = None
         del source, first
         gc_collect()
-        self.embedding = Fp8EngramEmbedding(config=self.config, block_size=DEEPSEEK_V41_ENGRAM_BLOCK_SIZE,
-                                           **spec)
+        self.embedding = Fp8EngramEmbedding(config=self.config, block_size=DEEPSEEK_V41_ENGRAM_BLOCK_SIZE, **spec)
         logger.info('DeepSeek-V4.1 Engram tables are fp8-resident and not trained.')
 
     def _mask_excluded_tokens(self, input_ids: Tensor) -> tuple[Tensor, Tensor]:
