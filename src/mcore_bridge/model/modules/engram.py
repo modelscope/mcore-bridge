@@ -271,8 +271,7 @@ class DeepseekV41Engram(Engram):
             ep_group=source.ep_group,
             tp_group=first.tp_group,
             expt_dp_group=first.expt_dp_group)
-        # Drop the bf16 shards before allocating the fp8 store, otherwise both exist at once and
-        # the build peaks at 3x the checkpoint bytes instead of 1x.
+        # Free the bf16 shards first; holding both peaks at 3x the checkpoint bytes.
         self.embedding = None
         del source, first
         gc_collect()

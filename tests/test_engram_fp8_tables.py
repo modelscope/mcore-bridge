@@ -1,9 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Unit tests for the fp8-resident Engram tables.
-
-The upstream ``megatron.core.models.engram`` package is absent from most installs, so the module
-under test is re-imported against a stub that mirrors the documented contract:
-``table(local_row_ids) -> [*ids.shape, D]`` and ``embedding(hash_ids[..., N]) -> [..., N, D]``.
+"""Unit tests for the fp8-resident Engram tables against a stub of the upstream contract (the real
+``megatron.core.models.engram`` package is absent from most installs).
 """
 import importlib
 import importlib.util

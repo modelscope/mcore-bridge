@@ -1,15 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""FP8-resident Engram tables.
-
-DeepSeek-V4.1 ships its n-gram tables as fp8 + e8m0 block scales and never trains them, but
-Megatron's ``EPShardedEmbeddingTable`` materializes a ``bf16`` row shard (~2x the checkpoint
-bytes) because its tables are trainable in general. These subclasses keep the raw fp8 bits and
-decode only the rows a forward actually touches, reusing upstream's EP routing untouched: only
-``EPShardedEmbeddingTable.forward`` is replaced, and every other table attribute is preserved so
-``EPShardedMultiTableEmbedding`` keeps working.
-
-Load with these tables is a byte copy (checkpoint fp8 -> store fp8), so it no longer upcasts
-183 GiB of Engram weights to bf16.
+"""FP8-resident Engram tables: keep the checkpoint's fp8 bytes + e8m0 scales and decode only the rows a
+forward touches, instead of materializing 2x bf16 row shards. Loading is a byte copy.
 """
 import torch
 from torch import Tensor, nn
@@ -31,11 +22,9 @@ logger = get_logger()
 
 
 def fp8_quant_declared(config) -> bool:
-    """Whether the checkpoint declares DeepSeek-V4.1's official quantized layout.
+    """Whether the checkpoint declares DeepSeek-V4.1's official quantized layout (ue8m0 / 32x32 blocks).
 
-    ``scale_fmt: ue8m0`` or a 32x32 block scale is what both consumers key off: the fp8-resident
-    Engram store and the export requantizer. The storage follows the checkpoint declaration rather
-    than a user switch.
+    Shared by the fp8 Engram store and the export requantizer.
     """
     hf_config = getattr(config, 'hf_config', None)
     quantization = getattr(hf_config, 'quantization_config', None)
@@ -96,8 +85,7 @@ if EPShardedEmbeddingTable is not None:
             self.block_size = block_size
             device = torch.device('cpu') if config.use_cpu_initialization else get_current_device()
             local_rows = self.local_num_embeddings
-            # Zero-filled, not empty: an unfilled row must read as 0 rather than as garbage bits.
-            # Non-persistent buffers so `.to(device)` moves them while `.to(dtype)` leaves the bytes alone.
+            # Zero-filled (unfilled rows must decode to 0); non-persistent so `.to(dtype)` cannot touch the bytes.
             self.register_buffer(
                 'fp8_rows',
                 torch.zeros((local_rows, embedding_dim), dtype=torch.uint8, device=device),
@@ -107,8 +95,7 @@ if EPShardedEmbeddingTable is not None:
                 torch.zeros((local_rows, -(-embedding_dim // block_size)), dtype=torch.uint8, device=device),
                 persistent=False)
             self._filled_rows = 0
-            # Zero-row bf16 placeholder: upstream allocates temporaries and probes the checkpoint
-            # dtype through `weight`, so it must exist with the right dtype/device but hold no data.
+            # Zero-row bf16 placeholder: upstream probes `weight`'s dtype/attrs but must not see data.
             self.weight = nn.Parameter(
                 torch.empty(0, embedding_dim, dtype=config.params_dtype, device=device), requires_grad=False)
             self.weight.allreduce = False
@@ -127,8 +114,7 @@ if EPShardedEmbeddingTable is not None:
 
         def _save_to_state_dict(self, destination, prefix, keep_vars):
             super()._save_to_state_dict(destination, prefix, keep_vars)
-            # `weight` stays a zero-row placeholder; the payload travels under the checkpoint names so
-            # plain state_dict() and DCP both carry the table.
+            # Payload travels under the checkpoint names; `weight` stays a zero-row placeholder.
             destination[prefix + 'weight'] = self.fp8_rows.view(torch.float8_e4m3fn)
             destination[prefix + 'weight_scale_inv'] = self.fp8_scales.view(torch.float8_e8m0fnu)
 

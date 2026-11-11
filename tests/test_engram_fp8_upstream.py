@@ -1,8 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""Fp8EngramEmbedding against the real Megatron Engram embedding (requires the upstream Engram PR).
-
-Skipped when Megatron ships no ``megatron.core.models.engram``; the hermetic stub-based coverage
-lives in ``test_engram_fp8_tables.py``.
+"""Fp8EngramEmbedding against the real Megatron Engram embedding; skipped without the upstream package
+(stub-based coverage lives in ``test_engram_fp8_tables.py``).
 """
 import pytest
 import torch
