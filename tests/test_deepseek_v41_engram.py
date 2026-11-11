@@ -9,9 +9,9 @@ from safetensors.torch import save_file
 from types import SimpleNamespace
 
 from mcore_bridge.config.parser import _convert_config
-from mcore_bridge.model.gpts import deepseek_v41 as deepseek_v41_module
-from mcore_bridge.model.gpts.deepseek_v41 import (DeepseekV41Aligner, DeepseekV41Bridge, DeepseekV41DSparkAttention,
-                                                  DeepseekV41Loader, DeepseekV41Vision, DeepseekV41VisionTransformer)
+from mcore_bridge.model.mm_gpts import deepseek_v41 as deepseek_v41_module
+from mcore_bridge.model.mm_gpts.deepseek_v41 import (DeepseekV41Aligner, DeepseekV41Bridge, DeepseekV41DSparkAttention,
+                                                     DeepseekV41Loader, DeepseekV41Vision, DeepseekV41VisionTransformer)
 from mcore_bridge.model.modules import engram as engram_adapter
 from mcore_bridge.model.modules.dspark import (DeepseekV41DSparkConfidenceHead, DeepseekV41DSparkInput,
                                                DeepseekV41DSparkMarkovHead, DeepseekV41DSparkOutput,
@@ -313,6 +313,11 @@ def test_dspark_state_preserves_recompute_inputs():
 
 
 def test_dspark_stack_prefill_and_decode_lifecycle():
+    from mcore_bridge.model.modules import dspark as dspark_module
+
+    if dspark_module.SinglePassMHCState is None:
+        pytest.skip('DSpark needs megatron.core.transformer.hyper_connection.SinglePassMHCState, which '
+                    'the installed Megatron does not provide (the module is not on main/dev).')
 
     class _Input(torch.nn.Module):
 
@@ -563,6 +568,9 @@ def test_engram_config_allows_packed_sequences_without_losing_the_pipeline_guard
     if not engram_adapter.has_native_engram():
         pytest.skip('The PR #7224 baseline intentionally has no Engram extension.')
     config = _engram_config_for_validation(tmp_path)
+    if not hasattr(config.variant_spec, 'supports_packed_sequences'):
+        pytest.skip('The installed Engram EngramVariant predates `supports_packed_sequences`; no public '
+                    'Engram branch (#7231/#7501/#8225) exposes it, so this asserts a newer API.')
     assert not config.variant_spec.supports_packed_sequences
 
     config._validate_packed_sequences(SimpleNamespace(pipeline_model_parallel_size=1), packed_sequences=True)
