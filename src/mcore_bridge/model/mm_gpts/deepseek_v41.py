@@ -60,8 +60,8 @@ from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
-from mcore_bridge.model.modules.engram_fp8 import is_fp8_table
-from mcore_bridge.utils import Fp8Dequantizer, is_master
+from mcore_bridge.model.modules.engram_fp8 import fp8_engram_tables_declared, is_fp8_table
+from mcore_bridge.utils import Fp8Dequantizer, is_master, quantize_dsv41_export_value
 
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
@@ -1344,6 +1344,25 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             param.data.copy_(Fp8Dequantizer((32, 32)).convert(tensor, scales))
             return
         return super()._set_param(param, tensor, scale_inv)
+
+    def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
+        res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
+        if to_mcore or self._peft_format or not fp8_engram_tables_declared(self.config):
+            return res
+        # The load direction dequantizes the official FP8/MXFP4 source into BF16 training parameters, but
+        # vLLM only serves the official quantized layout (its SM100 attention reads ``weight_scale`` during
+        # construction), so the export restores that layout key-by-key: dense block32 fp8 + e8m0 scales and
+        # packed MXFP4 experts, each under the ``<name>.scale`` companion key the source uses. Gated on the
+        # same checkpoint declaration as the fp8 Engram tables (no user switch); an undeclared (BF16) source
+        # exports unchanged, and already-quantized payloads such as the Engram tables pass through.
+        requantized = {}
+        for key, value in res.items():
+            converted = quantize_dsv41_export_value(key, value)
+            if converted is None:
+                requantized[key] = value
+            else:
+                requantized.update(converted)
+        return requantized
 
     @staticmethod
     def _lm(mg_model):
