@@ -3,6 +3,7 @@ import copy
 import torch
 import transformer_engine.pytorch as te
 from contextlib import contextmanager
+from functools import partial
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -546,14 +547,26 @@ class DeepseekV4Loader(ModelLoader):
         return self._patch_dsv4_layer_specs([copy.deepcopy(spec) for spec in _build_all_layer_specs(self.config)])
 
     def _patch_dsv4_layer_specs(self, layer_specs):
+
+        def get_submodules(builder):
+            # MCore dev uses partial builders; older releases use ModuleSpec.
+            return builder.keywords['submodules'] if isinstance(builder, partial) else builder.submodules
+
+        def replace_module(builder, module):
+            if isinstance(builder, partial):
+                return partial(module, *builder.args, **builder.keywords)
+            builder.module = module
+            return builder
+
         for layer_spec in layer_specs:
             layer_spec.submodules.self_attention.module = DSv4HybridSelfAttention
-            core_attention_submodules = layer_spec.submodules.self_attention.submodules.core_attention.submodules
+            core_attention_submodules = get_submodules(layer_spec.submodules.self_attention.submodules.core_attention)
             if getattr(core_attention_submodules, 'compressor', None) is not None:
-                core_attention_submodules.compressor.module = Compressor
+                core_attention_submodules.compressor = replace_module(core_attention_submodules.compressor, Compressor)
             if getattr(core_attention_submodules, 'indexer', None) is not None:
-                core_attention_submodules.indexer.module = CSAIndexer
-                core_attention_submodules.indexer.submodules.compressor.module = Compressor
+                indexer_submodules = get_submodules(core_attention_submodules.indexer)
+                indexer_submodules.compressor = replace_module(indexer_submodules.compressor, Compressor)
+                core_attention_submodules.indexer = replace_module(core_attention_submodules.indexer, CSAIndexer)
         return layer_specs
 
 
