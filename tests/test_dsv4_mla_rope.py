@@ -27,13 +27,14 @@ def _load_apply():
 def test_packed_cu_seqlens_are_not_forwarded():
     apply, captured = _load_apply()
     tokens = torch.zeros(4, 2, 8)
-    freqs = torch.zeros(4, 1, 1, 4)
+    freqs = torch.arange(16, dtype=torch.float32).reshape(4, 1, 1, 4)
     cu = torch.tensor([0, 4])
     apply(tokens, freqs, config=object(), cu_seqlens=cu, cp_group=object())
     assert captured['kwargs']['cu_seqlens'] is None
     assert captured['kwargs']['mla_rotary_interleaved'] is True
     assert captured['t'] is tokens
-    assert captured['freqs'] is freqs
+    assert captured['freqs'].shape == (4, 1, 4)
+    torch.testing.assert_close(captured['freqs'], freqs.squeeze(-2), rtol=0, atol=0)
 
 
 def test_misaligned_frequencies_still_fail():
