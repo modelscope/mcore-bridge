@@ -72,3 +72,18 @@ def test_strict_load_reports_incompatible_state(embedding, problem):
         state['tables.0.weight'] = torch.zeros(2, 4)
     with pytest.raises(RuntimeError):
         embedding.load_state_dict(state, strict=True)
+
+
+def test_keep_vars_load_preserves_frozen_host_tables(embedding):
+    source = torch.nn.Module()
+    source.tables = torch.nn.ModuleList(
+        [torch.nn.Embedding(table.weight.shape[0], table.weight.shape[1]) for table in embedding.tables])
+    state = source.state_dict(keep_vars=True)
+    assert all(value.requires_grad for value in state.values())
+    with torch.enable_grad():
+        embedding.load_state_dict(state, strict=True)
+    for table in embedding.tables:
+        assert not table.weight.requires_grad
+        assert table.weight.grad_fn is None
+    ids = torch.zeros((1, 2, len(embedding.tables)), dtype=torch.long)
+    assert not embedding(ids).requires_grad

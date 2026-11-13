@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from contextlib import contextmanager
 from megatron.core import mpu
+from megatron.core.utils import unwrap_model
 from peft import PeftModel
 from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
@@ -17,7 +18,7 @@ from typing import Callable, List, Optional, Union
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
-                                deep_getattr, gc_collect, get_logger, is_master, unwrap_model)
+                                deep_getattr, gc_collect, get_logger, is_master)
 from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
@@ -54,6 +55,11 @@ class GPTBridge:
     additional_dim0_keys = set()
     additional_dim1_keys = set()
     _support_hf_grouped_lora = True
+
+    def __deepcopy__(self, memo):
+        # Bridges hold process groups; per-layer config copies must share, not copy, them.
+        memo[id(self)] = self
+        return self
 
     def __init__(self, config: ModelConfig):
         self.config = config
@@ -524,8 +530,8 @@ class GPTBridge:
             assert mg_scale_inv is None, f'mg_key: {mg_key}'
             tensor = tensor + offset
         is_embedding = mg_key in {'embedding.word_embeddings.weight', 'output_layer.weight'}
-        if is_embedding and self.config.padded_vocab_size < tensor.shape[0]:
-            tensor = tensor[:self.config.padded_vocab_size]
+        if is_embedding and self.config.actual_vocab_size < tensor.shape[0]:
+            tensor = tensor[:self.config.actual_vocab_size]
         if self._target_device is not None:
             tensor = tensor.to(device=self._target_device)
             if mg_scale_inv is not None:
@@ -1986,7 +1992,6 @@ class GPTBridge:
         return int(t.item())
 
     def _convert_mtp_layer(self, lm_model, hf_state_dict, hf_prefix: str, layer_idx: int, to_mcore: bool):
-        from mcore_bridge.model.mtp import get_mtp_inner_layer
         mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
         if self.hf_mtp_prefix == self.hf_layers_prefix:
             hf_layer_idx = layer_idx + self.config.num_layers
@@ -2015,7 +2020,7 @@ class GPTBridge:
             origin_hf_state_dict = {}
             hf_state_dict = {}
         self._convert_mtp_extra(mtp_layer, hf_state_dict, to_mcore, origin_hf_state_dict)
-        transformer_layer = None if mtp_layer is None else get_mtp_inner_layer(mtp_layer)
+        transformer_layer = None if mtp_layer is None else mtp_layer.mtp_model_layer
         self._convert_mtp_embeds(lm_model, hf_state_dict, to_mcore)
         hf_state_dict.update(self._set_layer_attn(transformer_layer, hf_state_dict, -1, to_mcore))
         hf_state_dict.update(self._set_layer_mlp(transformer_layer, hf_state_dict, -1, to_mcore, is_mtp=True))

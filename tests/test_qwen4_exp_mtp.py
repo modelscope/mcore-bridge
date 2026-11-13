@@ -225,7 +225,7 @@ def test_qwen4exp_mtp_builds_residual_linear_shared_head():
         # joint multi-stream norm: hc_count * hidden_size
         assert ml.hnorm.weight.shape[0] == config.hc_count * config.hidden_size
         assert type(ml.hyper_connection_mixer).__name__ == 'Qwen4ExpTextGatedResidual'
-        inner = ml.transformer_layer
+        inner = ml.mtp_model_layer
         assert type(inner).__name__ == 'Qwen4ExpMTPInnerLayer'
         assert getattr(inner.self_attention, 'indexer', None) is not None  # full-attention + QSA
         assert inner.ple is None  # no PLE in the MTP block

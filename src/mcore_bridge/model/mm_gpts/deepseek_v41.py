@@ -61,7 +61,8 @@ from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
 from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
                                                build_deepseek_v41_engram_config, has_native_engram)
-from mcore_bridge.utils import is_master
+from mcore_bridge.model.modules.engram_fp8 import fp8_quant_declared, is_fp8_table
+from mcore_bridge.utils import Fp8Dequantizer, is_master, quantize_dsv41_export_value
 
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
@@ -1339,24 +1340,46 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     the decoder's ``2 * N`` hybrid layers.
     """
 
-    def _set_param(self, param, tensor, scale_inv):
-        # The source format is quantized; this path trains BF16 parameters.
-        # Decode on CPU before transfer, avoiding NPU E8M0/FP4 conversion kernels.
-        if is_torch_npu_available() and scale_inv is not None and not self._is_fp8_param(param):
-            from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8
-            tensor = tensor.cpu()
-            if tensor.dtype == torch.int8 and tensor.shape[-1] * 2 == param.shape[-1]:
-                tensor = fp4_to_fp8(tensor)
-            tensor = tensor.reshape(*param.shape)
-            scale_inv = scale_inv.cpu().reshape(-1, scale_inv.shape[-1])
-            tensor = Fp8Dequantizer(block_size='auto').convert(tensor, scale_inv)
-            param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
-            return
-        return super()._set_param(param, tensor, scale_inv)
-
     _ENGRAM_LOAD_CHUNK_ROWS = 65536
     additional_dim0_keys = DeepseekV4Bridge.additional_dim0_keys | {'embed', 'head'}
     additional_dim1_keys = DeepseekV4Bridge.additional_dim1_keys | {'main_proj'}
+
+    def _set_param(self, param: torch.Tensor, tensor: torch.Tensor, scale_inv: Optional[torch.Tensor]):
+        quantization = getattr(getattr(getattr(self, 'config', None), 'hf_config', None), 'quantization_config',
+                               None) or {}
+        is_fp4 = tensor.dtype == torch.int8 and tensor.shape[-1] * 2 == param.shape[-1]
+        block32 = tensor.dtype == torch.float8_e4m3fn and quantization.get('weight_block_size') == [32, 32]
+        npu_bf16 = is_torch_npu_available() and not self._is_fp8_param(param)
+        npu_quantized = npu_bf16 and (is_fp4 or tensor.dtype == torch.float8_e4m3fn)
+        if scale_inv is not None and (block32 or npu_quantized):
+            if self._is_fp8_param(param):
+                raise ValueError('DeepSeek V4.1 source dequantization requires BF16 training parameters')
+            if is_torch_npu_available():
+                tensor, scale_inv = tensor.cpu(), scale_inv.cpu()
+            if is_fp4:
+                from mcore_bridge.utils import fp4_to_fp8
+                tensor = fp4_to_fp8(tensor)
+            tensor = tensor.reshape(*param.shape)
+            scales = scale_inv.reshape(-1, scale_inv.shape[-1])
+            block_size = (1, 32) if is_fp4 else tuple(quantization.get('weight_block_size') or (128, 128))
+            param.data.copy_(Fp8Dequantizer(block_size).convert(tensor, scales).to(param))
+            return
+        return super()._set_param(param, tensor, scale_inv)
+
+    def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
+        res = super()._convert_hf_state_dict(hf_state_dict, to_mcore)
+        if to_mcore or self._peft_format or not fp8_quant_declared(self.config):
+            return res
+        # Restore the official quantized layout the BF16 training parameters were loaded from; gated on the
+        # checkpoint's own declaration, not on a user switch.
+        requantized = {}
+        for key, value in res.items():
+            converted = quantize_dsv41_export_value(key, value)
+            if converted is None:
+                requantized[key] = value
+            else:
+                requantized.update(converted)
+        return requantized
 
     @staticmethod
     def _lm(mg_model):
@@ -1395,6 +1418,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
             self._lm(mg_model), 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore: bool):
+        result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
+        if self.config.language_model_only:
+            return result
         # Runs the vision/aligner + image_* block unconditionally instead of branching on *this*
         # rank's ``mg_model.visual``. On export every pipeline stage runs ``_convert`` ->
         # ``_convert_pre_process``, and this path issues the *same* pp-group collective sequence on
@@ -1407,9 +1433,6 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         # collectives so the last stage's later per-layer ``has_model`` all-reduce reads a stale
         # value -> ``next(mg_models)`` -> ``StopIteration``. On load only the first stage reaches
         # this method (see ``_convert``'s ``is_pp_first_stage`` guard).
-        result = super()._convert_pre_process(mg_model, hf_state_dict, hf_prefix, to_mcore)
-        if self.config.language_model_only:
-            return result
         target = hf_state_dict if to_mcore else result
         for name in ('image_start', 'image_end', 'image_newline'):
             self._set_state_dict(mg_model, f'visual.{name}', target, f'model.{name}', to_mcore)
@@ -1622,9 +1645,12 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
         if weight.ndim != 2 or scale.ndim != 2:
             raise ValueError(f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
         if weight.shape[0] != scale.shape[0]:
-            # V4.1 projection matrices use 32x32 blocks; embedding tables use rowwise scales.
-            from mcore_bridge.utils import Fp8Dequantizer
-            return Fp8Dequantizer(block_size='auto').convert(weight, scale)
+            # WKV uses block32, including a partial final block; tables remain row-scaled.
+            expected = tuple((size + 31) // 32 for size in weight.shape)
+            if tuple(scale.shape) != expected:
+                raise ValueError(
+                    f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
+            return Fp8Dequantizer((32, 32)).convert(weight, scale)
         if weight.shape[1] % scale.shape[1] != 0:
             raise ValueError(f'Engram weight width {weight.shape[1]} is not divisible by scale width {scale.shape[1]}.')
         block_size = weight.shape[1] // scale.shape[1]
@@ -1633,6 +1659,9 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     def _load_engram_embedding(self, engram, hf_state_dict):
         weight = hf_state_dict['engram.embed.weight']
         scale = hf_state_dict.get('engram.embed.weight_scale_inv')
+        if is_fp8_table(engram.embedding.tables[0]) and scale is None:
+            raise ValueError('The Engram table store is fp8 because quantization_config declares an FP8 '
+                             'source, but `engram.embed.weight_scale_inv` is missing from this checkpoint.')
         flat_offset = 0
         for table in engram.embedding.tables:
             table_offset = flat_offset
@@ -1643,6 +1672,10 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 source_end = table_offset + table.row_start + local_end
                 rows = self._load_lazy_slice(weight, source_start, source_end)
                 row_scales = None if scale is None else self._load_lazy_slice(scale, source_start, source_end)
+                if is_fp8_table(table):
+                    # Byte copy: the checkpoint already holds the fp8 payload and e8m0 scales.
+                    table.fill_rows(local_start, local_end, rows, row_scales)
+                    continue
                 rows = self._dequantize_engram_rows(rows, row_scales)
                 table.weight.data[local_start:local_end].copy_(
                     rows.to(device=table.weight.device, dtype=table.weight.dtype))
@@ -1680,11 +1713,17 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
                 return
             if engram is None:
                 return
-            # --- export embedding tables to a single flat tensor (bf16, no FP8) ---
-            all_rows = []
-            for table in engram.embedding.tables:
-                all_rows.append(table.weight.data.cpu())
-            hf_state_dict['engram.embed.weight'] = torch.cat(all_rows, dim=0)
+            # --- export embedding tables to a single flat tensor ---
+            if is_fp8_table(engram.embedding.tables[0]):
+                hf_state_dict['engram.embed.weight'] = torch.cat(
+                    [t.fp8_rows.view(torch.float8_e4m3fn).cpu() for t in engram.embedding.tables], dim=0)
+                hf_state_dict['engram.embed.weight_scale_inv'] = torch.cat(
+                    [t.fp8_scales.view(torch.float8_e8m0fnu).cpu() for t in engram.embedding.tables], dim=0)
+            else:
+                all_rows = []
+                for table in engram.embedding.tables:
+                    all_rows.append(table.weight.data.cpu())
+                hf_state_dict['engram.embed.weight'] = torch.cat(all_rows, dim=0)
             # --- export key+value projections as combined wkv ---
             key_w = engram.key_projection.weight.data.cpu()  # [stream_width, total_memory_dim]
             val_w = engram.value_projection.weight.data.cpu()  # [hidden, total_memory_dim]

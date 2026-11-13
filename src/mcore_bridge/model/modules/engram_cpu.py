@@ -29,7 +29,8 @@ class CPUEmbeddingTable(EPShardedEmbeddingTable):
             if source.shape != self.weight.shape:
                 error_msgs.append(f'{key}: expected {tuple(self.weight.shape)}, got {tuple(source.shape)}')
             else:
-                self.weight.copy_(source.to(device='cpu', dtype=self.weight.dtype))
+                with torch.no_grad():
+                    self.weight.copy_(source.to(device='cpu', dtype=self.weight.dtype))
         elif strict:
             missing_keys.append(key)
         # The host tensor deliberately is neither a parameter nor a buffer.

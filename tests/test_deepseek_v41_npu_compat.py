@@ -56,17 +56,33 @@ def test_non_npu_parameter_loading_preserves_parent_path(monkeypatch):
     calls = []
     monkeypatch.setattr(module.DeepseekV4Bridge, '_set_param', lambda self, *args: calls.append(args))
     bridge = object.__new__(module.DeepseekV41Bridge)
-    parameter, source, scale = object(), object(), object()
+    parameter, source, scale = torch.zeros(2, 2), torch.ones(2, 2), None
     bridge._set_param(parameter, source, scale)
     assert calls == [(parameter, source, scale)]
 
 
-def test_engram_block_scales_match_expanded_reference():
-    weight = (torch.arange(32).reshape(4, 8) % 7 - 3).to(torch.float8_e4m3fn)
-    scale = torch.tensor([[0.5, 2.], [4., 8.]])
-    expected = weight.float() * scale.repeat_interleave(2, dim=0).repeat_interleave(4, dim=1)
+@pytest.mark.parametrize('rows', [64, 100])
+def test_engram_block_scales_match_expanded_reference(rows):
+    weight = (torch.arange(rows * 64).reshape(rows, 64) % 7 - 3).to(torch.float8_e4m3fn)
+    scale = torch.arange(1, ((rows + 31) // 32) * 2 + 1).reshape(-1, 2).float()
+    expected = weight.float() * scale.repeat_interleave(32, dim=0).repeat_interleave(32, dim=1)[:rows]
     actual = module.DeepseekV41Bridge._dequantize_engram_rows(weight, scale)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize('npu', [False, True])
+def test_fp8_parameter_tail_blocks(monkeypatch, npu):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(module, 'is_torch_npu_available', lambda: npu)
+    bridge = object.__new__(module.DeepseekV41Bridge)
+    bridge.config = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'weight_block_size': [32, 32]}))
+    weight = torch.ones(100, 64).to(torch.float8_e4m3fn)
+    scales = torch.arange(1, 9).reshape(4, 2).float()
+    target = torch.nn.Parameter(torch.zeros(100, 64), requires_grad=False)
+    bridge._set_param(target, weight, scales)
+    expected = scales.repeat_interleave(32, 0).repeat_interleave(32, 1)[:100]
+    torch.testing.assert_close(target, expected, rtol=0, atol=0)
 
 
 def test_engram_row_scales_preserve_existing_format():

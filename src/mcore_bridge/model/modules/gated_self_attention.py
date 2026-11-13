@@ -1,13 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import torch
+from megatron.core.extensions.transformer_engine import SplitAlongDim
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.tensor_parallel import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.attention import SelfAttention
-
-try:
-    from megatron.core.extensions.transformer_engine import SplitAlongDim
-except ImportError:
-    SplitAlongDim = None
 
 
 class GatedSelfAttention(SelfAttention):

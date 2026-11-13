@@ -5,9 +5,9 @@ Pure logic, no GPU / distributed init required.
 """
 import pytest  # noqa: E402
 
-from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HyperConnectionHybridLayer  # noqa: E402
-from mcore_bridge.model.gpts.deepseek_v41 import (HybridLayerConfig, HyperConnectionHybridLayer,
-                                                  derive_hybrid_layer_config)
+from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HyperConnectionHybridLayer  # noqa: E402
+from mcore_bridge.model.mm_gpts.deepseek_v41 import (HybridLayerConfig, HyperConnectionHybridLayer,
+                                                     derive_hybrid_layer_config)
 
 
 def test_tiny_all_moe_zero_ratio():
@@ -72,7 +72,7 @@ def test_loader_build_hybrid_config_does_not_mutate_original():
     # The loader derives its own config copy so the caller's config is never mutated.
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Loader
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Loader
 
     loader = object.__new__(DeepseekV41Loader)
     loader.config = SimpleNamespace(
@@ -106,7 +106,7 @@ def test_loader_build_hybrid_config_does_not_mutate_original():
 def _make_bridge(engram_layer_ids, enable_hyper_connections):
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Bridge
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Bridge
 
     bridge = object.__new__(DeepseekV41Bridge)
     bridge.config = SimpleNamespace(
@@ -176,7 +176,7 @@ def test_engram_placement_and_hf_layer_id_round_trip():
     # engram_num_embeddings validation (keyed by 0-based HF ids) still resolves.
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Bridge, DeepseekV41Loader
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Bridge, DeepseekV41Loader
 
     loader = object.__new__(DeepseekV41Loader)
     assert loader._engram_placement_layer_ids([1, 3]) == (3, 7)
@@ -196,7 +196,7 @@ def test_num_hybrid_layers_normalizes_both_layer_spaces():
     # ``2 * num_layers`` on the doubled config over-counted and dereferenced None layers.
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Bridge
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Bridge
 
     load_cfg = SimpleNamespace(num_layers=4, hybrid_layer_pattern=None)
     export_cfg = SimpleNamespace(num_layers=8, hybrid_layer_pattern='DEDEDEDE')
@@ -262,7 +262,7 @@ def test_rewrap_swaps_class_only_on_engram_wrappers():
     # subclass; every other wrapper keeps the base class (and its fast path).
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Loader
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Loader
 
     engram_wrapper = object.__new__(HyperConnectionHybridLayer)
     engram_wrapper.inner_layer = SimpleNamespace(engram=object())
@@ -283,7 +283,7 @@ def test_rewrap_noop_without_hyper_connections():
     # No wrapping happens at all when hyper-connections are off, so nothing to retrofit.
     from types import SimpleNamespace
 
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Loader
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Loader
 
     engram_wrapper = object.__new__(HyperConnectionHybridLayer)
     engram_wrapper.inner_layer = SimpleNamespace(engram=object())
@@ -296,7 +296,7 @@ def test_rewrap_noop_without_hyper_connections():
     assert type(engram_wrapper) is HyperConnectionHybridLayer
 
 
-from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HybridStackModel  # noqa: E402
+from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HybridStackModel  # noqa: E402
 
 
 def _seg_config(pattern, **overrides):
@@ -379,7 +379,7 @@ def test_resolve_hybrid_layer_pattern_segments_then_defers_to_base():
         _seg_config('DEDEDEDE', pipeline_model_parallel_size=1)) == 'DEDEDEDE'
 
 
-from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41Bridge, DeepseekV41Loader  # noqa: E402
+from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41Bridge, DeepseekV41Loader  # noqa: E402
 
 # --- DSpark (``mtp.*``) draft stack -------------------------------------------------------------
 
@@ -478,8 +478,8 @@ def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
 def test_multimodal_wrapper_hosts_hybrid_backbone():
     # The wrapper is the stock multimodal model with the language-model class swapped for the
     # PP-capable hybrid backbone; everything else (vision tower, image-embed injection) is inherited.
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HybridStackModel, DeepseekV41MultimodalModel
     from mcore_bridge.model.mm_gpt_model import MultimodalGPTModel
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41HybridStackModel, DeepseekV41MultimodalModel
     assert issubclass(DeepseekV41MultimodalModel, MultimodalGPTModel)
     assert DeepseekV41MultimodalModel.language_model_cls is DeepseekV41HybridStackModel
 
@@ -491,7 +491,7 @@ def test_hybrid_stack_exposes_extra_forward_keys():
 
 
 def test_hybrid_loader_model_cls_is_multimodal_wrapper():
-    from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41MultimodalModel
+    from mcore_bridge.model.mm_gpts.deepseek_v41 import DeepseekV41MultimodalModel
     assert DeepseekV41Loader.model_cls is DeepseekV41MultimodalModel
 
 
@@ -567,7 +567,7 @@ def test_hybrid_forward_unpacks_extra_block_kwargs(monkeypatch):
     # it threads ``input_ids`` itself. The hybrid stack must unpack that container before delegating,
     # strip visual keys, and forward anything else, otherwise a text-only wrapper run raises
     # ``HybridModel.forward() got an unexpected keyword argument 'extra_block_kwargs'``.
-    from mcore_bridge.model.gpts import deepseek_v41 as hyb
+    from mcore_bridge.model.mm_gpts import deepseek_v41 as hyb
 
     received = {}
     monkeypatch.setattr(hyb.HybridModel, 'forward', lambda self, *a, **k: received.update(args=a, kwargs=k) or 'OUT')
@@ -590,7 +590,7 @@ def test_hybrid_forward_rejects_pixel_values_from_extra_block_kwargs(monkeypatch
     # Defense in depth: a multimodal batch that smuggles ``pixel_values`` via ``extra_block_kwargs``
     # must still hit the text-only guard (the wrapper injects image embeds and clears them, so the
     # backbone never legitimately sees pixels).
-    from mcore_bridge.model.gpts import deepseek_v41 as hyb
+    from mcore_bridge.model.mm_gpts import deepseek_v41 as hyb
 
     monkeypatch.setattr(hyb.HybridModel, 'forward', lambda self, *a, **k: 'OUT')
     stack = object.__new__(DeepseekV41HybridStackModel)

@@ -4,8 +4,7 @@
     pip install git+https://github.com/NVIDIA/Megatron-LM.git@dev
     python -m mcore_bridge.tools.apply_megatron_patch
 
-The patch (`patches/megatron_glm53_dev.patch`) is rebased onto dev a5aa637fa
-(megatron-core 0.20.0+a5aa637fa, 2026-10-22; originally generated against ee743d3ef) and backports
+The patch (`patches/megatron_glm53_dev.patch`) is rebased onto dev c4220af3a (2026-10-29) and backports
 the unmerged Megatron-LM #7054 GLM numerics -- KDA two-stage gates, mHC precision -- plus GLM's
 parameter-free mHC output mean and KDA in_proj width derivation. KPool DSA / NoPE MLA and the two
 non-model-specific optimizer fixes are no longer in the patch: upstream a5aa637fa already carries

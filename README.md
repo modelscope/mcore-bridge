@@ -20,7 +20,7 @@
 <p align="center">
 <img src="https://img.shields.io/badge/python-3.12-5be.svg">
 <img src="https://img.shields.io/badge/pytorch-%E2%89%A52.0-orange.svg">
-<a href="https://github.com/NVIDIA/Megatron-LM/"><img src="https://img.shields.io/badge/megatron--core-%E2%89%A50.16-76B900.svg"></a>
+<a href="https://github.com/NVIDIA/Megatron-LM/"><img src="https://img.shields.io/badge/megatron--core-%E2%89%A50.18-76B900.svg"></a>
 <!-- <a href="https://mcore-bridge.readthedocs.io/en/latest/"><img src="https://img.shields.io/badge/docs-latest-blue.svg"></a> -->
 <a href="https://pypi.org/project/mcore-bridge/"><img src="https://badge.fury.io/py/mcore-bridge.svg"></a>
 <a href="https://github.com/modelscope/mcore-bridge/blob/main/LICENSE"><img src="https://img.shields.io/github/license/modelscope/mcore-bridge"></a>
@@ -110,7 +110,7 @@ Recommended Runtime Environment:
 | torch        | >=2.0        | 2.8.0/2.11.0       |                    |
 | transformer-engine    | >=2.3       |  2.14.1    |                  |
 | apex |         | 0.1 | Optional |
-| megatron-core    |   >=0.16,<0.21    | 0.17.1      |                  |
+| megatron-core    |   >=0.18,<0.21    | 0.19.2      |                  |
 | flash-attn    |        | 2.8.3/3.0.0b1   |     Optional      |
 | transformers | >=4.33       | 4.57.6/5.8.1   |                    |
 | modelscope   | >=1.23       |             |                    |

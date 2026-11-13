@@ -9,6 +9,8 @@ and MTP can span several heterogeneous inner layers.
 import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -19,20 +21,8 @@ from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import deep_getattr, get_logger
 
 from ..constant import ModelType
+from ..hybrid_model import HybridModel
 from ..register import ModelLoader, ModelMeta, register_model
-
-try:
-    from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
-    from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-
-    from ..hybrid_model import HybridModel
-
-    _HYBRID_MODEL_AVAILABLE = True
-except ImportError as error:
-    if not (error.name or '').startswith('megatron.core.models.hybrid'):
-        raise
-    HybridModel = HybridStack = HybridStackSubmodules = hybrid_stack_spec = None
-    _HYBRID_MODEL_AVAILABLE = False
 
 logger = get_logger()
 
@@ -342,7 +332,7 @@ class NemotronHBridge(GPTBridge):
         them as two `mtp.layers.{0,1}` entries: index 0 carries `enorm`/`hnorm`/`eh_proj`
         plus the attention mixer, index 1 the MoE mixer plus `final_layernorm`. mcore keeps
         both under `mtp.layers[depth].mtp_model_layer.layers[i]`, so the base class
-        assumption of a single `mtp_layer.transformer_layer` does not hold.
+        assumption of a single `mtp_layer.mtp_model_layer` does not hold.
         """
         pattern = self.config.mtp_hybrid_override_pattern
         mtp_layer = lm_model.mtp.layers[layer_idx] if hasattr(lm_model, 'mtp') else None
@@ -429,13 +419,12 @@ class NemotronHLoader(ModelLoader):
         return model
 
 
-if _HYBRID_MODEL_AVAILABLE:
-    register_model(
-        ModelMeta(
-            ModelType.nemotron_h,
-            ['nemotron_h'],
-            bridge_cls=NemotronHBridge,
-            loader=NemotronHLoader,
-            mtp_prefix='mtp',
-            mtp_depth_field='mtp_num_hidden_layers',
-        ))
+register_model(
+    ModelMeta(
+        ModelType.nemotron_h,
+        ['nemotron_h'],
+        bridge_cls=NemotronHBridge,
+        loader=NemotronHLoader,
+        mtp_prefix='mtp',
+        mtp_depth_field='mtp_num_hidden_layers',
+    ))

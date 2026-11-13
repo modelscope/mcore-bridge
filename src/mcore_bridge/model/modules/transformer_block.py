@@ -10,13 +10,9 @@ from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.transformer_block import TransformerBlock as McoreTransformerBlock
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, get_pg_rank, make_viewless_tensor
 from typing import List, Optional, Set, Union, cast
-
-try:
-    from megatron.core.typed_torch import apply_module
-except ImportError:
-    apply_module = None
 
 try:
     from megatron.core.transformer.hyper_connection import HyperConnectionModule, learned_output_contract
@@ -508,10 +504,7 @@ class TransformerBlock(McoreTransformerBlock):
 
         # Final layer norm.
         if self.final_layernorm is not None:
-            if apply_module is None:
-                hidden_states = self.final_layernorm(hidden_states)
-            else:
-                hidden_states = apply_module(self.final_layernorm)(cast(torch.Tensor, hidden_states))
+            hidden_states = apply_module(self.final_layernorm)(cast(torch.Tensor, hidden_states))
             # TENorm produces a "viewed" tensor. This will result in schedule.py's
             # deallocate_output_tensor() throwing an error, so a viewless tensor is
             # created to prevent this.

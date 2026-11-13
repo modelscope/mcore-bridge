@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import megatron.core
 import peft
 import torch
 import torch.nn as nn
@@ -32,7 +31,6 @@ from mcore_bridge.utils import get_current_device
 from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
-mcore_ge_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0')
 peft_019 = version.parse(peft.__version__) >= version.parse('0.19.0')
 
 
@@ -170,7 +168,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             'config': self.config,
             'is_expert': self.is_expert,
         }
-        if not (mcore_ge_016 and self.is_grouped):
+        # Grouped TE linears take a `pg_collection`, not a `tp_group`; only the
+        # non-grouped adapters forward the base layer's tensor-parallel group.
+        if not self.is_grouped:
             tp_group = _get_tensor_parallel_group_for_lora(self.base_layer)
             if tp_group is not None:
                 kwargs['tp_group'] = tp_group
@@ -214,7 +214,8 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                     )
             else:
                 native_row = isinstance(self.base_layer, RowParallelLinear)
-                row_input_size = self.in_features if native_row or is_torch_npu_available() else in_features
+                # TE (including TENPU) expects the global input size; native layers already expose it.
+                row_input_size = self.in_features if native_row else in_features
                 row_linear_cls = RowParallelLinear if native_row else TERowParallelLinear
                 lora_a = row_linear_cls(
                     input_size=row_input_size,

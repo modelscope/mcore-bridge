@@ -3,6 +3,7 @@ import copy
 import torch
 import transformer_engine.pytorch as te
 from contextlib import contextmanager
+from functools import partial
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
@@ -29,6 +30,12 @@ except ImportError:
     _q_rms_norm = None
     apply_module = None
     off_interface = None
+
+try:
+    from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
+        get_transformer_layer_with_experimental_attention_variant_spec as _build_all_layer_specs
+except ImportError:  # megatron-core 0.18: block-level entry point only
+    _build_all_layer_specs = None
 
 
 @contextmanager
@@ -104,9 +111,11 @@ def _apply_mla_rope(t, freqs, *, config, cu_seqlens, cp_group, inverse=False):
 class DSv4HybridSelfAttention(McoreDSv4HybridSelfAttention):
 
     def __init__(self, config, *args, **kwargs):
-        assert McoreDSv4HybridSelfAttention is not object, (
-            'Please install the Megatron-Core dev branch: '
-            '`pip install git+https://github.com/NVIDIA/Megatron-LM@dev`')
+        if McoreDSv4HybridSelfAttention is object:
+            raise ImportError('DeepSeek-V4 requires megatron-core >= 0.20: '
+                              '`experimental_attention_variant.deepseek_v4_hybrid_attention` entered the release in '
+                              '0.20 (0.18/0.19 only ship the standard GPT skeleton). '
+                              'Install `megatron-core>=0.20`, or Megatron-LM@dev.')
         with _patch_YarnRotaryEmbedding(config):
             super().__init__(config, *args, **kwargs)
         # ``layer_types`` is an HF-space (length ``num_layers``) list. On the HybridStack the layer
@@ -535,19 +544,35 @@ class DeepseekV4GPTModel(GPTModel):
 class DeepseekV4Loader(ModelLoader):
     model_cls = DeepseekV4GPTModel
 
-    def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
-        transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
-        for layer_spec in transformer_layer_spec.layer_specs:
+    def _build_decoder_layer_specs(self):
+        if _build_all_layer_specs is None or McoreDSv4HybridSelfAttention is object:
+            raise NotImplementedError(
+                'DeepSeek-V4 requires megatron-core >= 0.20: it needs both the layer-level '
+                'experimental entry point and `experimental_attention_variant.deepseek_v4_hybrid_attention`.')
+        return self._patch_dsv4_layer_specs([copy.deepcopy(spec) for spec in _build_all_layer_specs(self.config)])
+
+    def _patch_dsv4_layer_specs(self, layer_specs):
+
+        def get_submodules(builder):
+            # MCore dev uses partial builders; older releases use ModuleSpec.
+            return builder.keywords['submodules'] if isinstance(builder, partial) else builder.submodules
+
+        def replace_module(builder, module):
+            if isinstance(builder, partial):
+                return partial(module, *builder.args, **builder.keywords)
+            builder.module = module
+            return builder
+
+        for layer_spec in layer_specs:
             layer_spec.submodules.self_attention.module = DSv4HybridSelfAttention
-            core_attention_submodules = layer_spec.submodules.self_attention.submodules.core_attention.submodules
+            core_attention_submodules = get_submodules(layer_spec.submodules.self_attention.submodules.core_attention)
             if getattr(core_attention_submodules, 'compressor', None) is not None:
-                core_attention_submodules.compressor.module = Compressor
+                core_attention_submodules.compressor = replace_module(core_attention_submodules.compressor, Compressor)
             if getattr(core_attention_submodules, 'indexer', None) is not None:
-                core_attention_submodules.indexer.module = CSAIndexer
-                core_attention_submodules.indexer.submodules.compressor.module = Compressor
-        return transformer_layer_spec
+                indexer_submodules = get_submodules(core_attention_submodules.indexer)
+                indexer_submodules.compressor = replace_module(indexer_submodules.compressor, Compressor)
+                core_attention_submodules.indexer = replace_module(core_attention_submodules.indexer, CSAIndexer)
+        return layer_specs
 
 
 class DeepseekV4Bridge(GPTBridge):

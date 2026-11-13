@@ -209,8 +209,7 @@ def test_mtp_repeated_forward_backward_per_depth():
 
 def test_mtp_full_recompute_per_depth():
     """Full recompute must exercise the bridge checkpoint path without
-    changing the math (0.18.x padding_mask threading, 0.16/0.17 non-tensor
-    shim)."""
+    changing the math (0.18.x padding_mask threading)."""
     with _parallel_context():
         ids, pos = _inputs()
         labels = ids.clone()
@@ -366,11 +365,10 @@ def test_bridge_extras_reach_inner_layer(recompute):
     per_layer_inputs) must be injected into the inner TransformerLayer -- under
     eager AND under full recompute (the checkpoint closure must restore the
     per-microbatch extras during backward)."""
-    from mcore_bridge.model.mtp import get_mtp_inner_layer
     with _parallel_context():
         model = _build(depth=1, recompute=recompute, bf16=True, hidden=128, heads=2)
         model.train()
-        inner = get_mtp_inner_layer(model.mtp.layers[0])
+        inner = model.mtp.layers[0].mtp_model_layer
         captured = []
         orig_fa = inner._forward_attention
 
@@ -412,13 +410,13 @@ def test_bridge_extras_reach_inner_layer(recompute):
 
 def test_padding_mask_survives_full_recompute():
     """On versions whose `_checkpointed_forward` lacks the padding_mask
-    parameter (0.18.x) the bridge backport must deliver the ROLLED padding
-    mask to the inner layer during forward AND recompute."""
-    from mcore_bridge.model.mtp import get_mtp_capabilities, get_mtp_inner_layer
+    parameter (0.18.x) the bridge-owned checkpoint path must deliver the ROLLED
+    padding mask to the inner layer during forward AND recompute."""
+    from mcore_bridge.model.mtp import get_mtp_capabilities
     with _parallel_context():
         model = _build(depth=1, recompute=True)
         model.train()
-        inner = get_mtp_inner_layer(model.mtp.layers[0])
+        inner = model.mtp.layers[0].mtp_model_layer
         seen = []
         orig_fa = inner._forward_attention
 
@@ -486,7 +484,6 @@ def test_differentiable_extras_recompute_graph_boundary():
     """A NON-LEAF differentiable extra shared by multiple depths must be staged
     as a checkpoint input, not closure-captured -- closure capture drags the
     producer graph through recompute-in-backward and frees it twice."""
-    from mcore_bridge.model.mtp import get_mtp_inner_layer
     with _parallel_context():
 
         def run(recompute):
@@ -494,7 +491,7 @@ def test_differentiable_extras_recompute_graph_boundary():
             model = _build(depth=2, recompute=recompute, bf16=True, hidden=128, heads=2)
             model.train()
             for li in range(get_physical_mtp_count(model)):
-                inner = get_mtp_inner_layer(model.mtp.layers[li])
+                inner = model.mtp.layers[li].mtp_model_layer
                 orig = inner._forward_attention
 
                 def spy(hidden_states, *a, _orig=orig, **kw):
@@ -533,7 +530,6 @@ def test_dict_rope_checkpoint_protocol():
     """A dict rotary_pos_emb must never reach save_for_backward positionally;
     the bridge checkpoint flattens the dict's tensors into staged inputs,
     recomputes exactly once in backward, and preserves the math."""
-    from mcore_bridge.model.mtp import get_mtp_capabilities
     with _parallel_context():
         model = _build(depth=1, recompute=True)
         layer = model.mtp.layers[0]
@@ -547,24 +543,13 @@ def test_dict_rope_checkpoint_protocol():
             return hidden_states * 2 + rotary_pos_emb['full_attention'].sum() * 0
 
         layer._proj_and_transformer_layer = light_proj
-        if get_mtp_capabilities().checkpoint_takes_forward_func:
-            # 0.16/0.17 contract: forward_func is the first positional arg
-            out = layer._checkpointed_forward(
-                light_proj,
-                hidden_states=hs,
-                decoder_input=dec,
-                rotary_pos_emb=rope,
-                attention_mask=None,
-                packed_seq_params=None,
-                sequence_len_offset=None)
-        else:
-            out = layer._checkpointed_forward(
-                hidden_states=hs,
-                decoder_input=dec,
-                rotary_pos_emb=rope,
-                attention_mask=None,
-                packed_seq_params=None,
-                sequence_len_offset=None)
+        out = layer._checkpointed_forward(
+            hidden_states=hs,
+            decoder_input=dec,
+            rotary_pos_emb=rope,
+            attention_mask=None,
+            packed_seq_params=None,
+            sequence_len_offset=None)
         out.sum().backward()
         assert len(calls) == 2, f'expected forward + one recompute, got {len(calls)} calls'
         assert all(isinstance(c, dict) and torch.is_tensor(c['full_attention']) for c in calls), \

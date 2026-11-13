@@ -21,11 +21,19 @@ def _cfg_get(config, key: str):
     return getattr(config, key, None)
 
 
+def _cfg_get_path(config, path: str):
+    for key in path.split('.'):
+        config = _cfg_get(config, key)
+        if config is None:
+            return None
+    return config
+
+
 def _get_declared_depth(hf_config, field: Optional[str]) -> Optional[int]:
     if not field:
         return None
     for config in (hf_config, _cfg_get(hf_config, 'text_config')):
-        value = _cfg_get(config, field)
+        value = _cfg_get_path(config, field)
         if value is None:
             continue
         try:
@@ -35,6 +43,10 @@ def _get_declared_depth(hf_config, field: Optional[str]) -> Optional[int]:
         if value > 0:
             return value
     return None
+
+
+def _get_declared_bool(hf_config, field: Optional[str]) -> bool:
+    return bool(_cfg_get_path(hf_config, field)) if field else False
 
 
 def _read_weight_keys(model_dir: Optional[str]) -> Optional[List[str]]:
@@ -78,13 +90,20 @@ def _count_standard_sets(keys: List[str], num_layers: int) -> int:
 
 
 def _count_prefixed_sets(keys: List[str], prefix: str) -> int:
+    prefix = prefix.strip('.')
+    pattern = re.compile(rf'^{re.escape(prefix)}\.(?:layers\.)?(\d+)\.')
+    indices = {int(match.group(1)) for key in keys if (match := pattern.match(key))}
+    if indices:
+        return len(indices)
+
+    # Legacy multimodal checkpoints may wrap an otherwise bare prefix.
     name = prefix.split('.')[-1]
     wrapper = r'(?:model\.)?(?:language_model\.)?'
     pattern = re.compile(rf'^{wrapper}{re.escape(name)}\.(?:layers\.)?(\d+)\.')
     indices = {int(match.group(1)) for key in keys if (match := pattern.match(key))}
     if indices:
         return len(indices)
-    top_level = re.compile(rf'^{wrapper}{re.escape(name)}\.')
+    top_level = re.compile(rf'^(?:{re.escape(prefix)}\.|{wrapper}{re.escape(name)}\.)')
     return 1 if any(top_level.match(key) for key in keys) else 0
 
 
@@ -119,12 +138,29 @@ def resolve_mtp_num_layers(model_meta: 'ModelMeta',
             logger.warning(f'Could not inspect MTP weights in {model_dir!r}; MTP is disabled. '
                            'Pass `--mtp_num_layers` explicitly if you want to train it.')
         return None
-    detected = _count_mtp_sets(keys, prefix, hf_config)
-    if detected == 0:
+    detected_modules = _count_mtp_sets(keys, prefix, hf_config)
+    if detected_modules == 0:
         if declared and warn:
             logger.warning(f'The model config declares {declared} MTP layer(s), but no MTP weights were found '
                            f'under {prefix!r}; MTP is disabled for this checkpoint.')
         return None
+
+    layers_per_depth = int(model_meta.mtp_layers_per_depth or 1)
+    if detected_modules % layers_per_depth:
+        raise ValueError(f'MTP weights under {prefix!r} contain {detected_modules} module(s), which is not divisible '
+                         f'by mtp_layers_per_depth={layers_per_depth}.')
+    physical_depths = detected_modules // layers_per_depth
+    repeated = _get_declared_bool(hf_config, model_meta.mtp_repeated_field)
+    if repeated:
+        if physical_depths != 1:
+            raise ValueError(f'{model_meta.mtp_repeated_field} is true, but the checkpoint stores '
+                             f'{physical_depths} physical MTP depth(s) under {prefix!r}.')
+        detected = declared or 1
+        if declared and warn:
+            logger.info(f'MTP uses one repeated physical pattern {prefix!r} for {declared} logical depth(s).')
+        return detected
+
+    detected = physical_depths
     if declared and declared != detected and warn:
         logger.warning(f'The model config declares {declared} MTP layer(s), but the checkpoint stores '
                        f'{detected} physical set(s) under {prefix!r}; using {detected}.')
@@ -143,7 +179,8 @@ def resolve_mtp_config(model_meta: 'ModelMeta', hf_config, model_dir: Optional[s
     else:
         num_layers = int(requested_num_layers)
     if requested_shared_weights is None:
-        shared_weights = bool(physical == 1 and num_layers and num_layers > 1)
+        repeated = _get_declared_bool(hf_config, model_meta.mtp_repeated_field)
+        shared_weights = bool(repeated or physical == 1 and num_layers and num_layers > 1)
     else:
         shared_weights = requested_shared_weights
     if requested_num_layers == 'auto' or requested_shared_weights is None:

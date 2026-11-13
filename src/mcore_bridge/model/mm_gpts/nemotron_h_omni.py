@@ -3,8 +3,6 @@
 import os
 import re
 import torch
-from megatron.core import __version__ as mcore_version
-from packaging.version import Version
 from peft.utils import ModulesToSaveWrapper
 from transformers import PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -14,12 +12,12 @@ from types import SimpleNamespace
 from mcore_bridge.utils import get_logger
 
 from ..constant import ModelType
-from ..gpts.nemotron_h import _HYBRID_MODEL_AVAILABLE, NemotronHBridge, NemotronHLoader
+from ..gpts.nemotron_h import NemotronHBridge, NemotronHLoader
+from ..hybrid_model import HybridModel
 from ..mm_gpt_model import MultimodalGPTModel
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
 
-_OMNI_HYBRID_AVAILABLE = _HYBRID_MODEL_AVAILABLE and Version(mcore_version) >= Version('0.18.0')
 _MODELING_MODULE = 'modeling_nemotron_h_omni'
 _PACKED_EVS_ERROR = ('EVS requires --padding_free false --packing false, or disabling it by unsetting '
                      'USE_NEMOTRON_EVS; packed sample boundaries are not rebuilt.')
@@ -278,79 +276,73 @@ class NemotronH_OmniVit(HuggingFaceVit):
         return inputs_embeds
 
 
-if _OMNI_HYBRID_AVAILABLE:
-    from ..hybrid_model import HybridModel
+class NemotronH_OmniGPTModel(MultimodalGPTModel):
+    language_model_cls = HybridModel
 
-    class NemotronH_OmniGPTModel(MultimodalGPTModel):
-        language_model_cls = HybridModel
-
-        def forward(self,
-                    input_ids,
-                    position_ids,
-                    attention_mask=None,
-                    decoder_input=None,
-                    labels=None,
-                    inference_params=None,
-                    packed_seq_params=None,
-                    **kwargs):
-            if any(kwargs.get(key) is not None for key in ('sound_clips', 'input_features', 'audio_values')):
-                raise NotImplementedError('Omni audio inputs are not supported; use image/video/text inputs only.')
-            kwargs.pop('loss_scale', None)
-            compressed = False
-            original_labels = labels
-            loss_indices = None
-            rate = self.config.hf_config.video_pruning_rate
-            evs = rate > 0 and _evs_env_enabled()
-            if rate > 0 and not evs and kwargs.get('pixel_values_videos'):
-                logger.info_once(f'Videos are trained without EVS (video_pruning_rate={rate}); '
-                                 'set USE_NEMOTRON_EVS=1 to enable video token pruning.')
-            if evs and kwargs.get('pixel_values_videos') and (inference_params is not None
-                                                              or kwargs.get('inference_context') is not None):
-                # Compression/right padding does not update cache offsets or last-token selection.
-                raise NotImplementedError('Omni EVS cached inference is not supported; unset USE_NEMOTRON_EVS '
-                                          '(or set video_pruning_rate=0), or use a full forward without '
-                                          'inference_params/inference_context.')
-            if evs and packed_seq_params is not None:
-                raise NotImplementedError(_PACKED_EVS_ERROR)
-            if evs and kwargs.get('pixel_values_videos') and not self.config.language_model_only:
-                if self.config.pipeline_model_parallel_size > 1:
-                    raise NotImplementedError('EVS requires --pipeline_model_parallel_size 1.')
-                if decoder_input is not None:
-                    raise ValueError('EVS requires input_ids, not precomputed decoder_input.')
-                image_mask, video_mask = _media_masks(input_ids, kwargs.get('image_token_mask'),
-                                                      kwargs.get('video_token_mask'), self.visual.img_context_token_id)
-                image_embeds, video_embeds, retention = self.visual.encode_media(
-                    kwargs.get('pixel_values'), kwargs['pixel_values_videos'], prune=True)
-                if retention.numel() != int(video_mask.sum()):
-                    raise ValueError('Video features and video_token_mask have different token counts.')
-                kwargs['omni_embeddings'] = (image_embeds, video_embeds)
-                if not retention.all():
-                    keep = torch.ones_like(input_ids, dtype=torch.bool)
-                    keep[video_mask] = retention.to(input_ids.device)
-                    (input_ids, position_ids, attention_mask, labels, image_mask, video_mask,
-                     loss_indices) = _compress_evs_inputs(input_ids, position_ids, attention_mask, labels, keep,
-                                                          image_mask, video_mask,
-                                                          self.config.tensor_model_parallel_size)
-                    compressed = True
-                    kwargs['image_token_mask'], kwargs['video_token_mask'] = image_mask, video_mask
-                    kwargs.pop('loss_mask', None)
-                    # Any caller-provided padding mask describes the old sequence.
-                    kwargs.pop('padding_mask', None)
-            output = super().forward(input_ids, position_ids, attention_mask, decoder_input, labels, inference_params,
-                                     packed_seq_params, **kwargs)
-            if original_labels is not None and compressed:
-                valid = loss_indices >= 0
-                restored = output.new_zeros(original_labels.shape)
-                return restored.scatter_add(1, loss_indices.clamp_min(0), output * valid)
-            return output
+    def forward(self,
+                input_ids,
+                position_ids,
+                attention_mask=None,
+                decoder_input=None,
+                labels=None,
+                inference_params=None,
+                packed_seq_params=None,
+                **kwargs):
+        if any(kwargs.get(key) is not None for key in ('sound_clips', 'input_features', 'audio_values')):
+            raise NotImplementedError('Omni audio inputs are not supported; use image/video/text inputs only.')
+        kwargs.pop('loss_scale', None)
+        compressed = False
+        original_labels = labels
+        loss_indices = None
+        rate = self.config.hf_config.video_pruning_rate
+        evs = rate > 0 and _evs_env_enabled()
+        if rate > 0 and not evs and kwargs.get('pixel_values_videos'):
+            logger.info_once(f'Videos are trained without EVS (video_pruning_rate={rate}); '
+                             'set USE_NEMOTRON_EVS=1 to enable video token pruning.')
+        if evs and kwargs.get('pixel_values_videos') and (inference_params is not None
+                                                          or kwargs.get('inference_context') is not None):
+            # Compression/right padding does not update cache offsets or last-token selection.
+            raise NotImplementedError('Omni EVS cached inference is not supported; unset USE_NEMOTRON_EVS '
+                                      '(or set video_pruning_rate=0), or use a full forward without '
+                                      'inference_params/inference_context.')
+        if evs and packed_seq_params is not None:
+            raise NotImplementedError(_PACKED_EVS_ERROR)
+        if evs and kwargs.get('pixel_values_videos') and not self.config.language_model_only:
+            if self.config.pipeline_model_parallel_size > 1:
+                raise NotImplementedError('EVS requires --pipeline_model_parallel_size 1.')
+            if decoder_input is not None:
+                raise ValueError('EVS requires input_ids, not precomputed decoder_input.')
+            image_mask, video_mask = _media_masks(input_ids, kwargs.get('image_token_mask'),
+                                                  kwargs.get('video_token_mask'), self.visual.img_context_token_id)
+            image_embeds, video_embeds, retention = self.visual.encode_media(
+                kwargs.get('pixel_values'), kwargs['pixel_values_videos'], prune=True)
+            if retention.numel() != int(video_mask.sum()):
+                raise ValueError('Video features and video_token_mask have different token counts.')
+            kwargs['omni_embeddings'] = (image_embeds, video_embeds)
+            if not retention.all():
+                keep = torch.ones_like(input_ids, dtype=torch.bool)
+                keep[video_mask] = retention.to(input_ids.device)
+                (input_ids, position_ids, attention_mask, labels, image_mask, video_mask,
+                 loss_indices) = _compress_evs_inputs(input_ids, position_ids, attention_mask, labels, keep, image_mask,
+                                                      video_mask, self.config.tensor_model_parallel_size)
+                compressed = True
+                kwargs['image_token_mask'], kwargs['video_token_mask'] = image_mask, video_mask
+                kwargs.pop('loss_mask', None)
+                # Any caller-provided padding mask describes the old sequence.
+                kwargs.pop('padding_mask', None)
+        output = super().forward(input_ids, position_ids, attention_mask, decoder_input, labels, inference_params,
+                                 packed_seq_params, **kwargs)
+        if original_labels is not None and compressed:
+            valid = loss_indices >= 0
+            restored = output.new_zeros(original_labels.shape)
+            return restored.scatter_add(1, loss_indices.clamp_min(0), output * valid)
+        return output
 
 
 class NemotronH_OmniLoader(NemotronHLoader):
-    model_cls = NemotronH_OmniGPTModel if _OMNI_HYBRID_AVAILABLE else None
+    model_cls = NemotronH_OmniGPTModel
 
     def __init__(self, config):
-        if not _OMNI_HYBRID_AVAILABLE:
-            raise ImportError('Nemotron-H-Omni requires megatron-core>=0.18.0 with models.hybrid support.')
         require_version('transformers>=5.16.1',
                         'Nemotron-H-Omni RADIO weight conversion requires transformers>=5.16.1.')
         if config.context_parallel_size > 1:
@@ -379,10 +371,9 @@ class NemotronH_OmniLoader(NemotronHLoader):
         super().__init__(config)
 
 
-if _OMNI_HYBRID_AVAILABLE:
-    register_model(
-        ModelMeta(
-            ModelType.nemotron_h_omni, ['nemotron_h_omni'],
-            bridge_cls=NemotronH_OmniBridge,
-            visual_cls=NemotronH_OmniVit,
-            loader=NemotronH_OmniLoader))
+register_model(
+    ModelMeta(
+        ModelType.nemotron_h_omni, ['nemotron_h_omni'],
+        bridge_cls=NemotronH_OmniBridge,
+        visual_cls=NemotronH_OmniVit,
+        loader=NemotronH_OmniLoader))
