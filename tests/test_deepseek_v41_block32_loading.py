@@ -143,3 +143,22 @@ def test_engram_unquantized_and_invalid_scale_shapes():
     for scales in (torch.ones(3, 3), torch.ones(64, 3), torch.ones(64)):
         with pytest.raises(ValueError):
             DeepseekV41Bridge._dequantize_engram_rows(source, scales)
+
+
+def test_npu_fp8_and_engram_tail_blocks(bridge, monkeypatch):
+    monkeypatch.setattr('mcore_bridge.model.mm_gpts.deepseek_v41.is_torch_npu_available', lambda: True)
+    weight = torch.ones(100, 64).to(torch.float8_e4m3fn)
+    scales = torch.arange(1, 9).reshape(4, 2).float()
+    target = torch.nn.Parameter(torch.zeros(100, 64), requires_grad=False)
+    bridge._set_param(target, weight, scales)
+    expected = scales.repeat_interleave(32, 0).repeat_interleave(32, 1)[:100]
+    torch.testing.assert_close(target, expected, rtol=0, atol=0)
+    torch.testing.assert_close(bridge._dequantize_engram_rows(weight, scales), expected, rtol=0, atol=0)
+
+
+def test_npu_fp4_loading(bridge, monkeypatch):
+    monkeypatch.setattr('mcore_bridge.model.mm_gpts.deepseek_v41.is_torch_npu_available', lambda: True)
+    parameter = torch.nn.Parameter(torch.zeros(1, 8), requires_grad=False)
+    packed = torch.tensor([[0x10, 0x32, 0x54, 0x76]], dtype=torch.int8)
+    bridge._set_param(parameter, packed, torch.tensor([[2.]]))
+    torch.testing.assert_close(parameter, torch.tensor([[0., 1., 2., 3., 4., 6., 8., 12.]]), rtol=0, atol=0)

@@ -243,6 +243,34 @@ def test_cpu_offload_survives_complete_engram_initialization(monkeypatch):
         layer_number=1,
         pg_collection=SimpleNamespace(tp=None, ep=None, expt_dp=None))
     assert isinstance(module.embedding, CPUShardedEmbedding)
-    module.to(dtype=torch.float32)
+    for table in module.embedding.tables:
+        table.weight.fill_(1)
+    module.float()
+    rows = module.embedding(torch.zeros((2, 2), dtype=torch.long)).flatten(-2)
+    assert rows.dtype == module.value_projection.weight.dtype == torch.float32
+    module.value_projection(rows).sum().backward()
+    torch.testing.assert_close(module.value_projection.weight.grad, torch.full_like(module.value_projection.weight, 2))
+    state = {k: v.clone().requires_grad_() for k, v in module.embedding.state_dict().items()}
+    module.embedding.load_state_dict(state)
     assert all(t.weight.device.type == 'cpu' and not t.weight.requires_grad for t in module.embedding.tables)
     assert not list(module.embedding.parameters())
+    state['tables.0.weight'] = state['tables.0.weight'].detach().to(torch.float8_e4m3fn)
+    state['tables.0.weight_scale_inv'] = torch.ones(SIZES[0], 1)
+    with pytest.raises(RuntimeError, match='requires dequantized'):
+        module.embedding.load_state_dict(state, strict=False)
+    pointers = [t.weight.data_ptr() for t in module.embedding.tables]
+    module.to(device='meta')
+    assert pointers == [t.weight.data_ptr() for t in module.embedding.tables]
+
+
+@pytest.mark.parametrize('shared,legacy,expected', [(None, None, False), (None, '1', True), ('0', '1', False),
+                                                    ('1', '0', True)])
+def test_offload_switch_precedence(monkeypatch, shared, legacy, expected):
+    from mcore_bridge.utils import use_ngram_embedding_cpu_offload
+
+    for name, value in [('NGRAM_EMBEDDING_CPU_OFFLOAD', shared), ('PLE_CPU_OFFLOAD', legacy)]:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert use_ngram_embedding_cpu_offload() is expected
