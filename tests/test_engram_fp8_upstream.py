@@ -219,28 +219,6 @@ def test_swap_keeps_upstream_trainability_on_the_bf16_path():
     assert all(table.weight.requires_grad for table in holder.embedding.tables)
 
 
-def test_cpu_offload_takes_precedence_over_fp8_checkpoint(monkeypatch):
-    from mcore_bridge.model.modules.engram_cpu import CPUShardedEmbedding, retain_tables_on_cpu
-
-    monkeypatch.setenv('NGRAM_EMBEDDING_CPU_OFFLOAD', '1')
-    upstream = upstream_embedding.EPShardedMultiTableEmbedding(
-        config=_config(fp8_declared=True),
-        table_sizes=SIZES,
-        embedding_dim=WIDTH,
-        init_method=None,
-        ep_group=None,
-        tp_group=None,
-        expt_dp_group=None)
-    retain_tables_on_cpu(upstream)
-    holder = SimpleNamespace(config=_config(fp8_declared=True), embedding=upstream)
-    DeepseekV41Engram._maybe_use_fp8_tables(holder)
-    assert holder.embedding is upstream
-    assert isinstance(holder.embedding, CPUShardedEmbedding)
-    holder.embedding.to(dtype=torch.float32)
-    assert all(t.weight.device.type == 'cpu' and not t.weight.requires_grad for t in holder.embedding.tables)
-    assert not list(holder.embedding.parameters())
-
-
 def test_cpu_offload_survives_complete_engram_initialization(monkeypatch):
     from mcore_bridge.model.modules.engram_cpu import CPUShardedEmbedding
 

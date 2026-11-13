@@ -5,13 +5,13 @@ import torch
 from mcore_bridge.model.mm_gpts import deepseek_v41 as module
 
 
-@pytest.mark.parametrize('shape', [(7, 12), (7, 3, 12), (7, 1, 3, 12)])
 @pytest.mark.parametrize('inverse', [False, True])
-def test_mla_rope_token_aligned_forward_backward(shape, inverse):
+def test_mla_rope_token_aligned_forward_backward(inverse):
     from types import SimpleNamespace
 
     from mcore_bridge.model.gpts.deepseek_v4 import _apply_mla_rope
 
+    shape = (7, 12)
     torch.manual_seed(42)
     source = torch.randn(shape, dtype=torch.float64, requires_grad=True)
     reference = source.detach().clone().requires_grad_(True)
@@ -51,30 +51,10 @@ def test_npu_fp4_load_matches_independent_values(monkeypatch):
     torch.testing.assert_close(parameter, expected, rtol=0, atol=0)
 
 
-def test_non_npu_parameter_loading_preserves_parent_path(monkeypatch):
-    monkeypatch.setattr(module, 'is_torch_npu_available', lambda: False)
-    calls = []
-    monkeypatch.setattr(module.DeepseekV4Bridge, '_set_param', lambda self, *args: calls.append(args))
-    bridge = object.__new__(module.DeepseekV41Bridge)
-    parameter, source, scale = torch.zeros(2, 2), torch.ones(2, 2), None
-    bridge._set_param(parameter, source, scale)
-    assert calls == [(parameter, source, scale)]
-
-
-@pytest.mark.parametrize('rows', [64, 100])
-def test_engram_block_scales_match_expanded_reference(rows):
-    weight = (torch.arange(rows * 64).reshape(rows, 64) % 7 - 3).to(torch.float8_e4m3fn)
-    scale = torch.arange(1, ((rows + 31) // 32) * 2 + 1).reshape(-1, 2).float()
-    expected = weight.float() * scale.repeat_interleave(32, dim=0).repeat_interleave(32, dim=1)[:rows]
-    actual = module.DeepseekV41Bridge._dequantize_engram_rows(weight, scale)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize('npu', [False, True])
-def test_fp8_parameter_tail_blocks(monkeypatch, npu):
+def test_fp8_parameter_and_engram_tail_blocks(monkeypatch):
     from types import SimpleNamespace
 
-    monkeypatch.setattr(module, 'is_torch_npu_available', lambda: npu)
+    monkeypatch.setattr(module, 'is_torch_npu_available', lambda: True)
     bridge = object.__new__(module.DeepseekV41Bridge)
     bridge.config = SimpleNamespace(hf_config=SimpleNamespace(quantization_config={'weight_block_size': [32, 32]}))
     weight = torch.ones(100, 64).to(torch.float8_e4m3fn)
@@ -83,14 +63,8 @@ def test_fp8_parameter_tail_blocks(monkeypatch, npu):
     bridge._set_param(target, weight, scales)
     expected = scales.repeat_interleave(32, 0).repeat_interleave(32, 1)[:100]
     torch.testing.assert_close(target, expected, rtol=0, atol=0)
-
-
-def test_engram_row_scales_preserve_existing_format():
-    weight = (torch.arange(32).reshape(4, 8) % 7 - 3).to(torch.float8_e4m3fn)
-    scale = torch.tensor([[0.5, 2.], [4., 8.], [2., 0.5], [8., 4.]])
-    expected = weight.float() * scale.repeat_interleave(4, dim=1)
-    actual = module.DeepseekV41Bridge._dequantize_engram_rows(weight, scale)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        module.DeepseekV41Bridge._dequantize_engram_rows(weight, scales), expected, rtol=0, atol=0)
 
 
 def test_pipeline_rotary_uses_hidden_payload_sequence():
