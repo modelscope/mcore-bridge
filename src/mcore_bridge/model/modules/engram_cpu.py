@@ -17,6 +17,16 @@ class CPUEmbeddingTable(EPShardedEmbeddingTable):
         rows = F.embedding(local_row_ids.to('cpu'), self.weight)
         return rows.to(local_row_ids.device)
 
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        # Probe the requested dtype without moving the large host shard to the device.
+        # Module.float()/half()/to(dtype=...) must still agree with downstream projections.
+        with torch.no_grad():
+            dtype = fn(self.weight.new_empty(0)).dtype
+            if dtype != self.weight.dtype:
+                self.weight = self.weight.to(dtype=dtype, device='cpu').detach()
+        return self
+
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
         destination[prefix + 'weight'] = self.weight if keep_vars else self.weight.detach()
@@ -28,6 +38,11 @@ class CPUEmbeddingTable(EPShardedEmbeddingTable):
             source = state_dict[key]
             if source.shape != self.weight.shape:
                 error_msgs.append(f'{key}: expected {tuple(self.weight.shape)}, got {tuple(source.shape)}')
+            elif (prefix + 'weight_scale_inv' in state_dict
+                  or source.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64)):
+                # error_msgs is fatal even with strict=False: ignoring FP8 scales changes values.
+                error_msgs.append(f'{key}: CPU Engram state dict requires dequantized floating-point weights '
+                                  'without scales; reload the base table from the HF checkpoint instead.')
             else:
                 with torch.no_grad():
                     self.weight.copy_(source.to(device='cpu', dtype=self.weight.dtype))
