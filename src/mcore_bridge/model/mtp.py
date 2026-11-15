@@ -103,8 +103,8 @@ def get_mtp_capabilities() -> MtpCapabilities:
         layer_init_src = inspect.getsource(McoreMultiTokenPredictionLayer.__init__)
     except (OSError, TypeError):
         layer_init_src = ''
-    split_projection_from_hyper_connections = (
-        'self.mhc_enabled = self.config.enable_hyper_connections' in layer_init_src)
+    split_projection_from_hyper_connections = ('self.mhc_enabled = self.config.enable_hyper_connections'
+                                               in layer_init_src)
 
     caps = MtpCapabilities(
         has_detach_heads='mtp_detach_heads' in tc,

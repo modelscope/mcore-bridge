@@ -795,9 +795,8 @@ class Qwen4ExpLoader(ModelLoader):
             for layer_spec in mtp_block_spec.layer_specs:
                 sub = layer_spec.submodules
                 if not (hasattr(sub, 'e_proj') and hasattr(sub, 'h_proj')):
-                    raise NotImplementedError(
-                        'Qwen3.8-Flash-Next MTP requires megatron-core >= 0.20, '
-                        f'got {megatron.core.__version__}.')
+                    raise NotImplementedError('Qwen3.8-Flash-Next MTP requires megatron-core >= 0.20, '
+                                              f'got {megatron.core.__version__}.')
                 layer_spec.module = Qwen4ExpMultiTokenPredictionLayer
                 # residual_linear_shared head: separate e_proj/h_proj (fc_embedding/fc_hidden), a joint
                 # multi-stream hnorm (pre_fc_norm_hidden over n*H), and no fused eh_proj. layer_norm
