@@ -8,4 +8,4 @@ from .megatron_utils import (get_local_layer_specs, get_num_samples, reconstruct
 from .quantizer import ceil_to_ue8m0, per_block_cast_to_fp8, per_token_cast_to_mxfp4, quantize_dsv41_export_value
 from .safetensors import SafetensorLazyLoader, StreamingSafetensorSaver
 from .torch_utils import gc_collect, get_current_device, safe_ddp_context, to_device
-from .utils import deep_getattr, get_env_args, json_parse_to_dict, patch_deepcopy
+from .utils import deep_getattr, get_env_args, json_parse_to_dict, patch_deepcopy, use_ngram_embedding_cpu_offload

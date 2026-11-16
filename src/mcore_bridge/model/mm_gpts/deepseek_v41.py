@@ -39,6 +39,7 @@ from megatron.core import mpu, parallel_state
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
 from megatron.core.transformer.module import MegatronModule
+from transformers.utils import is_torch_npu_available
 
 try:
     from megatron.core.transformer.module import mark_keep_in_fp32
@@ -890,8 +891,18 @@ if _HYBRID_MODEL_AVAILABLE:
             ``position_ids`` arrives already split with the hidden states' partition mode, so the
             indexed frequencies come out rank-local while keeping absolute positions.
             """
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(inference_context, self.decoder, transformer_input,
-                                                                    self.config, packed_seq_params)
+            from megatron.core.pipeline_parallel.pipeline_payload import PipelinePayload
+            incoming = getattr(self.decoder, 'input_tensor', None)
+            if inference_context is None and packed_seq_params is None and isinstance(incoming, PipelinePayload):
+                hidden = next(t for t, spec in zip(incoming.tensors, incoming.tensor_specs)
+                              if spec.name == 'hidden_states')
+                rotary_seq_len = hidden.shape[0] * self.config.context_parallel_size
+                if self.config.sequence_parallel:
+                    rotary_seq_len *= self.config.tensor_model_parallel_size
+            else:
+                rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(inference_context, self.decoder,
+                                                                        transformer_input, self.config,
+                                                                        packed_seq_params)
             packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
             rotary_pos_emb = {
                 'main': self.rotary_pos_emb(rotary_seq_len, packed_seq=packed_seq),
@@ -1334,14 +1345,24 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     additional_dim1_keys = DeepseekV4Bridge.additional_dim1_keys | {'main_proj'}
 
     def _set_param(self, param: torch.Tensor, tensor: torch.Tensor, scale_inv: Optional[torch.Tensor]):
-        quantization = getattr(self.config.hf_config, 'quantization_config', None) or {}
-        if (scale_inv is not None and tensor.dtype == torch.float8_e4m3fn
-                and quantization.get('weight_block_size') == [32, 32]):
+        quantization = getattr(getattr(getattr(self, 'config', None), 'hf_config', None), 'quantization_config',
+                               None) or {}
+        is_fp4 = tensor.dtype == torch.int8 and tensor.shape[-1] * 2 == param.shape[-1]
+        block32 = tensor.dtype == torch.float8_e4m3fn and quantization.get('weight_block_size') == [32, 32]
+        npu_bf16 = is_torch_npu_available() and not self._is_fp8_param(param)
+        npu_quantized = npu_bf16 and (is_fp4 or tensor.dtype == torch.float8_e4m3fn)
+        if scale_inv is not None and (block32 or npu_quantized):
             if self._is_fp8_param(param):
                 raise ValueError('DeepSeek V4.1 source dequantization requires BF16 training parameters')
+            if is_torch_npu_available():
+                tensor, scale_inv = tensor.cpu(), scale_inv.cpu()
+            if is_fp4:
+                from mcore_bridge.utils import fp4_to_fp8
+                tensor = fp4_to_fp8(tensor)
             tensor = tensor.reshape(*param.shape)
             scales = scale_inv.reshape(-1, scale_inv.shape[-1])
-            param.data.copy_(Fp8Dequantizer((32, 32)).convert(tensor, scales))
+            block_size = (1, 32) if is_fp4 else tuple(quantization.get('weight_block_size') or (128, 128))
+            param.data.copy_(Fp8Dequantizer(block_size).convert(tensor, scales).to(param))
             return
         return super()._set_param(param, tensor, scale_inv)
 
@@ -1621,11 +1642,15 @@ class DeepseekV41Bridge(DeepseekV4Bridge):
     def _dequantize_engram_rows(weight, scale):
         if scale is None:
             return weight
-        if (weight.ndim == scale.ndim == 2 and weight.shape[0] == 32 * scale.shape[0]
-                and weight.shape[1] == 32 * scale.shape[1]):
-            return Fp8Dequantizer((32, 32)).convert(weight, scale)
-        if weight.ndim != 2 or scale.ndim != 2 or weight.shape[0] != scale.shape[0]:
+        if weight.ndim != 2 or scale.ndim != 2:
             raise ValueError(f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
+        if weight.shape[0] != scale.shape[0]:
+            # WKV uses block32, including a partial final block; tables remain row-scaled.
+            expected = tuple((size + 31) // 32 for size in weight.shape)
+            if tuple(scale.shape) != expected:
+                raise ValueError(
+                    f'Invalid Engram FP8 weight/scale shapes: {tuple(weight.shape)} and {tuple(scale.shape)}.')
+            return Fp8Dequantizer((32, 32)).convert(weight, scale)
         if weight.shape[1] % scale.shape[1] != 0:
             raise ValueError(f'Engram weight width {weight.shape[1]} is not divisible by scale width {scale.shape[1]}.')
         block_size = weight.shape[1] // scale.shape[1]

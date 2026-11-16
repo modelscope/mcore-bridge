@@ -14,7 +14,7 @@ from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, ma
 from torch import nn
 from typing import List, Optional
 
-from ...utils import get_env_args, get_logger
+from ...utils import get_env_args, get_logger, use_ngram_embedding_cpu_offload
 from ...utils.constants import EXPORT_CHUNK_BYTES
 from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
@@ -28,10 +28,6 @@ _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
-
-
-def use_ple_cpu_offload() -> bool:
-    return get_env_args('PLE_CPU_OFFLOAD', bool, False)
 
 
 def use_ple_fused_kernel() -> bool:
@@ -158,12 +154,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         ngram_vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / ngram_vocab_divisor) * ngram_vocab_divisor
         self.padded_vocab_size = padded_vocab_size
-        self.cpu_offload = use_ple_cpu_offload()
+        self.cpu_offload = use_ngram_embedding_cpu_offload()
         if self.cpu_offload:
             # Warn rather than raise: whether this is safe depends on the train type,
-            # which the model config does not carry (see use_ple_cpu_offload).
-            get_logger().warning_once('PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
-                                      'gradient, so it stays frozen.')
+            # which the model config does not carry (see use_ngram_embedding_cpu_offload).
+            get_logger().warning_once('NGRAM_EMBEDDING_CPU_OFFLOAD=1: the n-gram table is host-resident '
+                                      'and receives no gradient, so it stays frozen.')
             self._init_host_table(config, padded_vocab_size, head_dim_per_ngram)
         else:
             # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
@@ -311,7 +307,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
     def export_table_to_hf(self, hf_state_dict, prefix=''):
         """Reverse of ``fill_table_from_hf``: write the current table back as HF
         shards so a full-parameter checkpoint is self-contained. Works for both
-        the host-resident (``PLE_CPU_OFFLOAD=1``) table and the TP-sharded
+        the host-resident (``NGRAM_EMBEDDING_CPU_OFFLOAD=1``) table and the TP-sharded
         ``VocabParallelEmbedding`` (the default, which receives gradients and so
         must not be silently dropped from the checkpoint). Bulk API: consumes
         :meth:`iter_export_table_to_hf` into ``hf_state_dict``.
