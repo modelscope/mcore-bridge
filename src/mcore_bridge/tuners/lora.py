@@ -26,12 +26,14 @@ from peft.utils.other import transpose
 from transformers.utils import is_torch_npu_available
 from typing import Any, List, Optional, Tuple
 
-from mcore_bridge.utils import get_current_device
+from mcore_bridge.utils import get_current_device, get_logger
 
 from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
 peft_019 = version.parse(peft.__version__) >= version.parse('0.19.0')
+
+logger = get_logger()
 
 
 def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwargs):
@@ -144,8 +146,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         """Effective weight for consumers that read a weight instead of calling ``forward()``.
 
         Absorbed MLA reshapes ``.weight``, which stays the frozen base by adapter contract. Mirrors
-        ``forward()``'s merged/disabled handling and rejects the two adapter options a static weight cannot
-        represent: ``lora_bias`` (an additive term) and training-time ``lora_dropout`` (applies to x).
+        ``forward()``'s merged/disabled handling. ``lora_bias`` is rejected (an additive term cannot be
+        folded into a weight); training-time ``lora_dropout`` is skipped with a one-time warning, since it
+        only regularizes activations and aborting training over it is disproportionate.
         """
         if self.is_grouped:
             raise AttributeError(f'{self.__class__.__name__} exposes weight{{i}} per gemm, not a single weight')
@@ -169,9 +172,9 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                 continue
             dropout = self.lora_dropout[adapter]
             if isinstance(dropout, nn.Dropout) and dropout.p > 0:
-                raise NotImplementedError(
-                    'absorbed MLA reads a static weight and cannot apply lora_dropout; set lora_dropout=0 '
-                    'for this model (ms-swift defaults to 0.05)')
+                logger.warning_once('absorbed MLA reads a static weight, so lora_dropout is ignored for that '
+                                    'projection (it behaves as 0); set lora_dropout=0 to make this explicit. '
+                                    'ms-swift defaults to 0.05')
         delta = None
         for adapter in self.active_adapters:
             if adapter not in self.lora_A.keys():

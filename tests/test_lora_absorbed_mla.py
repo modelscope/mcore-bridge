@@ -8,7 +8,7 @@ weight; (3) step-0 drift; (4) double counting or a 1-ulp mismatch with ``merge()
 semantics; (6) full-parameter path broken by the fallback; (7) combined-only layout; (8) silent
 base fallback for a new wrapper; (9) non-``AttributeError`` on grouped; (10) mutating the layer;
 (11) double wrapping; (12) dtype or delta loss in BF16; (13) TP2 geometry; (14) disable-after-merge
-diverging from ``forward``; (15) a training-time ``lora_dropout`` being silently ignored; (16) a
+diverging from ``forward``; (15) a training-time ``lora_dropout`` aborting the run or going unreported; (16) a
 lora_bias term silently dropped; (17) package import breaking on a Core revision without the getter;
 (18) the use-time guard missing a split ``linear_k_up_proj`` / ``linear_v_up_proj`` adapter.
 """
@@ -342,20 +342,32 @@ def test_disable_after_merge_matches_forward():
                                unadapted.view(HEADS, QK_DIM + V_DIM, KV_LORA)[:, :QK_DIM], **tolerance)
 
 
-def test_training_dropout_is_rejected():
+def test_training_dropout_is_ignored_once(monkeypatch):
+    import mcore_bridge.tuners.lora as lora_module
+    from mcore_bridge.utils import logger as logger_module
+
     base, lora = _wrap(lora_dropout=0.1)
     with torch.no_grad():
         lora.lora_B['default'].weight.normal_(std=0.5)
     lora.train()
-    # Ignoring it would silently change the computation the config asked for.
-    with pytest.raises(NotImplementedError, match='lora_dropout'):
-        lora.get_weight_for_absorption()
-    with pytest.raises(NotImplementedError, match='lora_dropout'):
-        _native()._get_kv_up_weights(_holder(lora))
 
-    lora.eval()  # dropout is the identity in eval, so the static weight is exact
+    warnings = []
+    logger_module.warning_set.clear()  # `warning_once` dedupes through this set
+    monkeypatch.setattr(lora_module.logger, 'warning', lambda msg, *a, **k: warnings.append(msg))
+
     reference = base.weight.float() + (lora.lora_B['default'].weight.float()
                                        @ lora.lora_A['default'].weight.float()) * lora.scaling['default']
+    # ms-swift defaults lora_dropout to 0.05: the absorbed layer behaves as dropout=0 and says so once
+    # instead of aborting a run over a regularization setting.
+    for _ in range(2):
+        torch.testing.assert_close(lora.get_weight_for_absorption(), reference.to(base.weight.dtype), rtol=0, atol=0)
+    assert len(warnings) == 1, f'expected one warning, got {warnings}'
+    assert 'lora_dropout' in warnings[0]
+
+    k, v = _native()._get_kv_up_weights(_holder(lora))
+    assert k.requires_grad and v.requires_grad
+
+    lora.eval()  # dropout is the identity in eval, so nothing is skipped there
     torch.testing.assert_close(lora.get_weight_for_absorption(), reference.to(base.weight.dtype), rtol=0, atol=0)
 
 
