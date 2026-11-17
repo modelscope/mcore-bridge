@@ -40,8 +40,8 @@ def _parallel_context(tp=1):
     local_rank = int(os.environ.get('LOCAL_RANK', '0'))
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
-        dist.init_process_group('nccl', init_method=f'file:///tmp/lora-absorbed-{uuid.uuid4().hex}', rank=0,
-                                world_size=1)
+        dist.init_process_group(
+            'nccl', init_method=f'file:///tmp/lora-absorbed-{uuid.uuid4().hex}', rank=0, world_size=1)
     already_initialized = parallel_state.model_parallel_is_initialized()
     if not already_initialized:
         parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp)
@@ -130,8 +130,8 @@ def _loss(k, v):
 
 
 def test_import_wires_the_absorbed_getter():
-    assert getattr(_native(), '_mcore_lora_patched', False), (
-        'importing mcore_bridge must route the absorbed getter through the adapter accessor')
+    assert getattr(_native(), '_mcore_lora_patched',
+                   False), ('importing mcore_bridge must route the absorbed getter through the adapter accessor')
 
 
 def test_k_absorption_trains_the_adapter():
@@ -198,8 +198,7 @@ def test_disabled_and_merged_adapters_fall_back_to_base(dtype):
         getattr(lora, name)['default'].to(torch.float32)
     with torch.no_grad():
         lora.lora_B['default'].weight.normal_(std=0.5)
-    delta = (lora.lora_B['default'].weight.float()
-             @ lora.lora_A['default'].weight.float()) * lora.scaling['default']
+    delta = (lora.lora_B['default'].weight.float() @ lora.lora_A['default'].weight.float()) * lora.scaling['default']
     # What `merge()` writes into the base: one FP32 add, rounded once to the base dtype.
     merged_reference = (base.weight.float() + delta).to(dtype)
     base_view = base.weight.detach().view(HEADS, QK_DIM + V_DIM, KV_LORA)
@@ -377,6 +376,7 @@ def test_missing_hook_guard_rejects_adapter_wrapped_projection(field):
     from mcore_bridge.patcher import _guard_absorbed_mla_without_hook
 
     class _Layer:
+
         def forward(self):
             return 'ok'
 
@@ -411,6 +411,7 @@ def test_import_survives_a_revision_without_the_getter():
 
 
 def test_getter_does_not_mutate_the_layer():
+
     class _Attention(torch.nn.Module):
         """Real layer shape: the projection is a registered submodule."""
 
