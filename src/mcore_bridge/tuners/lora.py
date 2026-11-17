@@ -173,8 +173,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
             dropout = self.lora_dropout[adapter]
             if isinstance(dropout, nn.Dropout) and dropout.p > 0:
                 logger.warning_once('absorbed MLA reads a static weight, so lora_dropout is ignored for that '
-                                    'projection (it behaves as 0); set lora_dropout=0 to make this explicit. '
-                                    'ms-swift defaults to 0.05')
+                                    'projection (it behaves as 0); set lora_dropout=0 to make this explicit.')
         delta = None
         for adapter in self.active_adapters:
             if adapter not in self.lora_A.keys():
