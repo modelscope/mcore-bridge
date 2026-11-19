@@ -862,6 +862,13 @@ class Gemma4TransformerLayer(TransformerLayer):
         mlp_output = self.post_feedforward_layernorm(mlp_output)
         hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)((mlp_output, bias), residual,
                                                                                      self.hidden_dropout)
+        # Same as mcore's TransformerLayer._forward_post_mlp: `_forward_pre_mlp_layernorm` stores its input (which
+        # carries an autograd history) on `mlp_norm_manager`; without this, the layer keeps the graph of its last
+        # forward alive after the backward pass, which adds up over layers (memory is not released between steps).
+        mlp_norm_manager = getattr(self, 'mlp_norm_manager', None)
+        if mlp_norm_manager is not None:
+            hidden_states = mlp_norm_manager.group_offload(hidden_states, forced_released_tensors=[residual])
+            self.mlp_norm_manager = None
         output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
         return output
 
