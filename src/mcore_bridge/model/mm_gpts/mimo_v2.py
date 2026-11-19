@@ -42,6 +42,7 @@ except ImportError:
         tensor.keep_in_fp32 = True
         return tensor
 
+
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
@@ -452,14 +453,21 @@ class MiMoV2Bridge(MultimodalGPTBridge):
         hf_config = config.hf_config
         # Quantization is decided by quantization_config alone: a stale 'fused_qkv' layout marker
         # on a split BF16 checkpoint must not route it through the dequantizing view. The markers
-        # stay on the in-memory config (other consumers may read them); the export-side config
-        # writeback strips them so saved BF16 checkpoints are not re-read as quantized.
+        # stay on the in-memory config (other consumers may read them); patch_export_hf_config
+        # strips them on the exported copy so saved BF16 checkpoints are not re-read as quantized.
         self._quant_config = getattr(hf_config, 'quantization_config', None)
         self._quantized_input = bool(self._quant_config)
         self.hybrid_layer_pattern = [int(p) for p in hf_config.hybrid_layer_pattern]
         self.swa_attention_sink = bool(getattr(hf_config, 'add_swa_attention_sink_bias', False))
         if getattr(hf_config, 'add_full_attention_sink_bias', False):
             raise NotImplementedError('MiMo-V2 full-attention sink bias is not supported.')
+
+    def patch_export_hf_config(self, hf_config):
+        # Exported weights use the standard HF split q/k/v layout; the fused-layout marker
+        # describes only the quantized source checkpoint and must not leak into the export.
+        for cfg in (hf_config, getattr(hf_config, 'text_config', None)):
+            if cfg is not None and hasattr(cfg, 'attention_projection_layout'):
+                delattr(cfg, 'attention_projection_layout')
 
     def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
         if to_mcore and self._quantized_input and not self._peft_format:
@@ -516,8 +524,7 @@ class MiMoV2Bridge(MultimodalGPTBridge):
         qk_dim, v_dim = config.kv_channels, config.v_head_dim
         q_dim = (config.num_attention_heads // groups) * qk_dim
         kv_proj_list = ['k_proj', 'v_proj']
-        is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
-                                                           LoraParallelLinear) and self._peft_format
+        is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv, LoraParallelLinear) and self._peft_format
         is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
         if self.pp_size > 1:
             dist.all_reduce(is_lora, group=self.pp_group)
@@ -538,15 +545,16 @@ class MiMoV2Bridge(MultimodalGPTBridge):
                 hf_state_dict['k_proj.lora_B.weight'] = lora_B[:, q_dim:q_dim + qk_dim, :].reshape(-1, rank).clone()
                 hf_state_dict['v_proj.lora_B.weight'] = lora_B[:, q_dim + qk_dim:, :].reshape(-1, rank).clone()
         elif not self._peft_format:
-            mg_attn_weight, scale_inv = self._get_weight(
-                None if mg_attn is None else mg_attn.linear_qkv.weight.data, 'linear_qkv.weight')
+            mg_attn_weight, scale_inv = self._get_weight(None if mg_attn is None else mg_attn.linear_qkv.weight.data,
+                                                         'linear_qkv.weight')
             if mg_attn_weight is not None:
                 mg_attn_weight = mg_attn_weight.reshape((groups, -1, config.hidden_size))
                 hf_state_dict['q_proj.weight'] = mg_attn_weight[:, :q_dim, :].reshape(-1, config.hidden_size).clone()
                 hf_state_dict['k_proj.weight'] = mg_attn_weight[:, q_dim:q_dim + qk_dim, :].reshape(
                     -1, config.hidden_size).clone()
-                hf_state_dict['v_proj.weight'] = mg_attn_weight[:, q_dim + qk_dim:, :].reshape(
-                    -1, config.hidden_size).clone()
+                hf_state_dict['v_proj.weight'] = mg_attn_weight[:,
+                                                                q_dim + qk_dim:, :].reshape(-1,
+                                                                                            config.hidden_size).clone()
             if scale_inv is not None:
                 raise ValueError('MiMo-V2 FP8 export is unsupported: the QK head dim (192) is not divisible '
                                  'by the FP8 block size (128). Export BF16.')
@@ -576,8 +584,7 @@ class MiMoV2Bridge(MultimodalGPTBridge):
             if not to_mcore and 'attention_sink_bias' in hf_state_dict:
                 # TE keeps softmax_offset in FP32 regardless of params_dtype; export in the model
                 # dtype so a BF16 checkpoint does not mix in an FP32 tensor (load casts back exactly).
-                hf_state_dict['attention_sink_bias'] = hf_state_dict['attention_sink_bias'].to(
-                    self.config.params_dtype)
+                hf_state_dict['attention_sink_bias'] = hf_state_dict['attention_sink_bias'].to(self.config.params_dtype)
         if to_mcore:
             hf_state_dict = {}
         else:

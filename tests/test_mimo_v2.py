@@ -12,16 +12,15 @@ tiny checkpoint). Two HF quirks shape the harness:
 import copy
 import json
 import os
+import pytest
 import shutil
 import subprocess
 import sys
-from types import SimpleNamespace as NS
-
-import pytest
 import torch
 import torch.nn.functional as F
 from transformers import AutoConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
+from types import SimpleNamespace as NS
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config
@@ -46,8 +45,7 @@ _REAL_WEIGHTS_DIR = os.environ.get('MIMO_V2_REAL_WEIGHTS_DIR', _REMOTE_DIR)
 
 def _real_weights_available():
     return _remote_code_available() and all(
-        os.path.exists(os.path.join(_REAL_WEIGHTS_DIR, f))
-        for f in ('config.json', 'model.safetensors.index.json'))
+        os.path.exists(os.path.join(_REAL_WEIGHTS_DIR, f)) for f in ('config.json', 'model.safetensors.index.json'))
 
 
 requires_real_weights = pytest.mark.skipif(
@@ -357,9 +355,7 @@ def test_parser_handles_v25_rope_scaling_variant(remote_dir):
 
 
 @requires_remote_code
-@pytest.mark.parametrize('change,match', [({
-    'add_full_attention_sink_bias': True
-}, 'full-attention sink')])
+@pytest.mark.parametrize('change,match', [({'add_full_attention_sink_bias': True}, 'full-attention sink')])
 def test_bridge_rejects_unsupported_checkpoints(remote_dir, change, match):
     config = _hf_config(remote_dir, **change)
     values = hf_to_mcore_config(config)
@@ -520,9 +516,11 @@ def test_split_qkv_asymmetric_layout():
     q = torch.arange(groups * hpg * qk * hidden, dtype=torch.float32).reshape(groups * hpg * qk, hidden)
     k = torch.arange(groups * qk * hidden, dtype=torch.float32).reshape(groups * qk, hidden) + 1e6
     v_t = torch.arange(groups * v * hidden, dtype=torch.float32).reshape(groups * v, hidden) + 2e6
-    fused = torch.cat([
-        torch.cat([q.view(groups, hpg * qk, hidden), k.view(groups, qk, hidden), v_t.view(groups, v, hidden)], dim=1)
-    ], dim=0).reshape(-1, hidden)
+    fused = torch.cat(
+        [torch.cat([q.view(groups, hpg * qk, hidden),
+                    k.view(groups, qk, hidden),
+                    v_t.view(groups, v, hidden)], dim=1)],
+        dim=0).reshape(-1, hidden)
     got_q, got_k, got_v = mimo_v2._split_qkv(fused, dim=0, groups=groups, heads_per_group=hpg, qk_dim=qk, v_dim=v)
     torch.testing.assert_close(got_q.reshape(-1, hidden), q, atol=0, rtol=0)
     torch.testing.assert_close(got_k.reshape(-1, hidden), k, atol=0, rtol=0)
@@ -558,7 +556,8 @@ def _mxfp4_quantize(weight):
     # Independent OCP e2m1 code table (deliberately not the production LUT, so the fixture
     # quantizer does not close a self-consistency loop with the dequantizer under test).
     table = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-                         dtype=torch.float32, device=weight.device)
+                         dtype=torch.float32,
+                         device=weight.device)
     codes = (scaled.unsqueeze(-1) - table).abs().argmin(dim=-1).view(out_dim, in_dim).to(torch.uint8)
     packed = codes[:, ::2] | (codes[:, 1::2] << 4)
     return packed, (exponent.view(out_dim, in_dim // 32) + 127).to(torch.uint8)
@@ -636,10 +635,16 @@ def _write_quantized_fixture(directory, state, hf_config, quant_config=None):
     os.makedirs(directory, exist_ok=True)
     _copy_remote_code(_REMOTE_DIR, directory)
     quantized = _quantize_to_official_layout(
-        state, hf_config, experts_mxfp4='mxfp4_block_size' in quant_config,
+        state,
+        hf_config,
+        experts_mxfp4='mxfp4_block_size' in quant_config,
         router_fp32=quant_config.get('store_dtype') == 'fp8')
     shard = 'model-00001.safetensors'
-    save_file({k: v.contiguous() for k, v in quantized.items()}, os.path.join(directory, shard),
+    save_file({
+        k: v.contiguous()
+        for k, v in quantized.items()
+    },
+              os.path.join(directory, shard),
               metadata={'format': 'pt'})
     payload = _tiny_config_dict()
     payload['attention_projection_layout'] = 'fused_qkv'
@@ -712,8 +717,7 @@ def _write_bf16_reference(directory, quantized_state, hf_config):
     _copy_remote_code(_REMOTE_DIR, directory)
     state = _reference_dequant(quantized_state, hf_config)
     shard = 'model-00001.safetensors'
-    save_file({k: v.contiguous() for k, v in state.items()}, os.path.join(directory, shard),
-              metadata={'format': 'pt'})
+    save_file({k: v.contiguous() for k, v in state.items()}, os.path.join(directory, shard), metadata={'format': 'pt'})
     with open(os.path.join(directory, 'config.json'), 'w') as f:
         json.dump(_tiny_config_dict(), f)
     total = sum(v.numel() * v.element_size() for v in state.values())
@@ -733,7 +737,9 @@ def _check_online_matches_offline(remote_dir, tmp_path, tp=1, mtp=1, quant_confi
     odir = str(tmp_path / 'offline')
     quant_config = _OFFICIAL_QUANT_CONFIG if quant_config is None else quant_config
     quantized = _quantize_to_official_layout(
-        canonical, hf_model.config, experts_mxfp4='mxfp4_block_size' in quant_config,
+        canonical,
+        hf_model.config,
+        experts_mxfp4='mxfp4_block_size' in quant_config,
         router_fp32=quant_config.get('store_dtype') == 'fp8')
     _write_bf16_reference(odir, quantized, hf_model.config)
 
@@ -785,8 +791,9 @@ def test_online_dequant_v25_router_stays_fp32(remote_dir, tmp_path):
     cast to params_dtype fails the dtype and bit-exact checks. Runs in BF16 to also exercise
     the gating upcast (TE's cuBLASLt GEMM rejects FP32 weight x BF16 input).
     """
-    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
     from test_glm5_next import _parallel_context
+
+    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
     hf_model = _build_hf(remote_dir, dtype=torch.bfloat16)
     canonical = _checkpoint_state(hf_model)
@@ -831,8 +838,9 @@ def test_online_dequant_v25_router_stays_fp32(remote_dir, tmp_path):
 def test_router_fp32_survives_nonlocal_config(remote_dir, tmp_path, monkeypatch):
     """The gate dtype is read from the weights at load time, not probed from name_or_path:
     a repo-id (non-local) config must not silently round an FP32 gate to BF16."""
-    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
     from test_glm5_next import _parallel_context
+
+    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
     hf_model = _build_hf(remote_dir, dtype=torch.bfloat16)
     canonical = _checkpoint_state(hf_model)
@@ -861,8 +869,9 @@ def test_router_fp32_survives_nonlocal_config(remote_dir, tmp_path, monkeypatch)
 def test_router_fp32_fails_loudly_without_keep_marker(remote_dir, tmp_path, monkeypatch):
     """On megatron-core<0.20 Float16Module casts unconditionally; loading an FP32 gate there
     must fail loudly instead of silently rounding it."""
-    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
     from test_glm5_next import _parallel_context
+
+    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
     hf_model = _build_hf(remote_dir, dtype=torch.bfloat16)
     canonical = _checkpoint_state(hf_model)
@@ -902,8 +911,9 @@ def test_swa_without_sink_flag_has_no_learnable_offset(remote_dir):
 def test_online_dequant_expert_subset_truncates_router(remote_dir, tmp_path):
     """Expert-subset models read experts.0..N-1; the router gate/bias must be truncated to the
     same prefix (mirrors the convert tool's --num-experts). Pro e64 T3 failed without it."""
-    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
     from test_glm5_next import _parallel_context
+
+    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
     hf_model = _build_hf(remote_dir, dtype=torch.bfloat16)
     canonical = _checkpoint_state(hf_model)
@@ -925,8 +935,10 @@ def test_online_dequant_expert_subset_truncates_router(remote_dir, tmp_path):
         torch.testing.assert_close(
             router.weight.data, gate[:n_sub].to(device=router.weight.device, dtype=router.weight.dtype), atol=0, rtol=0)
         torch.testing.assert_close(
-            router.expert_bias, bias[:n_sub].to(device=router.expert_bias.device, dtype=router.expert_bias.dtype),
-            atol=0, rtol=0)
+            router.expert_bias,
+            bias[:n_sub].to(device=router.expert_bias.device, dtype=router.expert_bias.dtype),
+            atol=0,
+            rtol=0)
         exported = _export(config, model)
         assert exported['model.layers.1.mlp.gate.weight'].shape[0] == n_sub
         assert exported['model.layers.1.mlp.gate.e_score_correction_bias'].shape[0] == n_sub
@@ -945,8 +957,9 @@ def test_parallel_tp2_online_dequant_matches_offline_tool(remote_dir, tmp_path):
 @requires_remote_code
 def test_online_dequant_rejects_bad_layout_and_missing_scales(remote_dir, tmp_path):
     """T4: a forged quantized checkpoint must fail loudly, never be read as plain BF16."""
-    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
     from test_glm5_next import _parallel_context
+
+    from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
     hf_model = _build_hf(remote_dir, dtype=torch.bfloat16)
     mtp_state, _ = _mtp_state(hf_model, remote_dir)
@@ -962,8 +975,10 @@ def test_online_dequant_rejects_bad_layout_and_missing_scales(remote_dir, tmp_pa
     with pytest.raises(ValueError, match='only supports the official'):
         mimo_v2._QuantizedStateDict(state, hf_config, dict(_OFFICIAL_QUANT_CONFIG, mxfp4_block_size=16))
     with pytest.raises(ValueError, match='only supports the official'):
-        mimo_v2._QuantizedStateDict(
-            state, hf_config, {k: v for k, v in _OFFICIAL_QUANT_CONFIG.items() if k != 'mxfp4_block_size'})
+        mimo_v2._QuantizedStateDict(state, hf_config, {
+            k: v
+            for k, v in _OFFICIAL_QUANT_CONFIG.items() if k != 'mxfp4_block_size'
+        })
     for dropped_key, match in [
         ('model.layers.0.self_attn.qkv_proj.weight_scale_inv', 'missing FP8 scale'),
         ('model.layers.0.mlp.gate_proj.weight_scale_inv', 'missing FP8 scale'),
@@ -1070,8 +1085,7 @@ def test_export_rejects_fp8_weights(remote_dir):
         config = _mcore_config(_hf_config(remote_dir))
     bridge = config.bridge
     attn = NS(linear_qkv=NS(weight=NS(data=torch.zeros(352, 64, device='cuda'))))
-    bridge._get_weight = lambda *args, **kwargs: (torch.zeros(352, 64, device='cuda'),
-                                                  torch.ones(3, 1, device='cuda'))
+    bridge._get_weight = lambda *args, **kwargs: (torch.zeros(352, 64, device='cuda'), torch.ones(3, 1, device='cuda'))
     with pytest.raises(ValueError, match='FP8 export is unsupported'):
         bridge._set_qkv(attn, {}, False, layer_idx=0)
 
@@ -1472,15 +1486,20 @@ def test_lora_adapter_save_reload_fresh_process(tmp_path):
         pytest.skip('MiMo-V2 HF remote code not found')
     root = os.path.dirname(os.path.dirname(__file__))
     env = os.environ.copy()
-    env['PYTHONPATH'] = os.pathsep.join(
-        [os.path.join(root, 'src'), os.path.join(root, 'tests'), '/mnt/workspace/hjh/.pkgs/pytest_env',
-         '/mnt/workspace/hjh/.pkgs/antlr49',
-         env.get('PYTHONPATH', '')])
+    env['PYTHONPATH'] = os.pathsep.join([
+        os.path.join(root, 'src'),
+        os.path.join(root, 'tests'), '/mnt/workspace/hjh/.pkgs/pytest_env', '/mnt/workspace/hjh/.pkgs/antlr49',
+        env.get('PYTHONPATH', '')
+    ])
     env['NCCL_DEBUG'] = 'WARN'
     env['MIMO_V2_REMOTE_DIR'] = _REMOTE_DIR
     for mode in ('save', 'check'):
         result = subprocess.run([sys.executable, __file__, mode, str(tmp_path)],
-                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+                                env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                timeout=600)
         assert result.returncode == 0, result.stdout
 
 
@@ -1493,10 +1512,11 @@ def test_lora_trained_and_decoder_only_fresh_process(tmp_path):
         pytest.skip('MiMo-V2 HF remote code not found')
     root = os.path.dirname(os.path.dirname(__file__))
     env = os.environ.copy()
-    env['PYTHONPATH'] = os.pathsep.join(
-        [os.path.join(root, 'src'), os.path.join(root, 'tests'), '/mnt/workspace/hjh/.pkgs/pytest_env',
-         '/mnt/workspace/hjh/.pkgs/antlr49',
-         env.get('PYTHONPATH', '')])
+    env['PYTHONPATH'] = os.pathsep.join([
+        os.path.join(root, 'src'),
+        os.path.join(root, 'tests'), '/mnt/workspace/hjh/.pkgs/pytest_env', '/mnt/workspace/hjh/.pkgs/antlr49',
+        env.get('PYTHONPATH', '')
+    ])
     env['NCCL_DEBUG'] = 'WARN'
     env['MIMO_V2_REMOTE_DIR'] = _REMOTE_DIR
     for mode, subdir in (('save_trained', 'trained'), ('check', 'trained'), ('save_decoder_only', 'dec'),
@@ -1504,7 +1524,11 @@ def test_lora_trained_and_decoder_only_fresh_process(tmp_path):
         directory = tmp_path / subdir
         directory.mkdir(exist_ok=True)
         result = subprocess.run([sys.executable, __file__, mode, str(directory)],
-                                env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=600)
+                                env=env,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                text=True,
+                                timeout=600)
         assert result.returncode == 0, result.stdout
 
 
@@ -1530,8 +1554,8 @@ def test_lora_export_key_layout(remote_dir):
             for proj in ('q_proj', 'k_proj', 'v_proj'):
                 assert f'{prefix}{proj}.lora_A.weight' in adapter, f'missing {prefix}{proj}.lora_A'
                 assert f'{prefix}{proj}.lora_B.weight' in adapter, f'missing {prefix}{proj}.lora_B'
-            torch.testing.assert_close(adapter[f'{prefix}q_proj.lora_A.weight'],
-                                       adapter[f'{prefix}k_proj.lora_A.weight'], atol=0, rtol=0)
+            torch.testing.assert_close(
+                adapter[f'{prefix}q_proj.lora_A.weight'], adapter[f'{prefix}k_proj.lora_A.weight'], atol=0, rtol=0)
         assert adapter['model.layers.0.self_attn.v_proj.lora_B.weight'].shape[0] == 2 * 16  # full kv=2, v=16
         assert adapter['model.layers.1.self_attn.v_proj.lora_B.weight'].shape[0] == 4 * 16  # swa kv=4
         assert adapter['model.layers.0.self_attn.q_proj.lora_B.weight'].shape[0] == 8 * 32
@@ -1560,15 +1584,15 @@ def test_sharded_state_dict_sink_and_qkv_layout(remote_dir):
             if is_swa:
                 assert 'softmax_offset' in core_sd, f'{name}: sink missing from sharded_state_dict'
                 shard = core_sd['softmax_offset']
-                assert tuple(shard.global_shape) == (8,)
-                assert tuple(shard.local_shape) == (8 // tp,)
-                assert tuple(shard.global_offset) == (rank * (8 // tp),)
+                assert tuple(shard.global_shape) == (8, )
+                assert tuple(shard.local_shape) == (8 // tp, )
+                assert tuple(shard.global_offset) == (rank * (8 // tp), )
                 gathered = [torch.empty_like(shard.data) for _ in range(tp)]
-                torch.distributed.all_gather(gathered, shard.data.contiguous(),
-                                             group=parallel_state.get_tensor_model_parallel_group())
+                torch.distributed.all_gather(
+                    gathered, shard.data.contiguous(), group=parallel_state.get_tensor_model_parallel_group())
                 full = torch.cat(gathered)
-                hf_key = ('model.mtp.layers.0.self_attn.attention_sink_bias' if 'mtp' in name else
-                          f'model.layers.{name.split(".")[-1]}.self_attn.attention_sink_bias')
+                hf_key = ('model.mtp.layers.0.self_attn.attention_sink_bias'
+                          if 'mtp' in name else f'model.layers.{name.split(".")[-1]}.self_attn.attention_sink_bias')
                 torch.testing.assert_close(full.cpu(), checkpoint[hf_key].cpu(), atol=0, rtol=0)
             else:
                 assert 'softmax_offset' not in core_sd, f'{name}: full layer must not declare a sink'
@@ -1580,16 +1604,18 @@ def test_sharded_state_dict_sink_and_qkv_layout(remote_dir):
             assert tuple(shard.global_shape) == (expected_rows, 64), f'{name}: {shard.global_shape}'
             assert tuple(shard.local_shape) == (expected_rows // tp, 64)
             gathered = [torch.empty_like(shard.data) for _ in range(tp)]
-            torch.distributed.all_gather(gathered, shard.data.contiguous(),
-                                         group=parallel_state.get_tensor_model_parallel_group())
+            torch.distributed.all_gather(
+                gathered, shard.data.contiguous(), group=parallel_state.get_tensor_model_parallel_group())
             full = torch.cat(gathered)
             idx = name.split('.')[-1]
             prefix = 'model.mtp.layers.0.self_attn.' if 'mtp' in name else f'model.layers.{idx}.self_attn.'
             q, k, v = (checkpoint[prefix + f'{p}_proj.weight'] for p in ('q', 'k', 'v'))
             hpg = 8 // groups
-            expected = torch.cat([
-                torch.cat([q.view(groups, hpg * 32, 64), k.view(groups, 32, 64), v.view(groups, 16, 64)], dim=1)
-            ], dim=0).reshape(-1, 64)
+            expected = torch.cat(
+                [torch.cat([q.view(groups, hpg * 32, 64),
+                            k.view(groups, 32, 64),
+                            v.view(groups, 16, 64)], dim=1)],
+                dim=0).reshape(-1, 64)
             torch.testing.assert_close(full.cpu(), expected.cpu(), atol=0, rtol=0)
 
 
@@ -1671,8 +1697,7 @@ def test_parallel_forward_parity(remote_dir, topo, padding_free):
                 if padding_free == 'off':
                     output = stage_model(ids, positions, extra, runtime_gather_output=True)
                 else:
-                    output = stage_model(ids, positions, None, packed_seq_params=extra,
-                                         runtime_gather_output=True)
+                    output = stage_model(ids, positions, None, packed_seq_params=extra, runtime_gather_output=True)
                 return output, lambda tensor, **kw: tensor
 
             with torch.no_grad():
@@ -1696,8 +1721,8 @@ def test_parallel_forward_parity(remote_dir, topo, padding_free):
             if padding_free == 'off':
                 actual = _mcore_logits(model, config, input_ids, position_ids, attention_mask).float()
             else:
-                logits = model(input_ids, position_ids, None, packed_seq_params=packed_seq_params,
-                               runtime_gather_output=True)
+                logits = model(
+                    input_ids, position_ids, None, packed_seq_params=packed_seq_params, runtime_gather_output=True)
                 actual = logits[..., :config.actual_vocab_size].float()
             torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol)
 
@@ -1762,8 +1787,8 @@ def test_parallel_tp2_sp_gradient_parity(remote_dir):
         ]
         for name, expected, actual in pairs:
             assert actual is not None, f'{name}: grad missing'
-            torch.testing.assert_close(actual.float(), expected.float(), atol=3e-4, rtol=3e-4,
-                                       msg=lambda m: f'{name}: {m}')
+            torch.testing.assert_close(
+                actual.float(), expected.float(), atol=3e-4, rtol=3e-4, msg=lambda m: f'{name}: {m}')
 
 
 # Real-weight regression: TE fused LN+GEMM fp32 kernels carry ~2e-3 rel error on SM100, so
@@ -1818,9 +1843,14 @@ def _build_real_weight_models(real_weights_dir, dtype, language_model_only=True)
         rope.inv_freq = (1.0 / (10000.0**(torch.arange(0, dim, 2, dtype=torch.float32) / dim))).to(device)
     values = hf_to_mcore_config(hf_config)
     values.update(
-        mcore_model_type='mimo_v2', language_model_only=language_model_only, moe_grouped_gemm=True,
-        expert_tensor_parallel_size=1, overlap_p2p_comm=False, mtp_num_layers=0,
-        mtp_loss_scaling_factor=0.1, params_dtype=dtype)
+        mcore_model_type='mimo_v2',
+        language_model_only=language_model_only,
+        moe_grouped_gemm=True,
+        expert_tensor_parallel_size=1,
+        overlap_p2p_comm=False,
+        mtp_num_layers=0,
+        mtp_loss_scaling_factor=0.1,
+        params_dtype=dtype)
     config = ModelConfig(**values)
     model = get_mcore_model(config)[0].cuda().eval()
     config.bridge.load_weights([model], _REAL_WEIGHTS_DIR)
@@ -1848,11 +1878,12 @@ def _patch_unfused(model, eps):
     n_fused = 0
     for name, mod in model.named_modules():
         is_grouped = 'Grouped' in type(mod).__name__ and hasattr(mod, 'weight0')
-        if not (is_grouped or (hasattr(mod, 'layer_norm_weight') and hasattr(mod, 'weight')
-                               and 'linear' in name)):
+        if not (is_grouped or (hasattr(mod, 'layer_norm_weight') and hasattr(mod, 'weight') and 'linear' in name)):
             continue
         if is_grouped:
+
             def make_g(m):
+
                 def fwd(inp, m_splits, *a, **kw):
                     x = inp
                     if getattr(m, 'layer_norm_weight', None) is not None:
@@ -1865,10 +1896,14 @@ def _patch_unfused(model, eps):
                         off += n
                     out = torch.cat(outs, dim=0) if outs else x.new_zeros((0, m.weight0.shape[0]))
                     return out, None
+
                 return fwd
+
             mod.forward = make_g(mod)
         else:
+
             def make(m):
+
                 def fwd(inp, *a, **kw):
                     normed = _real_rmsnorm(inp, m.layer_norm_weight, eps)
                     out = F.linear(normed, m.weight)
@@ -1876,21 +1911,27 @@ def _patch_unfused(model, eps):
                     if bias is not None and bias.numel() > 0:
                         out = out + bias
                     return out, None
+
                 return fwd
+
             mod.forward = make(mod)
         n_fused += 1
     n_plain = 0
     for name, mod in model.named_modules():
         if type(mod).__name__.startswith('TE') and hasattr(mod, 'weight') and 'Linear' in type(mod).__name__ \
                 and not hasattr(mod, 'layer_norm_weight') and 'Grouped' not in type(mod).__name__:
+
             def make_p(m):
+
                 def fwd(inp, *a, **kw):
                     out = F.linear(inp, m.weight)
                     bias = getattr(m, 'bias', None)
                     if bias is not None and bias.numel() > 0:
                         return out, bias
                     return out, None
+
                 return fwd
+
             mod.forward = make_p(mod)
             n_plain += 1
     return n_fused, n_plain
@@ -1902,7 +1943,9 @@ def _patch_eager_attn(model):
     n = 0
     for name, mod in model.named_modules():
         if isinstance(mod, mimo_v2.MiMoV2TEDotProductAttention):
+
             def make(m):
+
                 def fwd(query, key, value, attention_mask, *a, **kw):
                     # query [s,b,nh,qk], key [s,b,nkv,qk], value [s,b,nkv,v]
                     if getattr(m, 'attention_value_scale', None) is not None:
@@ -1912,7 +1955,7 @@ def _patch_eager_attn(model):
                     q = query.permute(1, 2, 0, 3).float()
                     k = key.permute(1, 2, 0, 3).float().repeat_interleave(rep, dim=1)
                     v = value.permute(1, 2, 0, 3).float().repeat_interleave(rep, dim=1)
-                    scale = m.softmax_scale if getattr(m, 'softmax_scale', None) else qk ** -0.5
+                    scale = m.softmax_scale if getattr(m, 'softmax_scale', None) else qk**-0.5
                     logits = torch.matmul(q, k.transpose(-1, -2)) * scale
                     if attention_mask is not None:
                         logits = logits.masked_fill(attention_mask[:, :, :s, :s], float('-inf'))
@@ -1925,7 +1968,9 @@ def _patch_eager_attn(model):
                     out = torch.matmul(probs, v)  # [b,nh,s,v]
                     out = out.permute(2, 0, 1, 3).reshape(s, b, nh * v.shape[-1])
                     return out.contiguous().to(query.dtype)
+
                 return fwd
+
             mod.forward = make(mod)
             n += 1
     return n
@@ -1957,10 +2002,8 @@ def test_real_weight_loading_bit_exact(real_weights_dir):
                 ln2_w = ml.pre_mlp_layernorm.weight if hasattr(ml.pre_mlp_layernorm, 'weight') \
                     else ml.mlp.linear_fc1.layer_norm_weight
                 pairs += [
-                    (f'l{idx}.q', qkv[:, :hpg * qk_dim].reshape(nh, qk_dim, -1),
-                     sa.q_proj.weight.view(nh, qk_dim, -1)),
-                    (f'l{idx}.k', qkv[:, hpg * qk_dim:hpg * qk_dim + qk_dim],
-                     sa.k_proj.weight.view(nkv, qk_dim, -1)),
+                    (f'l{idx}.q', qkv[:, :hpg * qk_dim].reshape(nh, qk_dim, -1), sa.q_proj.weight.view(nh, qk_dim, -1)),
+                    (f'l{idx}.k', qkv[:, hpg * qk_dim:hpg * qk_dim + qk_dim], sa.k_proj.weight.view(nkv, qk_dim, -1)),
                     (f'l{idx}.v', qkv[:, hpg * qk_dim + qk_dim:], sa.v_proj.weight.view(nkv, v_dim, -1)),
                     (f'l{idx}.o', msa.linear_proj.weight, sa.o_proj.weight),
                     (f'l{idx}.ln1', msa.linear_qkv.layer_norm_weight, hl.input_layernorm.weight),
@@ -1983,8 +2026,8 @@ def test_real_weight_loading_bit_exact(real_weights_dir):
                                   torch.cat([hl.mlp.gate_proj.weight, hl.mlp.up_proj.weight], dim=0)))
                     pairs.append((f'l{idx}.fc2', ml.mlp.linear_fc2.weight, hl.mlp.down_proj.weight))
             for name, actual, expected in pairs:
-                torch.testing.assert_close(actual.detach().float(), expected.detach().float(), atol=0, rtol=0,
-                                           msg=lambda m: f'{name}: {m}')
+                torch.testing.assert_close(
+                    actual.detach().float(), expected.detach().float(), atol=0, rtol=0, msg=lambda m: f'{name}: {m}')
         finally:
             del hf, model
             torch.cuda.empty_cache()
@@ -2008,8 +2051,10 @@ def test_real_weight_forward_parity_fp32_unfused(real_weights_dir):
             hf_outs, mg_outs = {}, {}
 
             def hook(store, i):
+
                 def fn(m, a, o):
                     store[i] = (o[0] if isinstance(o, tuple) else o).detach().float().cpu()
+
                 return fn
 
             for i in range(n_layers):
@@ -2019,8 +2064,8 @@ def test_real_weight_forward_parity_fp32_unfused(real_weights_dir):
                 hf(input_ids=input_ids, attention_mask=torch.ones_like(input_ids), use_cache=False)
                 model(input_ids, position_ids, mask4d, runtime_gather_output=True)
             for i in range(n_layers - 1):
-                torch.testing.assert_close(mg_outs[i].transpose(0, 1), hf_outs[i], atol=5e-5, rtol=5e-5,
-                                           msg=lambda m: f'layer{i}: {m}')
+                torch.testing.assert_close(
+                    mg_outs[i].transpose(0, 1), hf_outs[i], atol=5e-5, rtol=5e-5, msg=lambda m: f'layer{i}: {m}')
             hf_last, mg_last = hf_outs[n_layers - 1], mg_outs[n_layers - 1].transpose(0, 1)
             d = (hf_last - mg_last).abs()
             big = hf_last.abs() > 5.0
