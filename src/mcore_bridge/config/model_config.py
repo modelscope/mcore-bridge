@@ -233,6 +233,11 @@ class ModelConfig(TransformerConfig):
     # nemotron_h (hybrid mamba2 + attention + moe)
     hybrid_layer_pattern: Optional[str] = None
 
+    # mimo_v2 (hybrid full/SWA attention, asymmetric QK/V head dims, per-layer KV heads)
+    attention_value_scale: Optional[float] = None
+    swa_rope_theta: Optional[float] = None
+    swa_num_key_value_heads: Optional[int] = None
+
     # dsa
     experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa', 'dsv4_hybrid']] = None
     dsa_indexer_n_heads: Optional[int] = None

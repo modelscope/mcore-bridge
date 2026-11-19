@@ -367,6 +367,33 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         res['swiglu'] = False
         res['gated_linear_unit'] = True
         res['activation_func'] = partial(F.gelu, approximate='tanh')
+    elif hf_model_type == 'mimo_v2':
+        # Hybrid full/SWA attention, asymmetric QK/V head dims, per-layer KV heads, SWA-only
+        # learnable sinks, sigmoid noaux_tc router. Input: BF16 split-q/k/v checkpoint.
+        res['layernorm_epsilon'] = hf_config.layernorm_epsilon  # HF field name is not rms_norm_eps
+        res['window_size'] = f'{window_size - 1},0'
+        pattern = [int(p) for p in hf_config.hybrid_layer_pattern]
+        # ModelConfig._eval_pattern rejects spaces; use the spaceless join like the other branches.
+        res['window_attn_skip_freq'] = '[' + ','.join(map(str, pattern)) + ']'
+        res['moe_layer_freq'] = '[' + ','.join(str(int(f)) for f in hf_config.moe_layer_freq) + ']'
+        res['moe_router_load_balancing_type'] = 'none'
+        res['moe_router_enable_expert_bias'] = True
+        # HF never updates the correction bias; freeze it so checkpoints and LoRA adapters
+        # agree on reload (no expert-bias drift).
+        res['moe_router_bias_update_rate'] = 0.0
+        res['moe_router_dtype'] = 'fp32'  # HF gate computes routing logits in fp32
+        res['apply_rope_fusion'] = False  # partial rotary + dual rope + MTP dict rope
+        res['hidden_dropout'] = 0.0
+        res['attention_value_scale'] = hf_config.attention_value_scale
+        res['swa_rope_theta'] = hf_config.swa_rope_theta
+        res['swa_num_key_value_heads'] = hf_config.swa_num_key_value_heads
+        if getattr(hf_config, 'n_group', None) in (None, 1):
+            res.pop('moe_router_num_groups', None)
+            res.pop('moe_router_group_topk', None)
+        for swa_key, full_key in (('swa_num_attention_heads', 'num_attention_heads'), ('swa_head_dim', 'head_dim'),
+                                  ('swa_v_head_dim', 'v_head_dim')):
+            if getattr(hf_config, swa_key) != getattr(hf_config, full_key):
+                raise ValueError(f'MiMo-V2 requires {swa_key} == {full_key}.')
     elif hf_model_type == 'muse_glimmer':
         # 39 sliding layers (window 2048) interleaved with 13 full-attention layers; the latter are
         # exactly the NoPE layers (`layer_rope_theta == 0`).
