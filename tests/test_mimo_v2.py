@@ -1247,7 +1247,6 @@ def _hf_hidden_before_norm(hf_model, input_ids):
     attention_mask = torch.ones_like(input_ids)
     inputs_embeds = model.embed_tokens(input_ids)
     position_ids = torch.arange(input_ids.shape[1], device='cuda').unsqueeze(0).expand(input_ids.shape[0], -1)
-    cache_position = torch.arange(input_ids.shape[1], device='cuda')
     from transformers.masking_utils import create_causal_mask, create_sliding_window_causal_mask
     mask_kwargs = dict(
         config=model.config,

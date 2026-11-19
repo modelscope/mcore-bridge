@@ -521,7 +521,7 @@ class MiMoV2Bridge(MultimodalGPTBridge):
         # Export: slice the rank-local tensor by the per-group [hpg*qk_dim, qk_dim, v_dim] sizes
         # BEFORE any TP gather (mirrors the base export protocol, including the is_lora PP all_reduce).
         config = self.config
-        qk_dim, v_dim = config.kv_channels, config.v_head_dim
+        qk_dim = config.kv_channels
         q_dim = (config.num_attention_heads // groups) * qk_dim
         kv_proj_list = ['k_proj', 'v_proj']
         is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv, LoraParallelLinear) and self._peft_format
