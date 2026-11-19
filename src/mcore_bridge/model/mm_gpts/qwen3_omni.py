@@ -22,6 +22,7 @@ class Qwen3Omni_Vit(HuggingFaceVit):
     _vision_tower = ['audio_tower', 'visual']
     _aligner = ['audio_tower.proj1', 'audio_tower.proj2', 'visual.merger', 'visual.merger_list']
     _generator = ['talker', 'code2wav']
+    media_input_keys = ('input_features',)
 
     def prepare_model(self, hf_config):
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (

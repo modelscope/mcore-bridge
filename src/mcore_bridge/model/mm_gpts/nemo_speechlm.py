@@ -261,6 +261,7 @@ class NemoSpeechLMVit(HuggingFaceVit):
     _vision_tower = ['perception.encoder']
     _aligner = ['perception.proj']
     test_mm_type = 'audio'
+    media_input_keys = ('input_features',)
 
     def prepare_model(self, hf_config: PretrainedConfig):
         self.perception = _TransformersPerception(hf_config)

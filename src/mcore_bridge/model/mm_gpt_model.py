@@ -14,8 +14,32 @@ from mcore_bridge.utils import reconstruct_tensor_cp, split_cp_inputs
 from .gpt_model import GPTModel
 
 
+def _pure_text_batch(kwargs: dict, media_input_keys) -> bool:
+    """True when every declared media key is None -- the tower would run on fabricated zeros."""
+    return all(kwargs.get(key) is None for key in media_input_keys)
+
+
+def _check_no_media_placeholders(kwargs: dict) -> None:
+    """A present, non-zero media-position marker with no media at all is broken input.
+
+    ``mm_token_type_ids`` marks each image (1) / video (2) token position; non-zero entries
+    with both ``pixel_values`` and ``pixel_values_videos`` absent mean placeholders without
+    media, which the vision path cannot score either. Checked only when the family emits the
+    key, so families that do not carry it are unaffected.
+    """
+    token_types = kwargs.get('mm_token_type_ids')
+    if token_types is not None and bool((token_types != 0).any()):
+        raise ValueError('mm_token_type_ids carries media placeholders but no pixel_values / '
+                         'pixel_values_videos; the batch would train on placeholder embeddings.')
+
+
 class MultimodalGPTModel(MegatronModule):
     language_model_cls = GPTModel
+
+    #: Set by the training strategy when skipping the tower on all-text micro-batches is safe
+    #: under the active parallelism (synchronous DDP only). Off by default: plain inference and
+    #: unsafe parallel layouts keep the original fabricated-zero path.
+    enable_text_vision_skip = False
 
     def __init__(self,
                  config: ModelConfig,
@@ -60,6 +84,10 @@ class MultimodalGPTModel(MegatronModule):
             if self.visual is not None:
                 if self.config.language_model_only:
                     res = self.visual.get_inputs_embeds_language_model(res, **kwargs)
+                elif self.enable_text_vision_skip and _pure_text_batch(kwargs, self.visual.media_input_keys):
+                    _check_no_media_placeholders(kwargs)
+                    # Keep res: with no media the tower's write-back is the identity, so the
+                    # word embeddings are already the final inputs_embeds.
                 else:
                     res = self.visual.get_inputs_embeds(res, **kwargs)
                 kwargs.clear()

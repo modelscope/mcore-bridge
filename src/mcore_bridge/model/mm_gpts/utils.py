@@ -28,6 +28,12 @@ class HuggingFaceVit(_HuggingFaceModule, ABC):
     module_mapping = {}  # hf -> mcore
     test_mm_type = 'image'
 
+    #: kwargs keys whose non-None value means real media reached the tower. A batch where they
+    #: are ALL None would otherwise run the tower on fabricated zero inputs -- each family's
+    #: ``get_inputs_embeds`` builds a dummy zeros batch on that path. Families whose media rides
+    #: other keys (audio: ``input_features``) declare their own tuple.
+    media_input_keys = ('pixel_values', 'pixel_values_videos')
+
     @contextmanager
     def patch_hf_config(self):
         config = self.config

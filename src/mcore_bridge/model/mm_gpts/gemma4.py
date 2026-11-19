@@ -64,6 +64,7 @@ class Gemma4Vit(HuggingFaceVit):
     }
     _vision_tower = ['vision_tower', 'audio_tower']
     _aligner = ['embed_vision', 'embed_audio']
+    media_input_keys = ('pixel_values', 'pixel_values_videos', 'input_features', 'input_features_mask')
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from transformers.models.gemma4.modeling_gemma4 import Gemma4Model, Gemma4MultimodalEmbedder

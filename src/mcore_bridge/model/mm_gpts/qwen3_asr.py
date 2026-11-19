@@ -22,6 +22,7 @@ class Qwen3ASRVit(HuggingFaceVit):
     _vision_tower = ['audio_tower']
     _aligner = ['audio_tower.proj1', 'audio_tower.proj2']
     test_mm_type = 'audio'
+    media_input_keys = ('input_features',)
 
     def prepare_model(self, hf_config: PretrainedConfig):
         from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (Qwen3ASRAudioEncoder,

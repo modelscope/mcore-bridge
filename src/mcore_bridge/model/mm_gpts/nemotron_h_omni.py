@@ -204,6 +204,7 @@ class NemotronH_OmniVit(HuggingFaceVit):
     }
     _vision_tower = ['vision_model']
     _aligner = ['vision_projector']
+    media_input_keys = ('pixel_values', 'pixel_values_videos', 'omni_embeddings')
 
     def prepare_model(self, hf_config: PretrainedConfig):
         RadioModel = get_class_from_dynamic_module('modeling_radio.RadioModel', hf_config.name_or_path)
