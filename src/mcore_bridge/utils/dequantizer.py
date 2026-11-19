@@ -66,19 +66,35 @@ class MxFp4Dequantizer:
 _FP4_E2M1_LUT = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
 
-def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
+def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """Unpack e2m1 nibbles (element 2i in the low nibble) to fp32 values via the shared LUT.
+
+    ``[..., B]`` packed uint8 -> ``[..., 2*B]`` fp32. Every e2m1 value is exactly representable
+    in fp8-e4m3 and bf16, so casting the result is lossless.
+    """
     lut = torch.tensor(_FP4_E2M1_LUT, dtype=torch.float32, device=packed.device)
     u8 = packed.contiguous().view(torch.uint8)
-    low = (u8 & 0x0F).long()
-    high = ((u8 >> 4) & 0x0F).long()
+    low = lut[(u8 & 0x0F).long()]
+    high = lut[(u8 >> 4).long()]
+    return torch.stack([low, high], dim=-1).reshape(*packed.shape[:-1], 2 * packed.shape[-1])
 
-    low_f32 = lut[low]
-    high_f32 = lut[high]
 
-    unpacked = torch.stack([low_f32, high_f32], dim=-1)
-    unpacked = unpacked.reshape(*packed.shape[:-1], 2 * packed.shape[-1])
+def fp4_to_fp8(packed: torch.Tensor) -> torch.Tensor:
+    return unpack_e2m1(packed).to(torch.float8_e4m3fn)
 
-    return unpacked.to(torch.float8_e4m3fn)
+
+def dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Torch-native MXFP4 dequantization: ``[R, C/2]`` packed e2m1 + E8M0 ``[R, C/32]`` -> bf16.
+
+    Scales sit along the INPUT dimension (one per 32 inputs, MiMo-V2 routed-expert layout) and
+    the math runs in fp32 before the bf16 cast. Distinct from ``MxFp4Dequantizer``, which
+    delegates to transformers' gpt-oss kernel (bf16 ldexp arithmetic, transposed output) — the
+    two are not bit-identical, so each loading path must keep using its own variant.
+    """
+    out_dim, in_dim = packed.shape[0], packed.shape[1] * 2
+    assert scale.shape == (out_dim, in_dim // 32), f'{packed.shape=} {scale.shape=}'
+    values = unpack_e2m1(packed) * torch.exp2(scale.float() - 127.0).repeat_interleave(32, dim=1)
+    return values.to(torch.bfloat16)
 
 
 class PackedDequantizer:

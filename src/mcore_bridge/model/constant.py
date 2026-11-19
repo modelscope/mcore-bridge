@@ -50,6 +50,8 @@ class MLLMModelType:
     nemotron_h_omni = 'nemotron_h_omni'
     nemo_speechlm = 'nemo_speechlm'
 
+    mimo_v2 = 'mimo_v2'
+
 
 class ModelType(LLMModelType, MLLMModelType):
     pass

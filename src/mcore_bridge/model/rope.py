@@ -112,10 +112,13 @@ def _get_rope_type(rope_scaling: Optional[Dict[str, Any]]):
 
 def get_rope_inv_freq(config, seq_len=None, text_config=None, **kwargs):
     from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
-    ROPE_INIT_FUNCTIONS.update(EXTENDED_ROPE_INIT_FUNCTIONS)
+
+    # Don't mutate ROPE_INIT_FUNCTIONS: injected compat copies leak into HF weight init and can
+    # re-init rope buffers with the wrong theta (or crash on configs without a global rope_theta).
+    rope_type = _get_rope_type(config.rope_scaling)
     if text_config is None:
         text_config = _get_dummy_config(config)
-    rope_init_fn = ROPE_INIT_FUNCTIONS[_get_rope_type(config.rope_scaling)]
+    rope_init_fn = EXTENDED_ROPE_INIT_FUNCTIONS.get(rope_type) or ROPE_INIT_FUNCTIONS[rope_type]
     inv_freq, attention_scaling = rope_init_fn(text_config, 'cpu', seq_len=seq_len, **kwargs)
     if attention_scaling is None:
         attention_scaling = 1.
