@@ -145,6 +145,12 @@ class MultimodalGPTModel(MegatronModule):
             input_ids_ = input_ids if needs_split else reconstruct_tensor_cp(
                 input_ids, packed_seq_params, dim=1, cp_partition_mode=cp_partition_mode)
             kwargs.update({'input_ids': input_ids_, 'packed_seq_params': packed_seq_params})
+            # defect126: mm_token_type_ids must track input_ids' CP transform so get_inputs_embeds
+            # sees matching shapes (it validates token_types.shape == input_ids.shape under CP>1).
+            _tt = kwargs.get('mm_token_type_ids')
+            if _tt is not None and cp_size > 1:
+                kwargs['mm_token_type_ids'] = _tt if needs_split else reconstruct_tensor_cp(
+                    _tt, packed_seq_params, dim=1, cp_partition_mode=cp_partition_mode)
             with self._patch_word_embeddings(kwargs):
                 decoder_input = self.language_model.embedding(input_ids=input_ids_, position_ids=position_ids)
         else:
