@@ -1,0 +1,58 @@
+name: ci
+
+# Mirror of ms-swift/.github/workflows/ci.yaml. One job, no logic: it hands the suite a fixed
+# 2-GPU slot and runs `pytest`. Anything variable lives outside this file:
+#   * which tests run      -> markers, plus the box's capability (tests/conftest.py)
+#   * which versions run   -> the test case's own business; a UT may pip-install what it needs
+#   * how many run at once -> how many runner services the box has
+#
+# CONCURRENCY IS A RUNNER-POOL PROPERTY, NOT A WORKFLOW ONE: the box registers one runner
+# service per 2-GPU slot, all labelled `gpu`, named `<host>-0` .. `<host>-3`. Actions queues
+# when all slots are busy; there is deliberately no job-level `concurrency:` here.
+#
+# Two repository variables:
+#   vars.CI_GPU_IMAGE         image owning torch / TE / megatron-core
+#   vars.CI_MODELSCOPE_CACHE  host path of the warm model cache
+
+on:
+  pull_request:
+  push:
+    branches: [main, "release/**"]
+  schedule:
+    - cron: "0 18 * * *"   # 02:00 Beijing
+  workflow_dispatch:
+
+# Per-ref only: supersedes earlier runs of the *same* PR, never another PR's.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODELSCOPE_ENVIRONMENT: ci
+  MODELSCOPE_API_TOKEN: ${{ secrets.MODELSCOPE_API_TOKEN }}
+  GPUS_PER_SLOT: 2
+
+jobs:
+  test:
+    name: test (cuda)
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 240
+    container:
+      image: ${{ vars.CI_GPU_IMAGE }}
+      options: --gpus all --shm-size=16gb --volume=${{ vars.CI_MODELSCOPE_CACHE }}:/root/.cache/modelscope
+    steps:
+      - uses: actions/checkout@v4
+      - name: Claim this slot's GPUs
+        run: .github/slot_devices.sh >> "$GITHUB_ENV"
+      # The image owns torch / TE / megatron-core. --no-deps keeps it that way: to add a
+      # runtime dependency, rebuild the image, do not grow this file.
+      - run: |
+          pip install --no-deps -e .
+          pip install -r requirements/tests.txt
+      # `&&` binds tighter than `||`, so the parentheses are load-bearing: without them a PR
+      # renders the literal `true` as pytest's argument.
+      - run: pytest ${{ github.event_name == 'schedule' && '' || '-m "not slow"' }}
+      # The container is root, the runner is not: leave the workspace deletable or the next run
+      # fails in checkout.
+      - if: always()
+        run: chmod -R a+rwX .
