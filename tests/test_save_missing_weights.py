@@ -7,7 +7,6 @@ the exported checkpoint.
 """
 import os
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # The megatron entrypoint initializes torch.distributed via env:// rendezvous.
 os.environ.setdefault('RANK', '0')
 os.environ.setdefault('LOCAL_RANK', '0')
@@ -19,8 +18,21 @@ import shutil  # noqa: E402
 import tempfile  # noqa: E402
 
 import json  # noqa: E402
+import pytest  # noqa: E402
 import torch  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
+
+_TE_ATTN_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+
+
+@pytest.fixture(autouse=True)
+def _isolate_te_attention_env(monkeypatch):
+    """mcore's _set_attention_backend pins the NVTE_* flags process-wide and asserts on a
+    conflicting leftover; an earlier suite's flash/auto model must not poison this export's
+    unfused build (same isolation the dsv4 sibling file carries)."""
+    for variable in _TE_ATTN_ENV_VARS:
+        monkeypatch.delenv(variable, raising=False)
+    yield
 
 MODEL_ID = 'Qwen/Qwen2-0.5B-Instruct'
 MODEL_TYPE = 'qwen2'  # a copied dir loses the model id, so type/template cannot be inferred

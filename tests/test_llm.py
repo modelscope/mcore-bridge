@@ -1,11 +1,23 @@
-import os
+import pytest
 
-os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3'
-os.environ['SWIFT_TEST_CONVERT_PRECISION'] = '1'
+
+@pytest.fixture(autouse=True)
+def _convert_precision_env(monkeypatch):
+    # Per-test, not module import: a leaked SWIFT_TEST_CONVERT_PRECISION=1 makes later
+    # export suites skip the mcore disk save entirely (silent missing checkpoint).
+    monkeypatch.setenv('SWIFT_TEST_CONVERT_PRECISION', '1')
 
 
 def _test_model(model_id, **kwargs):
+    import pytest
+    from modelscope import snapshot_download
     from swift import ExportArguments, export_main
+    # These conversion-precision e2e ride whatever the warm cache holds; a cold miss skips
+    # rather than pulling a 100B+ snapshot into a test run (daily tier, manual warm-up).
+    try:
+        snapshot_download(model_id, local_files_only=True)
+    except Exception as e:
+        pytest.skip(f'model not cached locally: {model_id} ({type(e).__name__})')
     if model_id.endswith('mcore') or 'megatron_output' in model_id and 'hf' not in model_id:
         export_main(
             ExportArguments(

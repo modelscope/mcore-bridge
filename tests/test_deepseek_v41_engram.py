@@ -10,8 +10,8 @@ from megatron.core.transformer import TransformerConfig
 from safetensors.torch import save_file
 
 from mcore_bridge.config.parser import _convert_config
-from mcore_bridge.model.gpts import deepseek_v41 as deepseek_v41_module
-from mcore_bridge.model.gpts.deepseek_v41 import (
+from mcore_bridge.model.mm_gpts import deepseek_v41 as deepseek_v41_module
+from mcore_bridge.model.mm_gpts.deepseek_v41 import (
     DeepseekV41Aligner,
     DeepseekV41Bridge,
     DeepseekV41DSparkAttention,

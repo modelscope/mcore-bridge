@@ -237,7 +237,10 @@ class ApplyPatchTest(unittest.TestCase):
             source = installer.patch_files(True)
         self.assertTrue(all(name.startswith('megatron/core/') for name in runtime))
         self.assertIn('megatron/core/transformer/transformer_config.py', runtime)
-        self.assertGreater(len(source), len(runtime))
+        # source checkout keeps everything runtime keeps (plus any tests/ diffs the patch carries);
+        # the runtime selection must never drop a core file or leak a tests/ entry.
+        self.assertTrue(set(runtime) <= set(source))
+        self.assertFalse(any(name.startswith('tests/') for name in runtime))
 
 
 class PackagedPatchIntegrationTest(unittest.TestCase):

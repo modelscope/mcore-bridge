@@ -309,12 +309,24 @@ def test_hybrid_controls_without_media_or_defaults(monkeypatch, pre_process):
     assert 'loss_mask' not in model.seen
 
 
+def _skip_without_omni_transformers():
+    """The Omni loader and the official RADIO conversion target transformers>=5.16.1
+    (require_version in NemotronH_OmniLoader; conversion_mapping's reverse= kwarg). Older
+    installs exempt these cases; the version-guard contract itself stays pinned by
+    test_omni_loader_requires_tested_transformers_api with a mocked version."""
+    from packaging.version import Version
+    import transformers
+    if Version(transformers.__version__) < Version('5.16.1'):
+        pytest.skip(f'Nemotron-H-Omni needs transformers>=5.16.1, found {transformers.__version__}')
+
+
 @pytest.mark.parametrize('field,value,message', [('context_parallel_size', 2, 'context_parallel_size 1'),
                                                  ('mtp_num_layers', 1, 'mtp_num_layers 0'), ('fp8', 'hybrid', 'FP8'),
                                                  ('pipeline_model_parallel_size', 2, 'pipeline_model_parallel_size 1'),
                                                  ('packing', True, 'padding_free false --packing false'),
                                                  ('padding_free', True, 'padding_free false --packing false')])
 def test_loader_early_guards(field, value, message, monkeypatch):
+    _skip_without_omni_transformers()
     monkeypatch.setenv('USE_NEMOTRON_EVS', '1')
     config = _config(**{field: value})
     with pytest.raises(NotImplementedError, match=message):
@@ -333,12 +345,14 @@ def test_omni_loader_requires_tested_transformers_api(monkeypatch, version):
 
 
 def test_non_evs_pp_and_packing_are_not_restricted():
+    _skip_without_omni_transformers()
     config = _config(pipeline_model_parallel_size=4, packing=True, padding_free=True)
     config.hf_config.video_pruning_rate = 0
     assert omni.NemotronH_OmniLoader(config).config is config
 
 
 def test_evs_optin_default_off_relaxes_constraints(monkeypatch):
+    _skip_without_omni_transformers()
     # Without USE_NEMOTRON_EVS the config's video_pruning_rate is ignored for training: the
     # Loader drops its PP/packing guards and the forward keeps full-length sequences.
     monkeypatch.delenv('USE_NEMOTRON_EVS', raising=False)
@@ -397,6 +411,7 @@ def _bridge():
 
 
 def test_radio_official_conversion_roundtrip(tmp_path):
+    _skip_without_omni_transformers()
     radio, bridge = RadioFixture(), _bridge()
     raw = {'vision_model.radio_model.model.blocks.0.attn.qkv.weight': torch.arange(48.).view(12, 4)}
     lazy = {k: NS(load=lambda v=v: v) for k, v in raw.items()}
@@ -414,6 +429,7 @@ def test_radio_official_conversion_roundtrip(tmp_path):
 
 
 def test_radio_root_modules_to_save_full_export():
+    _skip_without_omni_transformers()
     from peft.utils import ModulesToSaveWrapper
     radio = ModulesToSaveWrapper(RadioFixture(), 'default')
     radio.update('inactive')
@@ -427,6 +443,7 @@ def test_radio_root_modules_to_save_full_export():
 
 
 def test_radio_full_export_unmerged_and_merged_lora():
+    _skip_without_omni_transformers()
     from peft import LoraConfig, get_peft_model
     model = get_peft_model(RadioFixture(), LoraConfig(target_modules=['query'], r=2, lora_alpha=2))
     radio = model.base_model.model

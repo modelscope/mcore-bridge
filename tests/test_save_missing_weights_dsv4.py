@@ -265,6 +265,7 @@ def _export(model_dir: str, output_dir: str, save_missing_weights: bool, mtp_num
     return output_dir
 
 
+@pytest.mark.accel(1)
 def test_dsv4_mtp_weights_restored():
     """Without Megatron MTP, every `mtp.*` tensor must come back byte-for-byte."""
     with tempfile.TemporaryDirectory() as tmp_dir:
@@ -283,6 +284,7 @@ def test_dsv4_mtp_weights_restored():
         assert _trunk_keys(exported), 'trunk weights missing from export'
 
 
+@pytest.mark.accel(1)
 def test_dsv4_mtp_weights_dropped_by_default():
     """With the flag off the `mtp.*` weights are lost, as they are today."""
     with tempfile.TemporaryDirectory() as tmp_dir:

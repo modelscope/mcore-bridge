@@ -234,6 +234,9 @@ def test_full_export_requires_source_checkpoint(tmp_path):
 
 
 def _build_tiny_model(tp=1, pp=1, ep=1, sequence_parallel=False, mtp=False):
+    # The hybrid stack instantiates mcore's MambaMixer, which hard-requires the mamba-ssm
+    # kernels; installs without them exempt the real-model suites (parser/guard suites stay).
+    pytest.importorskip('mamba_ssm')
     from mcore_bridge.model.register import get_mcore_model
 
     hf_config = _config()
@@ -623,6 +626,8 @@ def _check_lora_fixture(output_dir):
 def test_lora_adapter_save_reload_fresh_process(tmp_path):
     if not torch.cuda.is_available() or int(os.environ.get('WORLD_SIZE', '1')) != 1:
         pytest.skip('requires one CUDA device')
+    # The spawned save/check processes build the tiny hybrid model outside pytest's gates.
+    pytest.importorskip('mamba_ssm')
     root = os.path.dirname(os.path.dirname(__file__))
     env = os.environ.copy()
     env['PYTHONPATH'] = os.pathsep.join(

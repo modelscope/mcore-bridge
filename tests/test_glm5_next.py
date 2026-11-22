@@ -259,6 +259,9 @@ def _build_parity_models(moe=False,
                          sequence_parallel=False,
                          dtype=torch.float32,
                          optimized_dsa=False):
+    # The installed transformers (5.12.1) does not ship glm5_next yet; exempt these parity
+    # suites until the stack provides it (same env-gate class as the vllm/flash_attn skipifs).
+    pytest.importorskip('transformers.models.glm5_next.modeling_glm5_next')
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextModel
 
     from mcore_bridge.model.register import get_mcore_model
@@ -1075,6 +1078,7 @@ def test_glm5_ep2_forward_parity():
 def test_glm5_rmsnorm_variants_match_hf_bit_exactly():
     """HF's RMSNorm casts back to the input dtype before the weight multiply; the mcore
     class must match bit-exactly."""
+    pytest.importorskip('transformers.models.glm5_next.modeling_glm5_next')
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextRMSNorm
     torch.manual_seed(5)
     for dtype in (torch.float32, torch.bfloat16):
@@ -1190,6 +1194,7 @@ def test_glm5_vision_tower_matches_hf_reference():
     """The wrapped HF vision tower must reproduce the standalone HF module exactly."""
     if not torch.cuda.is_available():
         pytest.skip('CUDA is required')
+    pytest.importorskip('transformers.models.glm5_next')
     from transformers.models.glm5_next import Glm5NextVisionModel
 
     config = _glm_config()
@@ -1238,6 +1243,7 @@ def _tiny_vl_config(moe=True):
 
 def _build_vl_parity_models(dtype=torch.float32):
     """Build an HF GLM-5.3 VL model plus the equivalent mcore MultimodalGPTModel."""
+    pytest.importorskip('transformers.models.glm5_next.modeling_glm5_next')
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextModel
 
     from mcore_bridge.model.register import get_mcore_model
