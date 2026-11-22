@@ -26,7 +26,6 @@ _DIST_ENV_DEFAULTS = {
     'LOCAL_RANK': '0',
     'WORLD_SIZE': '1',
     'MASTER_ADDR': '127.0.0.1',
-    'MASTER_PORT': '29901',
 }
 _TE_ATTN_ENV_VARS = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
 
@@ -37,6 +36,11 @@ def _isolate_megatron_runtime(monkeypatch):
     for variable, value in _DIST_ENV_DEFAULTS.items():
         if variable not in os.environ:
             monkeypatch.setenv(variable, value)
+    if 'MASTER_PORT' not in os.environ:
+        # Free port per test: parallel CI slots on the same host would otherwise collide on
+        # the TCPStore listen (EADDRINUSE).
+        from twinkle.utils.network import find_free_port
+        monkeypatch.setenv('MASTER_PORT', str(find_free_port()))
     for variable in _TE_ATTN_ENV_VARS:
         monkeypatch.delenv(variable, raising=False)
     yield

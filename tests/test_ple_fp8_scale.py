@@ -17,7 +17,10 @@ os.environ.setdefault('RANK', '0')
 os.environ.setdefault('LOCAL_RANK', '0')
 os.environ.setdefault('WORLD_SIZE', '1')
 os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-os.environ.setdefault('MASTER_PORT', '29519')
+# Free port, not a fixed one: parallel CI slots on the same host would otherwise collide on
+# the TCPStore listen (EADDRINUSE).
+from twinkle.utils.network import find_free_port  # noqa: E402
+os.environ['MASTER_PORT'] = str(find_free_port())
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
