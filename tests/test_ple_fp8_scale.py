@@ -17,10 +17,6 @@ os.environ.setdefault('RANK', '0')
 os.environ.setdefault('LOCAL_RANK', '0')
 os.environ.setdefault('WORLD_SIZE', '1')
 os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
-# Free port, not a fixed one: parallel CI slots on the same host would otherwise collide on
-# the TCPStore listen (EADDRINUSE).
-from twinkle.utils.network import find_free_port  # noqa: E402
-os.environ['MASTER_PORT'] = str(find_free_port())
 
 import pytest  # noqa: E402
 import torch  # noqa: E402
@@ -36,7 +32,21 @@ SCALE_KEY = Qwen4ExpTextNGramEmbedding._NGRAM_SCALE_KEY
 def _single_rank():
     """fill_table_from_hf reads the TP rank to find its slice of the table."""
     if not dist.is_initialized():
-        dist.init_process_group('gloo')
+        # Pick the port right before the rendezvous, not at collection time: a module-level
+        # pick widens the free-port TOCTOU window across the whole suite and parallel CI
+        # slots can collide on the TCPStore listen (EADDRINUSE). An externally pinned
+        # MASTER_PORT is honoured (dsv4 parity).
+        from twinkle.utils.network import find_free_port
+        previous = os.environ.get('MASTER_PORT')
+        if previous is None:
+            os.environ['MASTER_PORT'] = str(find_free_port())
+        try:
+            dist.init_process_group('gloo')
+        finally:
+            if previous is None:
+                os.environ.pop('MASTER_PORT', None)
+            else:
+                os.environ['MASTER_PORT'] = previous
     if not mpu.model_parallel_is_initialized():
         mpu.initialize_model_parallel(1)
     yield
