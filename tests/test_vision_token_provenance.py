@@ -1,7 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from types import SimpleNamespace
+
 import pytest
 import torch
-from types import SimpleNamespace
 
 from mcore_bridge.model.mm_gpts.utils import HuggingFaceVit
 

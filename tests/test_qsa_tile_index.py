@@ -1,7 +1,8 @@
 """CPU-only: a packed selection must attend exactly its keys, and the tile map must
 list every attended key's tile."""
-import pytest
 import random
+
+import pytest
 
 from mcore_bridge.model.modules.kernels import qsa_kernels as qk
 from mcore_bridge.model.modules.kernels.qsa_block_sparse_attn import build_tile_index, build_tile_index_pair

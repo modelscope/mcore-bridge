@@ -1,9 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from megatron.core.transformer.experimental_attention_variant.dsa import (DSAIndexerLossAutoScaler,
-                                                                          DSAIndexerLossLoggingHelper)
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention as McoreDSAttention
-from megatron.core.transformer.experimental_attention_variant.dsa import FusedDSAIndexerLoss, unfused_dsa_fn
 from typing import Optional
+
+from megatron.core.transformer.experimental_attention_variant.dsa import (
+    DSAIndexerLossAutoScaler,
+    DSAIndexerLossLoggingHelper,
+    FusedDSAIndexerLoss,
+    unfused_dsa_fn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention as McoreDSAttention
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model

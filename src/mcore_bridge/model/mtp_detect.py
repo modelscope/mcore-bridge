@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import glob
-import json
 import os
 import re
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+
+import json
 
 from mcore_bridge.utils import get_logger
 

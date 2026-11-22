@@ -1,5 +1,6 @@
-import json
 from types import SimpleNamespace
+
+import json
 
 from mcore_bridge.model.mtp_detect import resolve_mtp_config, resolve_mtp_num_layers
 from mcore_bridge.model.register import ModelMeta, get_model_meta

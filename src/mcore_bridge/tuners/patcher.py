@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from typing import Optional
+
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.module import MegatronModule
@@ -9,10 +11,8 @@ from peft.tuners.lora import model
 from peft.tuners.tuners_utils import BaseTunerLayer
 from torch import nn
 from transformers.utils import is_torch_npu_available
-from typing import Optional
 
 from mcore_bridge.utils import patch_deepcopy
-
 from .lora import LoraParallelLinear
 
 

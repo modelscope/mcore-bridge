@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # code borrowed from modelscope/ms-swift
 import os
-from transformers.utils import strtobool
 from typing import Tuple
+
+from transformers.utils import strtobool
 
 from .logger import get_logger
 

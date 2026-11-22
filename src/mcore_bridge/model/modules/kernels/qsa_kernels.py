@@ -32,7 +32,6 @@ WHY A KERNEL AT ALL (the decision this file encodes)
 import torch
 
 from mcore_bridge.utils import get_env_args, get_logger
-
 from .qsa_block_sparse_attn import qsa_block_sparse_attention
 
 logger = get_logger()

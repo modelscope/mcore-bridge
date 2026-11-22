@@ -18,11 +18,12 @@ setup with frozen base weights): they inherit the base's AVG sync through
 """
 import itertools
 import os
+import types
+
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-import types
 from megatron.core.packed_seq_params import PackedSeqParams
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -180,8 +181,10 @@ def _worker(rank, tp_size, init_file, layout, fused, lora=False):
 
 
 def _run_case(rank, tp_size, device, layout, fused, lora=False):
-    from megatron.core.distributed.finalize_model_grads import (_allreduce_non_tensor_model_parallel_grads,
-                                                                finalize_model_grads)
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_non_tensor_model_parallel_grads,
+        finalize_model_grads,
+    )
 
     case = f'layout={layout} fused={fused} tp={tp_size}' + (' lora' if lora else '')
     config = _config(tp_size)
@@ -231,13 +234,13 @@ def _run_case(rank, tp_size, device, layout, fused, lora=False):
     pre = _grads(layer)
     for name in checked:
         torch.testing.assert_close(
-            pre[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m: f'{case} pre-finalize {name}: {m}')
+            pre[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m, name=name: f'{case} pre-finalize {name}: {m}')
 
     # --- the regression assertion: the real finalizer keeps the grads at 1x ---
     _, _, post = backward_then_finalize()
     for name in checked:
         torch.testing.assert_close(
-            post[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m: f'{case} post-finalize {name}: {m}')
+            post[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m, name=name: f'{case} post-finalize {name}: {m}')
 
     # --- negative control: the old flag must reproduce the tp_size amplification ---
     for name, param in layer.named_parameters():
@@ -251,7 +254,7 @@ def _run_case(rank, tp_size, device, layout, fused, lora=False):
             ref[name] * tp_size,
             rtol=2e-3,
             atol=1e-4,
-            msg=lambda m: f'{case} negative control {name}: {m}')
+            msg=lambda m, name=name: f'{case} negative control {name}: {m}')
     if rank == 0:
         print(f'{case}: ok', flush=True)
 

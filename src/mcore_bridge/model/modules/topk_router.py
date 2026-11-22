@@ -1,10 +1,11 @@
 import copy
+from typing import Optional
+
 import torch
 from megatron.core import tensor_parallel
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
-from typing import Optional
 
 from .router_replay import MaskedRouterReplay
 

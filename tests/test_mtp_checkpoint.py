@@ -12,12 +12,13 @@ Locks the two properties that changed around persistence:
 Building a ``ModelConfig`` instantiates its bridge, which requires a
 model-parallel group, so every case runs inside a single-GPU parallel context.
 """
-import json
 import os
-import pytest
-import torch
 import uuid
 from contextlib import contextmanager
+
+import json
+import pytest
+import torch
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 

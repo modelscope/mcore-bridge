@@ -1,10 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import math
-import torch
 from contextlib import contextmanager
-from megatron.core.extensions.transformer_engine import (SplitAlongDim, TEColumnParallelLinear, TENorm,
-                                                         TERowParallelLinear)
+from typing import Optional, Tuple
+
+import torch
+from megatron.core.extensions.transformer_engine import (
+    SplitAlongDim,
+    TEColumnParallelLinear,
+    TENorm,
+    TERowParallelLinear,
+)
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_concentration_factor_from_config
@@ -12,8 +18,10 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
 from megatron.core.tensor_parallel import VocabParallelEmbedding, all_gather_last_dim_from_tensor_parallel_region
-from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
-                                                    scatter_to_tensor_model_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_tensor_model_parallel_region,
+)
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
@@ -23,13 +31,11 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.utils import make_viewless_tensor, nvtx_range_pop, nvtx_range_push
 from torch import Tensor, nn
 from transformers import AutoModel, PretrainedConfig
-from typing import Optional, Tuple
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import get_gemma4_attention_dims, get_gemma4_rope_head_dim_key
 from mcore_bridge.utils import get_logger
-
 from ..constant import ModelType
 from ..gpt_model import GPTModel
 from ..mm_gpt_model import MultimodalGPTModel
@@ -494,7 +500,7 @@ class Gemma4Bridge(MultimodalGPTBridge):
         return hf_state_dict
 
     def _set_word_embeddings(self, mg_model, hf_state_dict, to_mcore):
-        lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+        lm_model = mg_model.language_model if self.is_multimodal else mg_model
         self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
         if self.hidden_size_per_layer_input:
             for key in ['embed_tokens_per_layer', 'per_layer_model_projection', 'per_layer_projection_norm']:
@@ -872,9 +878,11 @@ class Gemma4UnifiedVit(Gemma4Vit):
     _vision_tower = []
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from transformers.models.gemma4_unified.modeling_gemma4_unified import (Gemma4UnifiedModel,
-                                                                                Gemma4UnifiedMultimodalEmbedder,
-                                                                                Gemma4UnifiedVisionEmbedder)
+        from transformers.models.gemma4_unified.modeling_gemma4_unified import (
+            Gemma4UnifiedModel,
+            Gemma4UnifiedMultimodalEmbedder,
+            Gemma4UnifiedVisionEmbedder,
+        )
         dtype = hf_config.torch_dtype
         self.embed_vision = (
             Gemma4UnifiedVisionEmbedder(hf_config.vision_config, hf_config.text_config).to(dtype)

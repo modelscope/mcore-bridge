@@ -1,8 +1,9 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """DSv4 RoPE must not hand packed cu_seqlens to Megatron's zigzag helper."""
 import ast
-import torch
 from pathlib import Path
+
+import torch
 
 
 def _load_apply():

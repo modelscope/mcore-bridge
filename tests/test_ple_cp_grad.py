@@ -9,6 +9,7 @@ gather back to a local-slice backward (the ``reconstruct_tensor_cp`` semantics) 
 """
 import itertools
 import os
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -133,13 +134,22 @@ def _cp_grad_worker(rank, world_size, init_file):
             ref_hidden_grad = split_cp_inputs(full_hidden.grad, cu, dim=0)
 
             out, hidden_grad, param_grads = _run_cp(layer, hidden, probe, input_ids, packed)
-            torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5, msg=lambda m: f'{case} output: {m}')
             torch.testing.assert_close(
-                hidden_grad, ref_hidden_grad, atol=1e-5, rtol=1e-5, msg=lambda m: f'{case} hidden grad: {m}')
+                out, ref_out, atol=1e-5, rtol=1e-5, msg=lambda m, case=case: f'{case} output: {m}')
+            torch.testing.assert_close(
+                hidden_grad,
+                ref_hidden_grad,
+                atol=1e-5,
+                rtol=1e-5,
+                msg=lambda m, case=case: f'{case} hidden grad: {m}')
             assert param_grads.keys() == ref_grads.keys()
             for name in param_grads:
                 torch.testing.assert_close(
-                    param_grads[name], ref_grads[name], atol=1e-4, rtol=1e-4, msg=lambda m: f'{case} {name}: {m}')
+                    param_grads[name],
+                    ref_grads[name],
+                    atol=1e-4,
+                    rtol=1e-4,
+                    msg=lambda m, case=case, name=name: f'{case} {name}: {m}')
 
             # Negative control: a local-slice gather backward must lose the cross-shard gradient.
             ple_module.gather_from_sequence_parallel_region = _local_slice_backward_gather

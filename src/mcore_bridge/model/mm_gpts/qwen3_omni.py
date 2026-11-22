@@ -2,7 +2,6 @@
 import torch
 
 from mcore_bridge.bridge import GPTBridge
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 from .qwen3_vl import Qwen3VL_Vit, Qwen3VLLoader
@@ -26,7 +25,10 @@ class Qwen3Omni_Vit(HuggingFaceVit):
 
     def prepare_model(self, hf_config):
         from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (
-            Qwen3OmniMoeAudioEncoder, Qwen3OmniMoeThinkerForConditionalGeneration, Qwen3OmniMoeVisionEncoder)
+            Qwen3OmniMoeAudioEncoder,
+            Qwen3OmniMoeThinkerForConditionalGeneration,
+            Qwen3OmniMoeVisionEncoder,
+        )
         self.model_cls = Qwen3OmniMoeThinkerForConditionalGeneration
         self.audio_tower = Qwen3OmniMoeAudioEncoder._from_config(hf_config.thinker_config.audio_config)
         self.visual = Qwen3OmniMoeVisionEncoder._from_config(hf_config.thinker_config.vision_config)

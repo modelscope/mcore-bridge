@@ -1,21 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
+from contextlib import nullcontext
+from typing import List, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine
-from contextlib import nullcontext
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet as _GatedDeltaNet
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules, torch_chunk_gated_delta_rule
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint, sharded_state_dict_default
 from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx_range_push
-from typing import List, Optional
 
 from mcore_bridge.config import ModelConfig
 

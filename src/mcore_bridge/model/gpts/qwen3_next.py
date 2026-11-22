@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from copy import deepcopy
+from typing import Optional, Tuple, Union
+
+import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, _get_extra_te_kwargs
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -8,20 +10,21 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.huggingface import HuggingFaceModule as _HuggingFaceModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_tensor_model_parallel_rank
-from megatron.core.tensor_parallel import (all_gather_last_dim_from_tensor_parallel_region,
-                                           gather_from_sequence_parallel_region, scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel import (
+    all_gather_last_dim_from_tensor_parallel_region,
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.tensor_parallel.random import get_cuda_rng_tracker
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.utils import deprecate_inference_params, is_fa_min_version, nvtx_range_pop, nvtx_range_push
 from transformers.utils import is_torch_npu_available
-from typing import Optional, Tuple, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, get_num_samples
-
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
 
@@ -81,7 +84,7 @@ class Qwen3NextRMSNorm(torch.nn.Module):
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.zeros(hidden_size, dtype=config.params_dtype))
         # Mark weight for SP gradient AllReduce across TP domain (consistent with TENorm/MCoreRMSNorm)
-        setattr(self.weight, 'sequence_parallel', config.sequence_parallel)
+        self.weight.sequence_parallel = config.sequence_parallel
 
     def _norm(self, x):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)

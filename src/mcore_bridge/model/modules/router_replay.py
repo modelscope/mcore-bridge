@@ -21,7 +21,6 @@ With ``replay_mask=None`` on every layer this behaves byte-for-byte like mcore's
 from typing import Callable, List, Optional, Tuple
 
 import torch
-
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 
 

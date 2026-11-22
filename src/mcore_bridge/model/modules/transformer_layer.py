@@ -1,13 +1,17 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
-import torch
 from contextlib import contextmanager
 from functools import partial
+from typing import Optional
+
+import torch
 from megatron.core.extensions.transformer_engine import TEFusedMLP
 from megatron.core.models.common.embeddings import rope_utils
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -18,7 +22,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules, get_transformer_layer_offset
 from megatron.core.utils import get_pg_rank
-from typing import Optional
 
 from mcore_bridge.utils import get_logger, split_cp_inputs
 

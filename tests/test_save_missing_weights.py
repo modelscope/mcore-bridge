@@ -15,9 +15,10 @@ os.environ.setdefault('WORLD_SIZE', '1')
 os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
 os.environ.setdefault('MASTER_PORT', '29513')
 
-import json  # noqa: E402
 import shutil  # noqa: E402
 import tempfile  # noqa: E402
+
+import json  # noqa: E402
 import torch  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 

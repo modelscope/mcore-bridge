@@ -1,6 +1,8 @@
 import inspect
-import peft
 import sys
+from typing import List, Optional, Tuple
+
+import peft
 import torch
 from megatron.core import mpu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -13,7 +15,6 @@ from packaging import version
 from peft.tuners.tuners_utils import BaseTuner
 from torch import nn
 from transformers.utils import is_torch_npu_available
-from typing import List, Optional, Tuple
 
 from mcore_bridge.utils import get_logger, is_flash_attn_3_available
 

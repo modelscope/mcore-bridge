@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import json
 import os
 from functools import partial
-from safetensors.torch import safe_open, save_file
 from typing import Literal
+
+import json
+from safetensors.torch import safe_open, save_file
 
 from .env import is_last_rank, is_master
 

@@ -11,11 +11,12 @@ Two properties are checked:
   * `mtp.*` keys never appear twice under two different naming schemes, which is
     what would happen if Megatron also exported its own `model.mtp.*` weights.
 """
-import json
 import os
-import pytest
 import shutil
 import tempfile
+
+import json
+import pytest
 import torch
 from megatron.core import parallel_state
 from safetensors.torch import load_file, save_file

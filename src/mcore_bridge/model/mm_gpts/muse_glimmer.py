@@ -1,5 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+from typing import Optional, Tuple
+
 import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
@@ -8,10 +10,8 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import build_module
 from torch import Tensor
 from transformers import AutoModel
-from typing import Optional, Tuple
 
 from mcore_bridge.bridge import MultimodalGPTBridge
-
 from ..constant import ModelType
 from ..gpt_model import GPTModel
 from ..mm_gpt_model import MultimodalGPTModel

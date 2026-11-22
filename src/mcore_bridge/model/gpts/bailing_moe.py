@@ -4,7 +4,6 @@ import torch.distributed as dist
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 

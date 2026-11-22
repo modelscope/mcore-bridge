@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch.nn.functional as F
 from functools import partial
+from typing import Any, Dict, Tuple
+
+import torch.nn.functional as F
 from megatron.core.activations import squared_relu
 from transformers import PretrainedConfig
-from typing import Any, Dict, Tuple
 
 from mcore_bridge.utils import get_env_args
 

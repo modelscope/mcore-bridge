@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import inspect
+from copy import deepcopy
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from copy import deepcopy
 from transformers import PretrainedConfig
-from typing import Optional
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import get_logger
-
 from ..constant import ModelType
 from ..mm_gpt_model import MultimodalGPTModel
 from ..mtp import get_mtp_capabilities, get_physical_mtp_depth
@@ -22,8 +22,9 @@ try:
     from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern, select_pipeline_segment
     from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
     from megatron.core.transformer.module import mark_keep_in_fp32
-    from megatron.core.transformer.multi_token_prediction import \
-        MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer
+    from megatron.core.transformer.multi_token_prediction import (
+        MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer,
+    )
 
     from ..hybrid_model import HybridModel
 except ImportError:

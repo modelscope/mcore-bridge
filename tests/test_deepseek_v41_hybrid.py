@@ -5,9 +5,12 @@ Pure logic, no GPU / distributed init required.
 """
 import pytest  # noqa: E402
 
-from mcore_bridge.model.gpts.deepseek_v41 import DeepseekV41HyperConnectionHybridLayer  # noqa: E402
-from mcore_bridge.model.gpts.deepseek_v41 import (HybridLayerConfig, HyperConnectionHybridLayer,
-                                                  derive_hybrid_layer_config)
+from mcore_bridge.model.gpts.deepseek_v41 import (
+    DeepseekV41HyperConnectionHybridLayer,  # noqa: E402
+    HybridLayerConfig,
+    HyperConnectionHybridLayer,
+    derive_hybrid_layer_config,
+)
 
 
 def test_tiny_all_moe_zero_ratio():
@@ -216,9 +219,10 @@ def test_hc_wrapper_applies_engram_on_nstream_before_delegating():
     # the n-stream Engram delta to ``hidden_states`` BEFORE delegating to the base wrapper forward
     # (aggregation + fast-path attention), so the delta lands on the pre-aggregation streams.
     # A plain inner layer delegates unchanged with no Engram add.
-    import torch
     from types import SimpleNamespace
     from unittest.mock import patch
+
+    import torch
 
     # Engram-carrying layer: a constant unit delta is added, so the tensor handed to the base
     # forward is the input plus that delta.
@@ -246,9 +250,10 @@ def test_hc_wrapper_applies_engram_on_nstream_before_delegating():
 def test_hc_wrapper_requires_input_ids_for_engram_layer():
     # An Engram layer cannot run without token IDs (needed for the n-gram hash), so forward
     # raises rather than silently dropping the Engram contribution.
+    from types import SimpleNamespace
+
     import pytest
     import torch
-    from types import SimpleNamespace
 
     engram_layer = object.__new__(DeepseekV41HyperConnectionHybridLayer)
     engram_layer.inner_layer = SimpleNamespace(engram=lambda *a, **k: 0)
@@ -463,8 +468,9 @@ def test_hybrid_convert_additional_layers_export_uses_proxy_on_non_last_stage():
 
 
 def test_hybrid_convert_additional_layers_raises_on_last_stage_without_stack():
-    import pytest
     from types import SimpleNamespace
+
+    import pytest
 
     bridge, _ = _dspark_bridge()
     mg_model = SimpleNamespace()  # last stage but stack missing -> misbuilt model

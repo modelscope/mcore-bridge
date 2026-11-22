@@ -1,13 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from copy import deepcopy
+from typing import Optional
+
+import torch
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from transformers import PretrainedConfig
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
-
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
 from .utils import HuggingFaceVit
@@ -19,8 +19,11 @@ class Llama4Vit(HuggingFaceVit):
     _aligner = ['multi_modal_projector']
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from transformers.models.llama4.modeling_llama4 import (Llama4ForConditionalGeneration,
-                                                                Llama4MultiModalProjector, Llama4VisionModel)
+        from transformers.models.llama4.modeling_llama4 import (
+            Llama4ForConditionalGeneration,
+            Llama4MultiModalProjector,
+            Llama4VisionModel,
+        )
         self.vision_model = Llama4VisionModel._from_config(hf_config.vision_config)
         self.multi_modal_projector = Llama4MultiModalProjector(hf_config).to(self.vision_model.dtype)
         self.model_cls = Llama4ForConditionalGeneration

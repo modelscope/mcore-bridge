@@ -4,7 +4,6 @@ from megatron.core import parallel_state
 
 from mcore_bridge.bridge import MultimodalGPTBridge
 from mcore_bridge.utils import split_cp_inputs
-
 from ..constant import ModelType
 from ..modules import TransformerBlock
 from ..register import ModelLoader, ModelMeta, register_model

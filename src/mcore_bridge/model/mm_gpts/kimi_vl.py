@@ -4,7 +4,6 @@ from transformers import PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from mcore_bridge.bridge import MultimodalGPTBridge
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit

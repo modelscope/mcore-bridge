@@ -20,12 +20,13 @@ the toggle goes missing.
 Runs on ``gloo`` (CPU), so it needs no GPU.
 """
 import os
+import types
+
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn as nn
-import types
 
 TP = 2
 PROJECTIONS = ('in_proj', 'in_proj_qkvz', 'in_proj_ba', 'out_proj')

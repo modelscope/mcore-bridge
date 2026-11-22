@@ -1,0 +1,14 @@
+line-length = 120
+target-version = "py38"
+exclude = ["build", "*.pyi", ".git"]
+
+[lint]
+select = ["B", "E", "F", "W", "I"]
+ignore = ["F401", "F403", "F405", "F821", "E251"]
+
+[lint.isort]
+known-first-party = ["mcore_bridge"]
+known-third-party = ["json", "yaml"]
+extra-standard-library = ["setuptools"]
+no-lines-before = ["standard-library", "local-folder"]
+default-section = "third-party"

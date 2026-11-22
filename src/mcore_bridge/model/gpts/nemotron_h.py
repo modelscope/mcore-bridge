@@ -6,6 +6,8 @@ Upstream deprecated `GPTModel` in favour of `HybridModel` (Megatron-LM #5911). O
 `MambaLayer` compat shim that a `GPTModel` build would need are both unnecessary here,
 and MTP can span several heterogeneous inner layers.
 """
+from typing import Optional
+
 import torch
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
@@ -14,12 +16,10 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import deep_getattr, get_logger
-
 from ..constant import ModelType
 from ..hybrid_model import HybridModel
 from ..register import ModelLoader, ModelMeta, register_model

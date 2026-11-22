@@ -1,17 +1,25 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import warnings
+from contextlib import contextmanager, nullcontext
+from typing import Any, List, Optional, Tuple
+
 import peft
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine
-import warnings
-from contextlib import contextmanager, nullcontext
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.extensions.transformer_engine import (TEColumnParallelGroupedLinear, TEColumnParallelLinear,
-                                                         TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear,
-                                                         TERowParallelGroupedLinear, TERowParallelLinear)
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelGroupedLinear,
+    TEColumnParallelLinear,
+    TEGroupedLinear,
+    TELayerNormColumnParallelLinear,
+    TELinear,
+    TERowParallelGroupedLinear,
+    TERowParallelLinear,
+)
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.parallel_state import get_expert_tensor_parallel_world_size, get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -24,10 +32,8 @@ from peft.tuners.lora.layer import LoraLayer
 from peft.tuners.tuners_utils import check_adapters_to_merge
 from peft.utils.other import transpose
 from transformers.utils import is_torch_npu_available
-from typing import Any, List, Optional, Tuple
 
 from mcore_bridge.utils import get_current_device
-
 from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
@@ -468,7 +474,7 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
                             sharded_state_dict[k] = apply_swiglu_sharded_factory(sharded_state_dict[k],
                                                                                  new_sharded_offsets)
             else:
-                for k, v in sharded_state_dict.items():
+                for k, _v in sharded_state_dict.items():
                     if k in [f'{prefix}base_layer.weight', f'{prefix}base_layer.bias']:
                         sharded_state_dict[k] = apply_swiglu_sharded_factory(sharded_state_dict[k], sharded_offsets)
         return sharded_state_dict

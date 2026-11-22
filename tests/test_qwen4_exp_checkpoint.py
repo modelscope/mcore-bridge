@@ -2,18 +2,22 @@
 
 import hashlib
 import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
 import json
 import pytest
 import torch
-from pathlib import Path
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import PretrainedConfig
-from types import SimpleNamespace
 
 from mcore_bridge.utils import qwen4_exp_checkpoint as mcore_bridge_checkpoint
-from mcore_bridge.utils.qwen4_exp_checkpoint import (qwen4_exp_export_config, restore_qwen4_exp_fixed_assets,
-                                                     validate_ple_checkpoint)
+from mcore_bridge.utils.qwen4_exp_checkpoint import (
+    qwen4_exp_export_config,
+    restore_qwen4_exp_fixed_assets,
+    validate_ple_checkpoint,
+)
 
 LAYERS_PREFIX = 'model.language_model.layers'
 PLE_PREFIX = f"{LAYERS_PREFIX}.1.ple.ple_embedding."

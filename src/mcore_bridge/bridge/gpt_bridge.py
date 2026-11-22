@@ -2,10 +2,12 @@
 import math
 import os
 import re
+from contextlib import contextmanager
+from typing import Callable, List, Optional, Union
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from contextlib import contextmanager
 from megatron.core import mpu
 from megatron.core.utils import unwrap_model
 from peft import PeftModel
@@ -13,12 +15,19 @@ from peft.utils import ModulesToSaveWrapper
 from tqdm import tqdm
 from transformers import PreTrainedModel
 from transformers.utils import ContextManagers
-from typing import Callable, List, Optional, Union
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.tuners import LoraParallelLinear
-from mcore_bridge.utils import (MxFp4Dequantizer, PackedDequantizer, SafetensorLazyLoader, StreamingSafetensorSaver,
-                                deep_getattr, gc_collect, get_logger, is_master)
+from mcore_bridge.utils import (
+    MxFp4Dequantizer,
+    PackedDequantizer,
+    SafetensorLazyLoader,
+    StreamingSafetensorSaver,
+    deep_getattr,
+    gc_collect,
+    get_logger,
+    is_master,
+)
 from mcore_bridge.utils.constants import EXPORT_CHUNK_BYTES
 
 logger = get_logger()
@@ -1861,7 +1870,7 @@ class GPTBridge:
                     alpha = None
                     if hyper_connection is not None:
                         alpha = []
-                        for i, alpha_suffix in enumerate(['pre', 'post', 'res']):
+                        for alpha_suffix in ['pre', 'post', 'res']:
                             alpha.append(getattr(hyper_connection, f'alpha_{alpha_suffix}', None))
                         alpha = torch.concat(alpha, dim=0)
                     hf_state_dict[f'hc_{hf_key}_scale'] = self._get_weight(alpha, 'alpha')[0]
@@ -1884,7 +1893,7 @@ class GPTBridge:
         return hf_state_dict
 
     def _set_word_embeddings(self, mg_model, hf_state_dict, to_mcore):
-        lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+        lm_model = mg_model.language_model if self.is_multimodal else mg_model
         self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key, to_mcore)
 
     def _convert_pre_process(self, mg_model, hf_state_dict, hf_prefix: str, to_mcore):
@@ -1918,7 +1927,7 @@ class GPTBridge:
             hf_state_dict = self._remove_prefix(hf_state_dict, hf_prefix)
         else:
             hf_state_dict = {}
-        lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+        lm_model = mg_model.language_model if self.is_multimodal else mg_model
         if self.config.task_type != 'embedding':
             if self.config.task_type == 'seq_cls':
                 # A seq_cls head is a distinct [num_labels, hidden] classifier that is NEVER tied to the vocab
@@ -1985,7 +1994,7 @@ class GPTBridge:
         disable_tqdm = self._disable_tqdm or not is_master()
         prog_bar = tqdm(range(self.config.num_layers), dynamic_ncols=True, desc=tqdm_desc, disable=disable_tqdm)
         while layer_idx < self.config.num_layers:
-            lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+            lm_model = mg_model.language_model if self.is_multimodal else mg_model
             if len(lm_model.decoder.layers) > 0:
                 start_idx = lm_model.decoder.layers[0].layer_number - 1
                 mg_layer_available = (start_idx <= layer_idx < lm_model.decoder.layers[-1].layer_number)
@@ -2021,7 +2030,7 @@ class GPTBridge:
                 hf_state_dict = {}
 
         if (not to_mcore or is_pp_last_stage) and self.config.mtp_num_layers:
-            lm_model = getattr(mg_model, 'language_model') if self.is_multimodal else mg_model
+            lm_model = mg_model.language_model if self.is_multimodal else mg_model
             if to_mcore and self.pp_rank > 0:
                 self._set_state_dict(lm_model, 'embedding.word_embeddings.weight', hf_state_dict, self.hf_embed_key,
                                      to_mcore)

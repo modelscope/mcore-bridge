@@ -1,15 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import inspect
 import math
+from typing import Optional
+
 import torch
 from megatron.core import mpu
 from megatron.core.models.hybrid.hybrid_model import HybridModel as McoreHybridModel
 from megatron.core.transformer.spec_utils import ModuleSpec
-from typing import Optional
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import split_cp_inputs
-
 from .mtp import get_physical_mtp_depth
 
 

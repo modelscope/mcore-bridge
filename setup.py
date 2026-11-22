@@ -1,7 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-from setuptools import find_packages, setup
-
 import re
+from setuptools import find_packages, setup
 
 
 def get_readme():

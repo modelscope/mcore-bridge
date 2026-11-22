@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # The gate-precision and KPool cases are adapted from Megatron-LM #7054 / be805e55 (NVIDIA license).
 import copy
+
 import pytest
 import torch
 from megatron.core import parallel_state
@@ -324,12 +325,13 @@ def test_bf16_wrapper_keeps_glm_router_state_in_fp32():
 def test_tp2_fp32_parameter_gradients_match_hf(monkeypatch):
     """Compares gradient values directly, telling a backward-compute error from grad_norm statistics."""
     import importlib
-    import json
     import os
+    from types import SimpleNamespace
+
+    import json
     import triton.language as tl
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig, finalize_model_grads
     from test_glm5_next import _build_parity_models, _checkpoint_state, _hf_logits, _model_inputs
-    from types import SimpleNamespace
 
     if os.environ.get('GLM5_PARALLEL_TEST') != 'tp2':
         pytest.skip('run with GLM5_PARALLEL_TEST=tp2 torchrun --nproc-per-node=2')

@@ -1,9 +1,11 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
 import os
+from collections import OrderedDict
+from typing import Optional, Tuple
+
 import torch
 import torch.nn.functional as F
-from collections import OrderedDict
 from megatron.core import mpu, parallel_state
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -13,18 +15,18 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEm
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.gpt import GPTModel as McoreGPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.mappings import (copy_to_tensor_model_parallel_region,
-                                                    gather_from_sequence_parallel_region,
-                                                    reduce_from_tensor_model_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    copy_to_tensor_model_parallel_region,
+    gather_from_sequence_parallel_region,
+    reduce_from_tensor_model_parallel_region,
+)
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
-from typing import Optional, Tuple
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger, split_cp_inputs
-
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
@@ -139,9 +141,9 @@ class GPTModel(McoreGPTModel):
                 if not hasattr(layer, 'transformer_layer'):
 
                     def _value(self):
-                        return getattr(self, 'mtp_model_layer')
+                        return self.mtp_model_layer
 
-                    setattr(layer.__class__, 'transformer_layer', property(_value))
+                    layer.__class__.transformer_layer = property(_value)
                 attention = layer.transformer_layer.self_attention
                 attention.config = copy.copy(attention.config)
                 attention.config.apply_rope_fusion = False

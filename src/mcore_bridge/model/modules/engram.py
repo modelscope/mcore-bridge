@@ -2,6 +2,7 @@
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
 import dataclasses
+
 import torch
 from torch import Tensor
 
@@ -11,8 +12,11 @@ try:
     from megatron.core import mpu
     from megatron.core.models.engram.config import EngramConfig
     from megatron.core.models.engram.engram import Engram
-    from megatron.core.models.engram.hashing import (compress_token_ids, shift_right_reset_at_eos,
-                                                     slice_hashes_for_sequence_parallel)
+    from megatron.core.models.engram.hashing import (
+        compress_token_ids,
+        shift_right_reset_at_eos,
+        slice_hashes_for_sequence_parallel,
+    )
     from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer, TransformerLayer
     from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
 except ImportError:

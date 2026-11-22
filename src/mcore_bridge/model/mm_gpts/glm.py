@@ -2,7 +2,6 @@
 from transformers import PretrainedConfig
 
 from mcore_bridge.bridge import MultimodalGPTBridge
-
 from ..constant import ModelType
 from ..gpts.glm4 import Glm4Bridge, Glm4Loader
 from ..register import ModelMeta, register_model

@@ -17,8 +17,11 @@ class MiniCPMV46Vit(HuggingFaceVit):
     _aligner = ['merger']
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from transformers.models.minicpmv4_6.modeling_minicpmv4_6 import (MiniCPMV4_6Merger, MiniCPMV4_6Model,
-                                                                          MiniCPMV4_6VisionModel)
+        from transformers.models.minicpmv4_6.modeling_minicpmv4_6 import (
+            MiniCPMV4_6Merger,
+            MiniCPMV4_6Model,
+            MiniCPMV4_6VisionModel,
+        )
         self.vision_tower = MiniCPMV4_6VisionModel._from_config(hf_config.vision_config)
         self.merger = MiniCPMV4_6Merger(hf_config).to(dtype=self.vision_tower.dtype)
         self.model_cls = MiniCPMV4_6Model

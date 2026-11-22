@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+from contextlib import contextmanager
+from typing import Optional
+
 import torch
 import transformer_engine.pytorch as te
-from contextlib import contextmanager
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.utils import Fp8Dequantizer, fp4_to_fp8
-
 from ..constant import ModelType
 from ..gpt_model import GPTModel
 from ..modules.compressor import Compressor, CSAIndexer
@@ -18,10 +18,12 @@ from ..register import ModelLoader, ModelMeta, register_model
 from ..rope import get_rope_inv_freq
 
 try:
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import \
-        FineGrainedActivationOffloadingInterface as off_interface
-    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import \
-        DSv4HybridSelfAttention as McoreDSv4HybridSelfAttention
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        FineGrainedActivationOffloadingInterface as off_interface,
+    )
+    from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
+        DSv4HybridSelfAttention as McoreDSv4HybridSelfAttention,
+    )
     from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import _q_rms_norm
     from megatron.core.typed_torch import apply_module
 except ImportError:
@@ -531,8 +533,9 @@ class DeepseekV4Loader(ModelLoader):
     model_cls = DeepseekV4GPTModel
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
         transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
         for layer_spec in transformer_layer_spec.layer_specs:
             layer_spec.submodules.self_attention.module = DSv4HybridSelfAttention

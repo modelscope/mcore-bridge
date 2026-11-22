@@ -2,9 +2,11 @@ import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    gather_from_tensor_model_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.utils import deprecate_inference_params
 

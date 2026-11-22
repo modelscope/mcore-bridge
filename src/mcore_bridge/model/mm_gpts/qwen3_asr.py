@@ -3,7 +3,6 @@ import torch
 from transformers import PretrainedConfig
 
 from mcore_bridge.bridge import MultimodalGPTBridge
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
@@ -25,8 +24,10 @@ class Qwen3ASRVit(HuggingFaceVit):
     media_input_keys = ('input_features',)
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (Qwen3ASRAudioEncoder,
-                                                                           Qwen3ASRThinkerForConditionalGeneration)
+        from qwen_asr.core.transformers_backend.modeling_qwen3_asr import (
+            Qwen3ASRAudioEncoder,
+            Qwen3ASRThinkerForConditionalGeneration,
+        )
         self.audio_tower = Qwen3ASRAudioEncoder._from_config(hf_config.thinker_config.audio_config)
         self.model_cls = Qwen3ASRThinkerForConditionalGeneration
 

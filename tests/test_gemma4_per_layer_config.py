@@ -2,9 +2,10 @@
 """Gemma 4 attention dims must be read the same way before and after transformers 5.15 (per-layer configs).
 The parser functions are loaded from source so most cases run on CPU without Transformer Engine."""
 import ast
-import pytest
 from pathlib import Path
 from typing import Any, Dict, Tuple
+
+import pytest
 
 gemma4_config = pytest.importorskip('transformers.models.gemma4.configuration_gemma4')
 

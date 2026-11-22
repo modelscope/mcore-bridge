@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from contextlib import contextmanager
+from typing import Optional
+
+import torch
 from megatron.core import InferenceParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import VocabParallelEmbedding, scatter_to_sequence_parallel_region
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
-from typing import Optional
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import reconstruct_tensor_cp, split_cp_inputs
-
 from .gpt_model import GPTModel
 
 

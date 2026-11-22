@@ -11,7 +11,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from packaging import version
 
 from mcore_bridge.utils import get_env_args
-
 from ..constant import ModelType
 from ..gpts.qwen3_next import Qwen3NextBridge, Qwen3NextLoader, resolve_gdn_attention_mask
 from ..register import ModelMeta, register_model

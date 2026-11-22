@@ -1,6 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from typing import Optional, Sequence, Tuple, Union
+
+import torch
 
 
 class Fp8Dequantizer:

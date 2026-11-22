@@ -4,12 +4,13 @@
 Process groups and collectives are simulated; these are not multi-GPU or
 checkpoint save/load integration tests.
 """
+from unittest.mock import Mock
+
 import pytest
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.tensor_parallel import VocabParallelEmbedding
-from unittest.mock import Mock
 
 from mcore_bridge.model.modules.ple import Qwen4ExpTextNGramEmbedding, Qwen4ExpTextPLELayer
 

@@ -1,16 +1,16 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
+from typing import Optional
+
 import torch
 import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm
 from megatron.core.transformer.attention import SelfAttention
 from transformers.utils import is_torch_npu_available
-from typing import Optional
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.tuners import LoraParallelLinear
 from mcore_bridge.utils import get_env_args
-
 from ..constant import ModelType
 from ..modules import GatedDeltaNet, GatedSelfAttention
 from ..register import ModelLoader, ModelMeta, register_model
@@ -116,8 +116,9 @@ class Qwen3NextLoader(ModelLoader):
     gated_delta_net = GatedDeltaNet
 
     def get_transformer_layer_spec(self, vp_stage: Optional[int] = None):
-        from megatron.core.models.gpt.experimental_attention_variant_module_specs import \
-            get_transformer_block_with_experimental_attention_variant_spec
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_block_with_experimental_attention_variant_spec,
+        )
         layer_specs = get_transformer_block_with_experimental_attention_variant_spec(self.config, vp_stage)
         for layer_spec in layer_specs.layer_specs:
             attn_module = layer_spec.submodules.self_attention.module

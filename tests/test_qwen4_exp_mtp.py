@@ -10,10 +10,11 @@ sbhd/bool-mask path, so its params legitimately carry no gradient there -- exact
 full-attention indexer does -- and are excluded from the grad-flow assertion.
 """
 import os
-import pytest
-import torch
 import uuid
 from contextlib import contextmanager
+
+import pytest
+import torch
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 

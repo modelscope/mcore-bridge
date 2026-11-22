@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import torch
 from contextlib import nullcontext
+from typing import List, Optional, Set, Union, cast
+
+import torch
 from megatron.core import tensor_parallel
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import te_checkpoint
@@ -12,7 +14,6 @@ from megatron.core.transformer.transformer_block import TransformerBlock as Mcor
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, get_pg_rank, make_viewless_tensor
-from typing import List, Optional, Set, Union, cast
 
 try:
     from megatron.core.transformer.hyper_connection import HyperConnectionModule, learned_output_contract

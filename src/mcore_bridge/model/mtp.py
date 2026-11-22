@@ -1,20 +1,20 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from __future__ import annotations
-
 import copy
 import inspect
-import torch
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import torch
 from megatron.core.transformer import multi_token_prediction as _mtp_mod
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock as McoreMultiTokenPredictionBlock
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer as McoreMultiTokenPredictionLayer
 from megatron.core.transformer.multi_token_prediction import get_mtp_layer_offset
 from megatron.core.transformer.multi_token_prediction import process_mtp_loss as _upstream_process_mtp_loss
 from megatron.core.transformer.multi_token_prediction import roll_tensor as _upstream_roll_tensor
-from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from mcore_bridge.utils import get_logger
 
@@ -368,8 +368,10 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
         dec = values[-2]
 
         if pre is not None:
-            from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                                scatter_to_sequence_parallel_region)
+            from megatron.core.tensor_parallel.mappings import (
+                gather_from_sequence_parallel_region,
+                scatter_to_sequence_parallel_region,
+            )
             sp = (self.config.sequence_parallel and self.config.tensor_model_parallel_size > 1)
             rolled = pre
             if sp:
@@ -501,7 +503,8 @@ class MultiTokenPredictionLayer(McoreMultiTokenPredictionLayer):
                 return checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
-            warnings.warn("recompute_method == 'block' is not supported for MTP yet. Skipping recompute.")
+            warnings.warn(
+                "recompute_method == 'block' is not supported for MTP yet. Skipping recompute.", stacklevel=2)
             return custom_forward(*flat_tensors)
         raise ValueError('Invalid activation recompute method.')
 

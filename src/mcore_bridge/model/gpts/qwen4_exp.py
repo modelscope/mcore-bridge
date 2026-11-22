@@ -1,19 +1,23 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import math
+from contextlib import contextmanager
+from copy import deepcopy
+from typing import List, Optional
+
 import megatron.core
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from contextlib import contextmanager
-from copy import deepcopy
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TENorm, TERowParallelLinear
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec, get_gpt_mtp_block_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.gated_delta_net import GatedDeltaNetSubmodules
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
-from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -21,14 +25,21 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from megatron.core.utils import make_viewless_tensor
 from torch import nn
 from transformers.utils import is_torch_npu_available
-from typing import List, Optional
 
 from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
-
-from ..modules import (QSA_SPARSE_KERNEL_ENV, GatedDeltaNet, QSAIndexer, QSASparseCoreAttention,
-                       Qwen4ExpTextGatedResidual, Qwen4ExpTextPLELayer, TransformerBlock, TransformerLayer,
-                       qsa_sparse_supported, use_qsa_sparse_kernel)
+from ..modules import (
+    QSA_SPARSE_KERNEL_ENV,
+    GatedDeltaNet,
+    QSAIndexer,
+    QSASparseCoreAttention,
+    Qwen4ExpTextGatedResidual,
+    Qwen4ExpTextPLELayer,
+    TransformerBlock,
+    TransformerLayer,
+    qsa_sparse_supported,
+    use_qsa_sparse_kernel,
+)
 from ..modules.ple import Qwen4ExpTextNGramEmbedding
 from ..mtp import MultiTokenPredictionLayer
 from ..register import ModelLoader

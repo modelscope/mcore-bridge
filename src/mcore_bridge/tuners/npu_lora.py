@@ -1,4 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from typing import Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,7 +9,6 @@ from megatron.core.extensions.transformer_engine import TEGroupedLinear
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import make_sharded_tensor_for_checkpoint
 from transformers.utils import is_torch_npu_available
-from typing import Optional, Tuple
 
 from mcore_bridge.utils import get_current_device
 

@@ -2,11 +2,14 @@ import torch
 from megatron.core import tensor_parallel
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    gather_from_tensor_model_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import \
-    AbsorbedMLASelfAttention as McoreAbsorbedMLASelfAttention
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    gather_from_tensor_model_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention as McoreAbsorbedMLASelfAttention,
+)
 from megatron.core.utils import deprecate_inference_params
 
 
@@ -240,7 +243,9 @@ class AbsorbedMLASelfAttention(McoreAbsorbedMLASelfAttention):
         inference_params=None,
     ):
         from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-            _apply_absorbed_v_up_projection, _restore_packed_thd_batch_dim)
+            _apply_absorbed_v_up_projection,
+            _restore_packed_thd_batch_dim,
+        )
         """Forward pass for multi-latent attention with matrix absorption"""
         assert attention_bias is None, 'Attention bias should not be passed into MLA.'
         assert (rotary_pos_cos is None and rotary_pos_sin is None), 'MLA does not support Flash Decoding'

@@ -1,9 +1,10 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+from typing import Tuple
+
 import torch
 import torch.nn.functional as F
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
-from typing import Tuple
 
 
 def _duplicated_linear(config, input_size: int, output_size: int) -> TELinear:
@@ -34,7 +35,7 @@ class Qwen4ExpTextGroupedRMSNorm(nn.Module):
         self.group_size = group_size
         if dim % group_size != 0:
             raise ValueError(f'hidden_size ({dim}) must be divisible by group_size ({group_size}).')
-        setattr(self.weight, 'sequence_parallel', sequence_parallel)
+        self.weight.sequence_parallel = sequence_parallel
 
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         x = x.reshape(*x.shape[:-1], -1, self.group_size)
@@ -80,7 +81,7 @@ class Qwen4ExpTextGatedResidual(nn.Module):
         self.block_inject_weight = _duplicated_linear(config, hc_hidden_size, self.hc_count) if use_combine else None
         # mcore-specific: SP grad flag on the replicated weights.
         for param in self.parameters():
-            setattr(param, 'sequence_parallel', config.sequence_parallel)
+            param.sequence_parallel = config.sequence_parallel
 
     def forward(self, hyper_input: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         # Mirrors transformers `Qwen4ExpTextGatedResidual.forward` line by line.

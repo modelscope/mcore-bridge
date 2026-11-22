@@ -2,10 +2,11 @@
 import importlib.util
 import math
 import os
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
-from pathlib import Path
 
 _KERNEL_PATH = Path(__file__).parents[1] / 'src/mcore_bridge/model/modules/kernels/ple_kernels.py'
 _spec = importlib.util.spec_from_file_location('ple_kernels_under_test', _KERNEL_PATH)

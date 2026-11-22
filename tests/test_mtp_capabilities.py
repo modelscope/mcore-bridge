@@ -6,13 +6,19 @@ block must stay unpatched, model-specific layer specs must survive adaptation,
 the construction-time class patch must be restored, and the loss/extras hooks
 must keep their documented behaviour.
 """
-import torch
 from types import SimpleNamespace
+
+import torch
 
 import mcore_bridge  # noqa: F401  (ensures apply_patch ran at import)
 from mcore_bridge.model import mtp as mtp_mod
-from mcore_bridge.model.mtp import (MultiTokenPredictionBlock, MultiTokenPredictionLayer, adapt_mtp_block_spec,
-                                    get_mtp_capabilities, prepare_mtp_loss_mask)
+from mcore_bridge.model.mtp import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
+    adapt_mtp_block_spec,
+    get_mtp_capabilities,
+    prepare_mtp_loss_mask,
+)
 
 
 def test_import_does_not_globally_patch_upstream_block():

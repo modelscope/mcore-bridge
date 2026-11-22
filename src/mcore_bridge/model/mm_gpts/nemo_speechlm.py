@@ -2,15 +2,15 @@
 """Nemotron Transcribe with a replicated audio tower and a Nemotron-H backbone."""
 import os
 import re
-import torch
 from dataclasses import dataclass
 from functools import lru_cache, partial
-from transformers import PretrainedConfig
 from typing import Optional
+
+import torch
+from transformers import PretrainedConfig
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils.safetensors import LazyTensor
-
 from ..constant import ModelType
 from ..gpts.nemotron_h import NemotronHBridge, NemotronHLoader
 from ..hybrid_model import HybridModel

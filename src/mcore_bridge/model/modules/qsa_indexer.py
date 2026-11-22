@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+
 import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
@@ -17,7 +18,7 @@ class Qwen4ExpTextRMSNorm(nn.Module):
         self.eps = eps
         self.weight = nn.Parameter(torch.zeros(dim, dtype=dtype))
         # Replicated across TP; reduce grads across TP when SP is on.
-        setattr(self.weight, 'sequence_parallel', sequence_parallel)
+        self.weight.sequence_parallel = sequence_parallel
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = x.float()
@@ -152,7 +153,7 @@ class QSAIndexer(nn.Module):
             eps=config.layernorm_epsilon,
             dtype=config.params_dtype,
             sequence_parallel=config.sequence_parallel)
-        setattr(self.index_qk_proj.weight, 'sequence_parallel', config.sequence_parallel)
+        self.index_qk_proj.weight.sequence_parallel = config.sequence_parallel
         # QSA selection is non-differentiable and always runs without autograd.
         # Keep its pretrained parameters out of optimizer groups and DDP buckets.
         self.requires_grad_(False)

@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from mcore_bridge.utils import get_env_args
-
 from ..constant import ModelType
 from ..gpts.qwen3_next_gdn import Qwen3NextGDNBridgeMixin, Qwen3NextLoader
 from ..register import ModelMeta, register_model

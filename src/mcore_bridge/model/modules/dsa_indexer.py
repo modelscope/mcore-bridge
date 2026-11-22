@@ -1,3 +1,5 @@
+from typing import Optional, Tuple
+
 import torch
 import transformer_engine
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
@@ -6,7 +8,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.spec_utils import build_module
-from typing import Optional, Tuple
 
 
 class DSAIndexer(McoreDSAIndexer):

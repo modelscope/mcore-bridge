@@ -1,10 +1,11 @@
 import copy
-import json
 import os
 from contextlib import contextmanager
+from typing import Callable, Dict, Optional, TypeVar, Union
+
+import json
 from torch import nn
 from transformers.utils import strtobool
-from typing import Callable, Dict, Optional, TypeVar, Union
 
 from .logger import get_logger
 

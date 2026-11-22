@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate Qwen4-Exp PLE assets and complete HF text-training checkpoints."""
 from __future__ import annotations
-
 import hashlib
-import json
 import os
 import re
 import struct
 import tempfile
-import torch
 from collections.abc import Collection
 from contextlib import ExitStack
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
+
+import json
+import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
-from typing import Any
 
 _VISION_PREFIX = 'model.visual.'
 _MTP_PREFIXES = ('mtp.', )

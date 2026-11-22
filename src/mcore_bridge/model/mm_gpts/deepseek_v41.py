@@ -30,11 +30,12 @@ registered at all (see ``_HYBRID_MODEL_AVAILABLE``).
 """
 import copy
 import os
+from dataclasses import dataclass
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import transformer_engine
-from dataclasses import dataclass
 from megatron.core import mpu, parallel_state
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.tensor_parallel.layers import VocabParallelEmbedding
@@ -49,19 +50,23 @@ except ImportError:
         return tensor
 
 
+from types import SimpleNamespace
+from typing import List, Optional, Sequence, Union
+
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_block import TransformerBlock as McoreTransformerBlock
 from torch import nn
 from tqdm import tqdm
-from types import SimpleNamespace
-from typing import List, Optional, Sequence, Union
 
 from mcore_bridge.config import MLAModelConfig
 from mcore_bridge.model.modules.dspark import DeepseekV41DSparkStack
-from mcore_bridge.model.modules.engram import (DeepseekV41Engram, DeepseekV41TransformerLayer,
-                                               build_deepseek_v41_engram_config, has_native_engram)
+from mcore_bridge.model.modules.engram import (
+    DeepseekV41Engram,
+    DeepseekV41TransformerLayer,
+    build_deepseek_v41_engram_config,
+    has_native_engram,
+)
 from mcore_bridge.utils import is_master
-
 from ..constant import ModelType
 from ..gpts.deepseek_v4 import DeepseekV4Bridge, DeepseekV4Loader, DSv4HybridSelfAttention, _apply_mla_rope
 from ..mm_gpt_model import MultimodalGPTModel
@@ -1071,6 +1076,7 @@ class DeepseekV41Loader(DeepseekV4Loader):
     @staticmethod
     def _replace_hybrid_router(spec):
         from functools import partial
+
         from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 
         from ..modules import TopKRouter
@@ -1198,7 +1204,9 @@ class DeepseekV41Loader(DeepseekV4Loader):
 
     def get_dspark_layer_spec(self):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            _get_backend_spec_provider, get_transformer_layer_with_experimental_attention_variant_spec)
+            _get_backend_spec_provider,
+            get_transformer_layer_with_experimental_attention_variant_spec,
+        )
 
         dspark_config = copy.copy(self.config)
         dspark_config.hf_config = getattr(self.config.hf_config, 'text_config', self.config.hf_config)

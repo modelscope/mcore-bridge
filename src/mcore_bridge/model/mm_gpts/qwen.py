@@ -6,7 +6,6 @@ from transformers.dynamic_module_utils import get_class_from_dynamic_module
 
 from mcore_bridge.bridge import GPTBridge, MultimodalGPTBridge
 from mcore_bridge.utils import get_env_args
-
 from ..constant import ModelType
 from ..register import ModelMeta, register_model
 from .utils import HuggingFaceVit
@@ -20,11 +19,13 @@ class Qwen2_5VL_Vit(HuggingFaceVit):
 
     def prepare_model(self, hf_config: PretrainedConfig):
         if self.version == 'v2_5':
-            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import \
-                Qwen2_5_VisionTransformerPretrainedModel as VisionModel
+            from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+                Qwen2_5_VisionTransformerPretrainedModel as VisionModel,
+            )
         elif self.version == 'v2':
-            from transformers.models.qwen2_vl.modeling_qwen2_vl import \
-                Qwen2VisionTransformerPretrainedModel as VisionModel
+            from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+                Qwen2VisionTransformerPretrainedModel as VisionModel,
+            )
         self.visual = VisionModel._from_config(hf_config.vision_config)
 
     def get_inputs_embeds(self, inputs_embeds, **kwargs):
@@ -76,9 +77,11 @@ class Qwen2_5Omni_Vit(HuggingFaceVit):
     _generator = ['talker', 'token2wav']
 
     def prepare_model(self, hf_config: PretrainedConfig):
-        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (Qwen2_5OmniAudioEncoder,
-                                                                            Qwen2_5OmniThinkerForConditionalGeneration,
-                                                                            Qwen2_5OmniVisionEncoder)
+        from transformers.models.qwen2_5_omni.modeling_qwen2_5_omni import (
+            Qwen2_5OmniAudioEncoder,
+            Qwen2_5OmniThinkerForConditionalGeneration,
+            Qwen2_5OmniVisionEncoder,
+        )
         self.audio_tower = Qwen2_5OmniAudioEncoder._from_config(hf_config.thinker_config.audio_config)
         self.visual = Qwen2_5OmniVisionEncoder._from_config(hf_config.thinker_config.vision_config)
         self.model_cls = Qwen2_5OmniThinkerForConditionalGeneration

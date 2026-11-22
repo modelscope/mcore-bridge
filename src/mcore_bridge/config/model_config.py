@@ -2,15 +2,16 @@
 import copy
 import os
 import re
-import torch.nn.functional as F
 from dataclasses import dataclass
+from typing import List, Literal, Optional, Union
+
+import torch.nn.functional as F
 from megatron.core import mpu
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from transformers import PretrainedConfig
 from transformers.utils import is_torch_npu_available
-from typing import List, Literal, Optional, Union
 
 from mcore_bridge.utils import get_logger, json_parse_to_dict
 

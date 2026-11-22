@@ -1,12 +1,13 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import os
-import pytest
 import subprocess
 import sys
+from types import SimpleNamespace as NS
+
+import pytest
 import torch
 from transformers import AutoConfig, PretrainedConfig
-from types import SimpleNamespace as NS
 
 from mcore_bridge.config.parser import hf_to_mcore_config
 from mcore_bridge.model.mm_gpts import nemo_speechlm as speechlm

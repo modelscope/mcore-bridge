@@ -1,17 +1,18 @@
 import itertools
 import math
 import os
-import pytest
 import statistics
 import tempfile
-import torch
-import torch.nn.functional as F
 import uuid
 from contextlib import contextmanager
+from types import SimpleNamespace
+
+import pytest
+import torch
+import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from types import SimpleNamespace
 
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.config.parser import hf_to_mcore_config

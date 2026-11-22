@@ -3,6 +3,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import dataclass
 from functools import partial
+from typing import TYPE_CHECKING, List, Optional, Type, Union
+
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEGroupedLinear, TELayerNormColumnParallelLinear, TELinear
@@ -12,14 +14,18 @@ from megatron.core.transformer.moe.router import TopKRouter as McoreTopKRouter
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention as McoreMLASelfAttention
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from torch import nn
-from typing import TYPE_CHECKING, List, Optional, Type, Union
 
 from mcore_bridge.bridge import GPTBridge
 from mcore_bridge.config import ModelConfig
 from mcore_bridge.utils import get_logger
-
-from .modules import (AbsorbedMLASelfAttention, DSAIndexer, MLASelfAttention, TopKRouter, TransformerBlock,
-                      TransformerLayer)
+from .modules import (
+    AbsorbedMLASelfAttention,
+    DSAIndexer,
+    MLASelfAttention,
+    TopKRouter,
+    TransformerBlock,
+    TransformerLayer,
+)
 from .mtp import adapt_mtp_block_spec, get_mtp_block_cls
 
 if TYPE_CHECKING:
@@ -101,7 +107,9 @@ class ModelLoader:
 
     def _replace_spec_dsa(self, layer_spec):
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-            _get_backend_spec_provider, get_dsa_module_spec_for_backend)
+            _get_backend_spec_provider,
+            get_dsa_module_spec_for_backend,
+        )
         backend = _get_backend_spec_provider(config=self.config)
         dsa_spec = get_dsa_module_spec_for_backend(self.config, backend)
         if getattr(dsa_spec.submodules.core_attention.submodules, 'indexer', None) is not None:

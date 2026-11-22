@@ -1,6 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 # code borrowed from modelscope/ms-swift
 import inspect
+from typing import Optional
+
 import torch
 from megatron.core import mpu, tensor_parallel
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
@@ -8,7 +10,6 @@ from megatron.core.transformer.multi_token_prediction import roll_tensor as mcor
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
 from transformers import set_seed
-from typing import Optional
 
 from .logger import get_logger
 

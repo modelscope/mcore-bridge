@@ -4,14 +4,15 @@ import gc
 import hashlib
 import os
 import time
-import torch
-import torch.distributed as dist
 import uuid
 from contextlib import contextmanager
+from typing import Any, Mapping, Optional, Union
+
+import torch
+import torch.distributed as dist
 from datasets.utils.filelock import FileLock
 from modelscope.hub.utils.utils import get_cache_dir
 from transformers.utils import is_torch_cuda_available, is_torch_mps_available, is_torch_npu_available
-from typing import Any, Mapping, Optional, Union
 
 from .env import get_dist_setting, is_dist, is_local_master, is_master
 from .logger import get_logger

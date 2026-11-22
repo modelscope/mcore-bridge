@@ -6,9 +6,10 @@ real Megatron install). The parallel-state calls are stubbed.
 """
 import importlib.util
 import sys
-import torch
 import types
 from pathlib import Path
+
+import torch
 
 
 def _load_megatron_utils():

@@ -13,10 +13,11 @@ deeper heads produce no loss/gradient while a weak ``any(grad)`` assertion
 would still pass.
 """
 import os
-import pytest
-import torch
 import uuid
 from contextlib import contextmanager
+
+import pytest
+import torch
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed

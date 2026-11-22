@@ -2,15 +2,15 @@
 """Nemotron-H-Omni: replicated RADIO/projector with a Nemotron-H language backbone."""
 import os
 import re
+from types import SimpleNamespace
+
 import torch
 from peft.utils import ModulesToSaveWrapper
 from transformers import PretrainedConfig
 from transformers.dynamic_module_utils import get_class_from_dynamic_module
 from transformers.utils.versions import require_version
-from types import SimpleNamespace
 
 from mcore_bridge.utils import get_logger
-
 from ..constant import ModelType
 from ..gpts.nemotron_h import NemotronHBridge, NemotronHLoader
 from ..hybrid_model import HybridModel
@@ -33,6 +33,7 @@ def _evs_env_enabled() -> bool:
 def _radio_checkpoint_to_module(radio_model, checkpoint_sd):
     """Apply the official RADIO rename/fused-QKV conversion (inverse of HF export)."""
     from copy import deepcopy
+
     from transformers.conversion_mapping import get_model_conversion_mapping
     from transformers.core_model_loading import WeightConverter, WeightRenaming, dot_natural_key, rename_source_key
     conversions = get_model_conversion_mapping(radio_model, add_legacy=True)

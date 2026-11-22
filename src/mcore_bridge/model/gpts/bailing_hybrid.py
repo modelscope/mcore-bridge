@@ -1,18 +1,21 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
-import torch
 from contextlib import contextmanager
+from typing import Optional, Tuple
+
+import torch
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
 from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb
 from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import _yarn_get_concentration_factor_from_config
-from megatron.core.tensor_parallel.mappings import (gather_from_tensor_model_parallel_region,
-                                                    scatter_to_tensor_model_parallel_region)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_tensor_model_parallel_region,
+    scatter_to_tensor_model_parallel_region,
+)
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from torch import Tensor, nn
-from typing import Optional, Tuple
 
 from ..constant import ModelType
 from ..register import ModelLoader, ModelMeta, register_model
@@ -100,6 +103,7 @@ class LinearAttention(SelfAttention):
         slope = slope[tp_rank * heads_per_partition:(tp_rank + 1) * heads_per_partition].contiguous()
         self.register_buffer('slope', slope, persistent=False)
 
+    # Code copied from: https://github.com/OpenNLPLab/lightning-attention/blob/d15c38529bbd5c2c82b44ddda3cac885825aa873/lightning_attn/utils/utils.py#L6  # noqa: E501
     @staticmethod
     def build_slope_tensor(n_attention_heads: int):
         """
@@ -114,8 +118,6 @@ class LinearAttention(SelfAttention):
             n_attention_heads (int): Number of attention heads in the model
         Returns:
             torch.Tensor: A tensor of shape [n_attention_heads] containing the computed slopes
-        Note:
-            Code copied from: https://github.com/OpenNLPLab/lightning-attention/blob/d15c38529bbd5c2c82b44ddda3cac885825aa873/lightning_attn/utils/utils.py#L6  # noqa
         """
 
         def get_slopes(n):

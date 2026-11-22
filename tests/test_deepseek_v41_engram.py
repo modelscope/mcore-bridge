@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import json
 import pytest
 import torch
@@ -6,17 +8,28 @@ from megatron.core import mpu
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, VocabParallelEmbedding
 from megatron.core.transformer import TransformerConfig
 from safetensors.torch import save_file
-from types import SimpleNamespace
 
 from mcore_bridge.config.parser import _convert_config
 from mcore_bridge.model.gpts import deepseek_v41 as deepseek_v41_module
-from mcore_bridge.model.gpts.deepseek_v41 import (DeepseekV41Aligner, DeepseekV41Bridge, DeepseekV41DSparkAttention,
-                                                  DeepseekV41Loader, DeepseekV41Vision, DeepseekV41VisionTransformer)
+from mcore_bridge.model.gpts.deepseek_v41 import (
+    DeepseekV41Aligner,
+    DeepseekV41Bridge,
+    DeepseekV41DSparkAttention,
+    DeepseekV41Loader,
+    DeepseekV41Vision,
+    DeepseekV41VisionTransformer,
+)
 from mcore_bridge.model.modules import engram as engram_adapter
-from mcore_bridge.model.modules.dspark import (DeepseekV41DSparkConfidenceHead, DeepseekV41DSparkInput,
-                                               DeepseekV41DSparkMarkovHead, DeepseekV41DSparkOutput,
-                                               DeepseekV41DSparkStack, DeepseekV41DSparkState, dspark_sample,
-                                               verify_dspark_draft)
+from mcore_bridge.model.modules.dspark import (
+    DeepseekV41DSparkConfidenceHead,
+    DeepseekV41DSparkInput,
+    DeepseekV41DSparkMarkovHead,
+    DeepseekV41DSparkOutput,
+    DeepseekV41DSparkStack,
+    DeepseekV41DSparkState,
+    dspark_sample,
+    verify_dspark_draft,
+)
 from mcore_bridge.utils.safetensors import SafetensorLazyLoader
 
 

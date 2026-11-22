@@ -1,0 +1,2 @@
+pytest
+ruff==0.13.0 # pin version to ensure consistent lint/format results across environments

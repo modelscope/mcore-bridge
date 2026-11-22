@@ -1,18 +1,24 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import copy
 import math
+from typing import List, Optional
+
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
-from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint,
-                                             sharded_state_dict_default)
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    sharded_state_dict_default,
+)
 from torch import nn
-from typing import List, Optional
 
 from ...utils import get_env_args, get_logger
 from ...utils.constants import EXPORT_CHUNK_BYTES
@@ -503,8 +509,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
                 # The SP forward gathers the full sequence, so every TP rank already
                 # produces the complete gradient: sync the replicas with AVG instead of
                 # the SP SUM, which would amplify the grads by tp_size.
-                setattr(param, 'sequence_parallel', False)
-                setattr(param, 'average_gradients_across_tp_domain', config.sequence_parallel)
+                param.sequence_parallel = False
+                param.average_gradients_across_tp_domain = config.sequence_parallel
 
     def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Training variant of transformers `_short_conv` (no conv state cache):
