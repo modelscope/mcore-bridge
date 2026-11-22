@@ -373,17 +373,18 @@ class ModelConfig(TransformerConfig):
         if self.apply_query_key_layer_scaling:
             os.environ['NVTE_APPLY_QK_LAYER_SCALING'] = '1'
         # mtp_num_layers is always the *logical* prediction depth.
-        # mtp_shared_weights=True switches MTP to the unrolled layout: mtp_num_layers is
-        # folded into mtp_unroll_steps and the block is built once (v5 path).
+        # mtp_shared_weights=True switches MTP to the repeated-layer layout: one physical block
+        # applied depth times. Map it onto upstream's mtp_use_repeated_layer (mcore builds ONE
+        # layer and loops mtp_num_layers times over it) and keep the logical depth in
+        # mtp_num_layers -- collapsing it to 1 desyncs the upstream loop AND gpt_model.forward's
+        # 1 + mtp_unroll_steps chunking (silent shape mismatch at the first MTP loss).
         if isinstance(self.mtp_num_layers, str):
             raise TypeError('mtp_num_layers must be an int or None; '
                             'use resolve_mtp_config() to resolve "auto".')
         if self.mtp_shared_weights:
             assert self.mtp_num_layers is not None and self.mtp_num_layers > 0
-            self.mtp_unroll_steps = self.mtp_num_layers
-            self.mtp_num_layers = 1
-        else:
-            self.mtp_unroll_steps = self.mtp_num_layers
+            self.mtp_use_repeated_layer = True
+        self.mtp_unroll_steps = self.mtp_num_layers
         if self.mtp_num_layers is None:
             # Reject rather than ignore: both knobs read as "MTP is configured", and silently
             # dropping them leaves a run that logs no MTP loss and exports no MTP layer while the

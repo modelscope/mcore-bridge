@@ -601,8 +601,13 @@ class MultiTokenPredictionBlock(McoreMultiTokenPredictionBlock):
         if caps.has_detach_heads and getattr(self.config, 'mtp_detach_heads', False):
             depth_in = depth_in.detach()
 
-        n = self.config.mtp_num_layers or 0
-        repeated = getattr(self.config, 'mtp_use_repeated_layer', False)
+        # Unroll count = logical depth: mtp_unroll_steps mirrors mtp_num_layers (ModelConfig),
+        # and gpt_model.forward chunks the block output by 1 + mtp_unroll_steps. Accept the
+        # v5 mtp_shared_weights spelling of the repeated flag too -- same reading as
+        # get_physical_mtp_depth.
+        n = self.config.mtp_unroll_steps or self.config.mtp_num_layers or 0
+        repeated = (getattr(self.config, 'mtp_use_repeated_layer', False)
+                    or getattr(self.config, 'mtp_shared_weights', False))
 
         # Keys the upstream layer forward declares go through verbatim;
         # everything else is a bridge extra for the inner TransformerLayer.

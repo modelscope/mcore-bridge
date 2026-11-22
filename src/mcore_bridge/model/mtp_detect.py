@@ -132,6 +132,18 @@ def resolve_mtp_num_layers(model_meta: 'ModelMeta',
     prefix = model_meta.mtp_prefix
     if not prefix:
         return None
+    # DSpark checkpoints (V4-Flash / V4.1) store their draft stack under the same mtp.*
+    # namespace but in a different layout (main_proj / markov_head, no enorm/hnorm);
+    # dspark_block_size is the marker that tells them apart from standard MTP (same rule as
+    # ModelConfig.__post_init__). The standard-MTP converter cannot consume that layout --
+    # auto-enabling it here crashes the export on the first enorm.weight lookup -- so the
+    # draft weights must stay on the DSpark / save_missing_weights path instead.
+    for config in (hf_config, _cfg_get(hf_config, 'text_config')):
+        if _cfg_get(config, 'dspark_block_size'):
+            if warn:
+                logger.info('DSpark checkpoint detected (dspark_block_size); standard MTP auto-detection '
+                            'is disabled -- the mtp.* draft stack is not standard MTP.')
+            return None
     declared = _get_declared_depth(hf_config, model_meta.mtp_depth_field)
     keys = _read_weight_keys(model_dir)
     if keys is None:

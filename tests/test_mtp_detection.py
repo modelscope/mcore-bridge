@@ -189,3 +189,41 @@ def test_three_physical_sets_keep_independent_weights(tmp_path):
 def test_unreadable_weights_disables_mtp(tmp_path):
     config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=1)
     assert resolve_mtp_num_layers(_standard_meta(), config, str(tmp_path)) is None
+
+
+def test_dspark_checkpoint_disables_standard_mtp_auto(tmp_path):
+    # Real DeepSeek-V4-Flash shape: the mtp.* draft stack is DSpark (main_proj/markov_head,
+    # no enorm/hnorm). Auto-enabling standard MTP on it crashes the export at the first
+    # enorm.weight lookup -- the draft weights belong to the DSpark/missing-weights path.
+    _write_index(tmp_path, [f'mtp.{i}.main_proj.weight' for i in range(3)])
+    config = SimpleNamespace(num_hidden_layers=4, num_nextn_predict_layers=3, dspark_block_size=5)
+    meta = get_model_meta('deepseek_v4')
+    assert resolve_mtp_num_layers(meta, config, str(tmp_path)) is None
+    assert resolve_mtp_config(meta, config, str(tmp_path), 'auto', None) == (None, False)
+
+
+def test_dspark_marker_in_text_config_also_gates(tmp_path):
+    # Multimodal wrappers nest the text config; the guard must not be bypassed there.
+    _write_index(tmp_path, [f'mtp.{i}.main_proj.weight' for i in range(3)])
+    config = SimpleNamespace(
+        text_config=SimpleNamespace(num_hidden_layers=4, num_nextn_predict_layers=3, dspark_block_size=5))
+    meta = get_model_meta('deepseek_v4')
+    assert resolve_mtp_num_layers(meta, config, str(tmp_path)) is None
+
+
+def test_plain_mtp_without_dspark_marker_still_detected(tmp_path):
+    # The guard must not over-block: a standard MTP checkpoint without dspark_block_size
+    # keeps its auto detection (same keys, marker absent).
+    _write_index(tmp_path, [f'model.mtp.{i}.e_proj.weight' for i in range(2)])
+    config = SimpleNamespace(num_hidden_layers=2, num_nextn_predict_layers=2)
+    meta = get_model_meta('deepseek_v4')
+    assert resolve_mtp_config(meta, config, str(tmp_path), 'auto', None) == (2, False)
+
+
+def test_explicit_mtp_request_not_gated_by_dspark(tmp_path):
+    # The gate only governs AUTO detection; an explicit user depth is honored (fail-loudly
+    # on an unsupported layout belongs to the converter, not to silent knob dropping).
+    _write_index(tmp_path, [f'mtp.{i}.main_proj.weight' for i in range(3)])
+    config = SimpleNamespace(num_hidden_layers=4, num_nextn_predict_layers=3, dspark_block_size=5)
+    meta = get_model_meta('deepseek_v4')
+    assert resolve_mtp_config(meta, config, str(tmp_path), 2, None) == (2, False)

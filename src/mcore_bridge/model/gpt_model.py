@@ -1,4 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
+import copy
 import math
 import os
 from collections import OrderedDict
@@ -20,13 +21,14 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     reduce_from_tensor_model_parallel_region,
 )
-from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
+from megatron.core.transformer.multi_token_prediction import (MTPLossAutoScaler, MTPLossLoggingHelper,
+                                                              tie_word_embeddings_state_dict)
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger, split_cp_inputs
+from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
