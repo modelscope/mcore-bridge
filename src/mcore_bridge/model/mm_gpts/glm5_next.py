@@ -413,14 +413,30 @@ class Glm5NextBridge(MultimodalGPTBridge):
         names = ('q_proj', 'k_proj', 'v_proj')
         a_key = f'in_proj.lora_A.{self._adapter_name}.weight'
         if to_mcore:
-            lora_a = [hf_state_dict[f'{name}.lora_A.weight'].load() for name in names]
+            # The fused group's members are probed one by one: no member means this layer was
+            # never a target, a member carrying only one of lora_A/lora_B is corrupt, and a
+            # legal subset fuses with zero rows for the members it does not carry -- exactly
+            # their no-LoRA contribution. The export path below chunks the fused B into equal
+            # Q/K/V thirds, so a missing member's local rows match any present member's.
+            present = [name for name in names if f'{name}.lora_A.weight' in hf_state_dict
+                       or f'{name}.lora_B.weight' in hf_state_dict]
+            unpaired = [name for name in present
+                        if (f'{name}.lora_A.weight' in hf_state_dict) != (f'{name}.lora_B.weight' in hf_state_dict)]
+            if unpaired:
+                raise ValueError(f'LoRA adapter members carry only one of lora_A/lora_B: {unpaired}')
+            if not present:
+                return
+            lora_a = [hf_state_dict[f'{name}.lora_A.weight'].load() for name in present]
             if not all(torch.equal(lora_a[0], part) for part in lora_a[1:]):
                 raise ValueError('Fused KDA QKV requires identical q_proj/k_proj/v_proj LoRA A weights')
             # Each TP shard stores local Q, then local K, then local V.
-            parts = [
-                self._split_tp(hf_state_dict[f'{name}.lora_B.weight'].load(), 0, False, is_embedding=False)
-                for name in names
-            ]
+            split_parts = {
+                name: (self._split_tp(hf_state_dict[f'{name}.lora_B.weight'].load(), 0, False, is_embedding=False)
+                       if name in present else None)
+                for name in names}
+            reference = next(part for part in split_parts.values() if part is not None)
+            parts = [split_parts[name] if split_parts[name] is not None else torch.zeros_like(reference)
+                     for name in names]
             self._set_weight(proj.lora_A[self._adapter_name].weight, lora_a[0], a_key)
             self._set_weight(proj.lora_B[self._adapter_name].weight, torch.cat(parts, dim=0), None)
         else:

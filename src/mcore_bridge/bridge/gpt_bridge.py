@@ -732,19 +732,37 @@ class GPTBridge:
         if to_mcore:
             # MultiLora pre-wraps every linear, but only target_modules carry LoRA; a missing
             # lora key means the layer was never a target, and peft checkpoints never touch
-            # base weights.
-            if isinstance(mg_attn.linear_qkv, LoraParallelLinear) and \
-                    'q_proj.lora_A.weight' in hf_state_dict:
-                lora_A = hf_state_dict['q_proj.lora_A.weight'].load()
-                assert all((lora_A == hf_state_dict[f'{k}.lora_A.weight'].load()).all()
-                           for k in kv_proj_list), 'Need to ensure QKV\'s lora_A are consistent'
-                q_lora_B = hf_state_dict['q_proj.lora_B.weight'].load()
-                lora_B = torch.cat([
-                    q_lora_B.reshape((num_query_groups, -1, q_lora_B.shape[-1])),
-                    *(hf_state_dict[f'{k}.lora_B.weight'].load().reshape((num_query_groups, -1, q_lora_B.shape[-1]))
-                      for k in kv_proj_list),
-                ],
-                                   dim=1).reshape((-1, q_lora_B.shape[-1]))
+            # base weights. Inside the fused QKV group a PARTIAL member set is a legal adapter:
+            # a member carrying only one of lora_A/lora_B is corrupt and rejected, the members
+            # the adapter does carry fuse normally, and the missing members contribute zero
+            # rows in the fused weight -- exactly their no-LoRA contribution.
+            members = ['q_proj'] + kv_proj_list
+            present = [name for name in members if f'{name}.lora_A.weight' in hf_state_dict
+                       or f'{name}.lora_B.weight' in hf_state_dict] \
+                if isinstance(mg_attn.linear_qkv, LoraParallelLinear) else []
+            unpaired = [name for name in present
+                        if (f'{name}.lora_A.weight' in hf_state_dict) != (f'{name}.lora_B.weight' in hf_state_dict)]
+            if unpaired:
+                raise ValueError(f'LoRA adapter members carry only one of lora_A/lora_B: {unpaired}')
+            if present:
+                lora_A = hf_state_dict[f'{present[0]}.lora_A.weight'].load()
+                assert all((lora_A == hf_state_dict[f'{name}.lora_A.weight'].load()).all() for name in present), \
+                    'Need to ensure QKV\'s lora_A are consistent'
+                reference = hf_state_dict[f'{present[0]}.lora_B.weight'].load()
+                rank = reference.shape[-1]
+                q_dim = kv_channels * self.config.num_attention_heads // num_query_groups
+                if self.config.attention_output_gate:
+                    q_dim *= 2
+                blocks = []
+                for name in members:
+                    if name in present:
+                        blocks.append(
+                            hf_state_dict[f'{name}.lora_B.weight'].load().reshape((num_query_groups, -1, rank)))
+                    else:
+                        rows = q_dim if name == 'q_proj' else kv_channels
+                        blocks.append(torch.zeros((num_query_groups, rows, rank),
+                                                  dtype=reference.dtype, device=reference.device))
+                lora_B = torch.cat(blocks, dim=1).reshape((-1, rank))
                 self._set_weight(mg_attn.linear_qkv.lora_A[self._adapter_name].weight, lora_A,
                                  'linear_qkv.lora_A.weight')
                 self._set_weight(mg_attn.linear_qkv.lora_B[self._adapter_name].weight, lora_B,
@@ -986,14 +1004,35 @@ class GPTBridge:
             has_scale_inv = any('_scale_inv' in k for k in hf_state_dict.keys())
             # The presence probe must use the SAME key shape the branch below consumes:
             # dense models use the bare HF name, experts prefix it with the expert index.
-            if is_expert:
-                first_expert = f'{ep_rank * num_local_experts}.'
-                fc1_lora_key = f'{first_expert}gate_up_proj.lora_A.weight' if is_gate_up \
-                    else f'{first_expert}gate_proj.lora_A.weight'
-            else:
-                fc1_lora_key = 'gate_up_proj.lora_A.weight' if is_gate_up \
-                    else 'gate_proj.lora_A.weight'
-            if isinstance(mg_mlp.linear_fc1, LoraParallelLinear) and fc1_lora_key in hf_state_dict:
+            # The fused fc1 group's members are probed one by one: a PARTIAL member set is a
+            # legal adapter (the members it carries fuse normally, the missing ones contribute
+            # zero rows inside the fused weight), a member carrying only one of lora_A/lora_B
+            # is corrupt, and a group with no member at all was never a target.
+            def _member_keys(name, part):
+                suffix = f'{name}.lora_{part}.weight'
+                if is_expert:
+                    return [f'{i + ep_rank * num_local_experts}.{suffix}' for i in range(num_local_experts)]
+                return [suffix]
+
+            def _present_keys(name, part):
+                return [key for key in _member_keys(name, part) if key in hf_state_dict]
+
+            def _counterpart(key):
+                # The same member's other half; the expert index prefix is preserved,
+                # only the lora part swaps -- pairing is decided per key by PRESENCE
+                # of the counterpart, never by comparing the two key-name lists
+                # (they differ by construction: lora_A vs lora_B suffixes).
+                return key.replace('.lora_A.', '.lora_B.') if '.lora_A.' in key else key.replace('.lora_B.', '.lora_A.')
+
+            members = ('gate_up_proj',) if is_gate_up else ('gate_proj', 'up_proj')
+            present = [name for name in members if _present_keys(name, 'A') or _present_keys(name, 'B')] \
+                if isinstance(mg_mlp.linear_fc1, LoraParallelLinear) else []
+            unpaired = [name for name in present
+                        if any(_counterpart(key) not in hf_state_dict
+                               for key in _present_keys(name, 'A') + _present_keys(name, 'B'))]
+            if unpaired:
+                raise ValueError(f'LoRA adapter members carry only one of lora_A/lora_B: {unpaired}')
+            if present:
                 mg_lora_B = mg_mlp.linear_fc1.lora_B[self._adapter_name]
                 mg_lora_B = [getattr(mg_lora_B, f'weight{i}')
                              for i in range(num_local_experts)] if is_expert else mg_lora_B.weight
@@ -1012,29 +1051,45 @@ class GPTBridge:
                         lora_B = hf_state_dict['gate_up_proj.lora_B.weight'].load()
                 else:
                     if is_expert:
-                        lora_A = torch.concat([
-                            hf_state_dict[f'{i + ep_rank * num_local_experts}.gate_proj.lora_A.weight'].load()
-                            for i in range(num_local_experts)
-                        ])
-                        up_lora_A = torch.concat([
-                            hf_state_dict[f'{i + ep_rank * num_local_experts}.up_proj.lora_A.weight'].load()
-                            for i in range(num_local_experts)
-                        ])
-                        weight_list = []
+                        # Probe members PER EXPERT by key presence (the global ``present``
+                        # list only says some expert carries the member) and enforce the
+                        # same lora_A consistency the dense branch asserts: gate_proj and
+                        # up_proj share one A inside the fused fc1.
+                        a_parts, weight_list = [], []
                         for i in range(num_local_experts):
-                            gate_lora_B = hf_state_dict[
-                                f'{i + ep_rank * num_local_experts}.gate_proj.lora_B.weight'].load()
-                            up_lora_B = hf_state_dict[f'{i + ep_rank * num_local_experts}.up_proj.lora_B.weight'].load()
-                            weight_list.append(torch.stack([gate_lora_B, up_lora_B], dim=0))
+                            expert = f'{i + ep_rank * num_local_experts}.'
+                            member_a = {name: hf_state_dict[f'{expert}{name}.lora_A.weight'].load()
+                                        for name in ('gate_proj', 'up_proj')
+                                        if f'{expert}{name}.lora_A.weight' in hf_state_dict}
+                            assert member_a, f'expert {expert} carries no lora_A member'
+                            ref_a = next(iter(member_a.values()))
+                            assert all((ref_a == a).all() for a in member_a.values()), \
+                                'Need to ensure lora_A consistency between gate_proj and up_proj'
+                            a_parts.append(ref_a)
+                            member_b = {name: hf_state_dict[f'{expert}{name}.lora_B.weight'].load()
+                                        for name in ('gate_proj', 'up_proj')
+                                        if f'{expert}{name}.lora_B.weight' in hf_state_dict}
+                            reference = next(iter(member_b.values()))
+                            weight_list.append(torch.stack(
+                                [member_b['gate_proj'] if 'gate_proj' in member_b
+                                 else torch.zeros_like(reference),
+                                 member_b['up_proj'] if 'up_proj' in member_b
+                                 else torch.zeros_like(reference)], dim=0))
+                        lora_A = torch.concat(a_parts)
                         lora_B = torch.concat(weight_list, dim=0)
                     else:
-                        lora_A = hf_state_dict['gate_proj.lora_A.weight'].load()
-                        up_lora_A = hf_state_dict['up_proj.lora_A.weight'].load()
-                        gate_lora_B = hf_state_dict['gate_proj.lora_B.weight'].load()
-                        up_lora_B = hf_state_dict['up_proj.lora_B.weight'].load()
-                        lora_B = torch.stack([gate_lora_B, up_lora_B], dim=0)
-                    assert (
-                        lora_A == up_lora_A).all(), 'Need to ensure lora_A consistency between gate_proj and up_proj'
+                        parts = {name: (hf_state_dict[f'{name}.lora_A.weight'].load(),
+                                       hf_state_dict[f'{name}.lora_B.weight'].load())
+                                 if name in present else (None, None) for name in ('gate_proj', 'up_proj')}
+                        lora_A = next(a for a, _ in parts.values() if a is not None)
+                        assert all((lora_A == a).all() for a, _ in parts.values() if a is not None), \
+                            'Need to ensure lora_A consistency between gate_proj and up_proj'
+                        reference = next(b for _, b in parts.values() if b is not None)
+                        lora_B = torch.stack(
+                            [parts['gate_proj'][1] if parts['gate_proj'][1] is not None
+                             else torch.zeros_like(reference),
+                             parts['up_proj'][1] if parts['up_proj'][1] is not None
+                             else torch.zeros_like(reference)], dim=0)
                 mg_lora_A = mg_mlp.linear_fc1.lora_A[self._adapter_name]
                 mg_lora_A = [getattr(mg_lora_A, f'weight{i}')
                              for i in range(num_local_experts)] if is_expert else mg_lora_A.weight

@@ -71,6 +71,7 @@ class Qwen2_5OmniBridge(GPTBridge):
 
 
 class Qwen2_5Omni_Vit(HuggingFaceVit):
+    media_input_keys = ('pixel_values', 'pixel_values_videos', 'input_features')
     module_mapping = {'thinker.audio_tower': 'audio_tower', 'thinker.visual': 'visual'}
     _vision_tower = ['audio_tower', 'visual']
     _aligner = ['audio_tower.proj', 'visual.merger']
