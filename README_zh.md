@@ -141,6 +141,7 @@ uv pip install -e . --torch-backend=auto
 
 | 系列     | model_type                                                   |
 | -------- | ------------------------------------------------------------ |
+| Thinking Machines | inkling2_loop（Inkling-2-Mini） |
 | Qwen     | qwen2_vl, qwen2_5_vl, qwen2_5_omni<br />qwen3_vl, qwen3_vl_moe, qwen3_omni_moe, qwen3_asr<br />qwen3_5, qwen3_5_moe |
 | Gemma     | gemma4, gemma4_unified                                   |
 | GLM      | glm4v, glm4v_moe |

@@ -34,7 +34,8 @@ def dispatch_megatron(
         # MindSpeed uses native mcore classes for TE parallel linears.
         linear_cls += (ColumnParallelLinear, RowParallelLinear)
     if isinstance(target_base_layer, linear_cls):
-        new_module = LoraParallelLinear(base_layer=target, adapter_name=adapter_name, **kwargs)
+        lora_cls = getattr(target_base_layer, 'lora_cls', LoraParallelLinear)
+        new_module = lora_cls(base_layer=target, adapter_name=adapter_name, **kwargs)
 
     return new_module
 
