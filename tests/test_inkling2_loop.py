@@ -13,7 +13,7 @@ from peft.tuners.lora.layer import Linear as PeftLinear
 from torch import nn
 from types import SimpleNamespace
 
-from mcore_bridge.model.gpts.inkling2_loop import Inkling2LoopBridge
+from mcore_bridge.model.mm_gpts.inkling2_loop import Inkling2LoopBridge
 from mcore_bridge.model.modules.inkling2_loop import (ATTENTION_PROJECTIONS, Inkling2Router, Inkling2TokenDispatcher,
                                                       _packed_document_layout)
 
@@ -239,7 +239,7 @@ def _worker(root, ep, tuner, reload_only=False):
     from transformers import Inkling2LoopForConditionalGeneration
 
     from mcore_bridge import get_mcore_model, hf_to_mcore_config
-    from mcore_bridge.model.gpts.inkling2_loop import Inkling2LoopConfig
+    from mcore_bridge.model.mm_gpts.inkling2_loop import Inkling2LoopConfig
     from mcore_bridge.model.modules.inkling2_loop import Inkling2LoopLoraLinear, Inkling2TensorLinear
 
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))

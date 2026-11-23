@@ -1,6 +1,5 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 class LLMModelType:
-    inkling2_loop = 'inkling2_loop'
     gpt = 'gpt'
     gpt_oss = 'gpt_oss'
 
@@ -19,6 +18,7 @@ class LLMModelType:
 
 
 class MLLMModelType:
+    inkling2_loop = 'inkling2_loop'
     qwen2_vl = 'qwen2_vl'
     qwen2_5_vl = 'qwen2_5_vl'
     qwen3_vl = 'qwen3_vl'

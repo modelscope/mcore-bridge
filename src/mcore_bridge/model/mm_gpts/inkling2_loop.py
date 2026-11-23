@@ -19,10 +19,10 @@ from mcore_bridge.utils.safetensors import LazyTensor
 from ..constant import ModelType
 from ..gpt_model import GPTModel
 from ..mm_gpt_model import MultimodalGPTModel
-from ..mm_gpts.utils import HuggingFaceVit
 from ..modules.inkling2_loop import (ATTENTION_PROJECTIONS, Inkling2LoopBlock, _apply_with_fp32_buffers,
                                      _sharded_children, require_inkling2_loop)
 from ..register import ModelLoader, ModelMeta, register_model
+from .utils import HuggingFaceVit
 
 
 @dataclass
