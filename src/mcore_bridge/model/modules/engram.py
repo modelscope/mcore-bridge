@@ -203,6 +203,20 @@ def _positions_in_segment(cu_seqlens: Tensor | None, sequence_length: int, devic
     return positions - boundaries[segment_index]
 
 
+def to_sequence_major(embedded: Tensor) -> Tensor:
+    """Reorder ``[B, S, D]`` embedding output to ``[S, B, D]`` with canonical strides.
+
+    ``embedded.transpose(0, 1).contiguous()`` looks equivalent, but for ``B == 1`` the size-1
+    dimension is ignored by the contiguity check, so ``.contiguous()`` (and a same-shape
+    ``.reshape``) is a no-op and the stale ``(D, S * D, 1)`` stride survives. Feeding that into
+    ``nn.Linear`` makes some backends take a broadcasting path and allocate ``S x out_features x
+    in_features`` per call (observed 53-217 GiB on MUSA for DeepSeek-V4.1 Engram). Going through
+    the 2-D view forces a real copy whenever the layout is not canonical.
+    """
+    batch, seq, dim = embedded.shape
+    return embedded.movedim(0, 1).reshape(-1, dim).view(seq, batch, dim)
+
+
 def _build_ngram_hashes(
     input_ids: Tensor,
     tokenizer_remap: Tensor | None,
@@ -402,7 +416,7 @@ class DeepseekV41Engram(Engram):
 
         nvtx_range_push('engram.lookup')
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            memory = to_sequence_major(self.embedding(hash_ids).flatten(start_dim=-2))
         finally:
             nvtx_range_pop('engram.lookup')
         streams = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)
