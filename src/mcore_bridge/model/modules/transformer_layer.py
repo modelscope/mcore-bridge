@@ -17,7 +17,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer as McoreTransformerLayer
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules, get_transformer_layer_offset
-from megatron.core.utils import get_pg_rank
+from megatron.core.utils import get_pg_rank, make_viewless_tensor
 from typing import Optional
 
 from mcore_bridge.utils import get_logger, split_cp_inputs
@@ -426,3 +426,29 @@ class TransformerLayer(McoreTransformerLayer):
             if enable_sp:
                 output = scatter_to_sequence_parallel_region(output)
         return output, context
+
+    def _mlp_post_step(self, mlp_output_with_bias, residual, mlp_raw_output=None):
+        """Upstream's post-MLP step: recompute discard, bda, mlp-norm offload commit, viewless wrap.
+
+        Lives here so that subclasses forking ``_forward_mlp`` (gemma4) cannot drop it. mcore 0.18 has no
+        ``mlp_norm_manager`` and commits through the static interface instead.
+        """
+        if mlp_raw_output is None:
+            mlp_raw_output = mlp_output_with_bias[0]
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(mlp_raw_output)
+
+        # A fork never sets the fc2 residual, so the bda always runs (upstream skips it only for fused tp inference).
+        hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(mlp_output_with_bias, residual,
+                                                                                     self.hidden_dropout)
+
+        manager = getattr(self, 'mlp_norm_manager', None)
+        if manager is not None:
+            hidden_states = manager.group_offload(hidden_states, forced_released_tensors=[residual])
+            self.mlp_norm_manager = None
+        elif self.offload_mlp_norm:
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import \
+                FineGrainedActivationOffloadingInterface
+            hidden_states = FineGrainedActivationOffloadingInterface.group_commit(
+                hidden_states, name='mlp_norm', forced_released_tensors=[residual])
+        return make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
