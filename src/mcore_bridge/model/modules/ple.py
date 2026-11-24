@@ -549,7 +549,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
     @property
     def _tp_group(self):
-        return self.pg_collection.tp if self.pg_collection is not None else parallel_state.get_tensor_model_parallel_group()
+        return self.pg_collection.tp if self.pg_collection is not None else parallel_state.get_tensor_model_parallel_group(
+        )
 
     @property
     def _cp_group(self):
@@ -707,8 +708,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
             raise ValueError(f'PLE cannot shard a document of {doc_length} tokens into '
                              f'2*cp={2 * self.cp_size} CP chunks.')
         piece = doc_length // (2 * self.cp_size)
-        return [(0, 0, self.cp_rank * piece, piece),
-                (1, piece, (2 * self.cp_size - 1 - self.cp_rank) * piece, piece)]
+        return [(0, 0, self.cp_rank * piece, piece), (1, piece, (2 * self.cp_size - 1 - self.cp_rank) * piece, piece)]
 
     def _cp_local_offsets(self, documents: List[tuple]) -> List[int]:
         """Offset of each document inside the CP-local tensor."""
@@ -718,8 +718,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
             cursor += sum(chunk[3] for chunk in self._cp_chunks(doc_end - doc_start))
         return offsets
 
-    def _local_runs(self, total: int, documents: List[tuple],
-                    tp_rank: Optional[int] = None) -> List[tuple]:
+    def _local_runs(self, total: int, documents: List[tuple], tp_rank: Optional[int] = None) -> List[tuple]:
         """``[(local_start, run_len, global_start, slot), ...]`` in local row order: the TP slice of
         the CP-local tensor intersected with the per-document chunks."""
         if total % (self.sp_size * self.cp_size):
@@ -735,8 +734,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
                 cp_start = offsets[doc_index] + local_offset
                 lo, hi = max(k0, cp_start), min(k0 + local_len, cp_start + piece)
                 if hi > lo:
-                    runs.append((lo - k0, hi - lo, doc_start + global_offset + (lo - cp_start),
-                                 2 * doc_index + slot))
+                    runs.append((lo - k0, hi - lo, doc_start + global_offset + (lo - cp_start), 2 * doc_index + slot))
         runs.sort(key=lambda run: run[0])
         return runs
 
@@ -763,11 +761,11 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """Why the tail exchange cannot be used for this microbatch, ``None`` when it can.
         Geometry only, so every rank picks the same branch (different collectives would deadlock)."""
         local_len = total // (self.sp_size * self.cp_size)
-        shortest = min(run[1] for tp_rank in range(self.sp_size)
-                       for run in self._local_runs(total, documents, tp_rank))
+        shortest = min(run[1] for tp_rank in range(self.sp_size) for run in self._local_runs(total, documents, tp_rank))
         if shortest < self.context_rows:
-            return (f'the shortest run is {shortest} rows, below the {self.context_rows}-row window '
-                    f'(a packed document needs about {2 * self.cp_size * self.context_rows} tokens for cp={self.cp_size})')
+            return (
+                f'the shortest run is {shortest} rows, below the {self.context_rows}-row window '
+                f'(a packed document needs about {2 * self.cp_size * self.context_rows} tokens for cp={self.cp_size})')
         slots = 2 * len(documents) * self.context_rows
         if slots > local_len:
             return f'the {2 * len(documents)} published tails ({slots} rows) exceed the {local_len}-row local block'
@@ -795,8 +793,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
                 return doc_start
         raise ValueError(f'PLE: global token {token} lies outside the documents.')
 
-    def _exchange_halo(self, hidden_states: torch.Tensor, runs: List[tuple],
-                       documents: List[tuple]) -> torch.Tensor:
+    def _exchange_halo(self, hidden_states: torch.Tensor, runs: List[tuple], documents: List[tuple]) -> torch.Tensor:
         """Publish each local run's trailing ``context_rows`` rows -> ``[tp*cp, 2*docs, rows, ...]``."""
         tails = hidden_states.new_zeros((2 * len(documents), self.context_rows) + tuple(hidden_states.shape[1:]))
         for local_start, run_len, _global_start, slot in runs:
@@ -822,8 +819,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
         if input_ids.shape[-1] == total:
             return input_ids
         if self.cp_size > 1:
-            ids = reconstruct_tensor_cp(input_ids, packed_seq_params, dim=1,
-                                        cp_partition_mode=self._cp_partition_mode(packed_seq_params))
+            ids = reconstruct_tensor_cp(
+                input_ids, packed_seq_params, dim=1, cp_partition_mode=self._cp_partition_mode(packed_seq_params))
             if ids.shape[-1] == total:
                 return ids
         raise ValueError(f'PLE needs the full (unsharded) input_ids: got {input_ids.shape[-1]} tokens for a '
@@ -892,7 +889,11 @@ class Qwen4ExpTextPLELayer(nn.Module):
                     continue
                 plan.append(
                     _PlePiece(
-                        run_local_start=local_start, start=start, end=end, global_start=global_start, owner=owner,
+                        run_local_start=local_start,
+                        start=start,
+                        end=end,
+                        global_start=global_start,
+                        owner=owner,
                         slot=slot))
 
         # One lookup for the whole CP-local block: the vocabulary-parallel lookup all-reduces over
@@ -905,9 +906,11 @@ class Qwen4ExpTextPLELayer(nn.Module):
             context = min(self.context_rows, global_start - self._document_start(global_start, documents))
             window_starts.append(global_start - context)
             blocks.append(
-                torch.cat(
-                    [ids.new_full((ids.shape[0], self.ngram_size - 1), eos),
-                     ids[:, global_start - context:global_start + piece_len]], dim=1))
+                torch.cat([
+                    ids.new_full((ids.shape[0], self.ngram_size - 1), eos),
+                    ids[:, global_start - context:global_start + piece_len]
+                ],
+                          dim=1))
         width = sum(block.shape[1] for block in blocks)
         capacity = total // self.cp_size + 2 * len(documents) * (self.context_rows + self.ngram_size - 1)
         if width > capacity:
@@ -947,9 +950,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
         pieces = [tensor for _start, tensor in located]
         return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
 
-    def _compute_piece(self, source: torch.Tensor, embeddings: torch.Tensor, halo, piece: _PlePiece,
-                       chunk_rows: int, source_is_global: bool, window_global_start: int,
-                       retained: int) -> tuple:
+    def _compute_piece(self, source: torch.Tensor, embeddings: torch.Tensor, halo, piece: _PlePiece, chunk_rows: int,
+                       source_is_global: bool, window_global_start: int, retained: int) -> tuple:
         """Chunk one piece, each chunk with the ``context_rows`` window the full-sequence path sees.
 
         ``retained`` is how many rows this rank already holds un-recomputed fp32 state for; a chunk

@@ -17,12 +17,12 @@ setup with frozen base weights): they inherit the base's sync flag through
 """
 import itertools
 import os
-from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import types
+from datetime import timedelta
 from megatron.core.packed_seq_params import PackedSeqParams
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')

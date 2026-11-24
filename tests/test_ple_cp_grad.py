@@ -9,11 +9,11 @@ control zeroes the published tails (the ``reconstruct_tensor_cp`` semantics) and
 """
 import itertools
 import os
-from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from datetime import timedelta
 from megatron.core import parallel_state
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer import TransformerConfig
@@ -137,7 +137,10 @@ def _cp_grad_worker(rank, world_size, init_file):
         torch.cuda.set_device(rank)
         device = torch.device('cuda', rank)
         dist.init_process_group(
-            backend='nccl', init_method=f'file://{init_file}', rank=rank, world_size=world_size,
+            backend='nccl',
+            init_method=f'file://{init_file}',
+            rank=rank,
+            world_size=world_size,
             timeout=timedelta(seconds=120))
         parallel_state.initialize_model_parallel(context_parallel_size=world_size)
         for layout, fused in itertools.product(('sbhd', 'thd'), ('1', '0')):
