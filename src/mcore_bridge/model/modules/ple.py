@@ -4,8 +4,8 @@ import math
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
