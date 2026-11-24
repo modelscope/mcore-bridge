@@ -1,14 +1,15 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """GPU regression test: PLE under context parallelism must match cp=1 in forward and backward.
 
-PLE gathers the CP shards, runs a causal conv over the full sequence and splits the output back
-to the local shard, so the gradient of a token near a shard boundary is partly produced on another
-CP rank. The test drives the real ``Qwen4ExpTextPLELayer.forward`` on real NCCL ranks and compares
-the local input gradient against a cp=1 run of the same layer. A negative control switches the CP
-gather back to a local-slice backward (the ``reconstruct_tensor_cp`` semantics) and must fail.
+PLE is token-local up to a bounded left window, so each CP rank computes its own rows plus the
+tail the preceding rank publishes: the gradient of a token near a shard boundary is partly
+produced on another CP rank. The test drives the real ``Qwen4ExpTextPLELayer.forward`` on real
+NCCL ranks and compares the local input gradient against a cp=1 run of the same layer. A negative
+control zeroes the published tails (the ``reconstruct_tensor_cp`` semantics) and must fail.
 """
 import itertools
 import os
+from datetime import timedelta
 import pytest
 import torch
 import torch.distributed as dist
@@ -76,11 +77,15 @@ def _packed_params(lengths, device):
 def _inputs(layout, cp_size, device):
     generator = torch.Generator(device='cpu').manual_seed(7)
     width = 16  # hc_count * hidden_size
+    # Every CP chunk must clear the 11-row context window (2*cp*context_rows tokens per
+    # document), otherwise the layer legitimately takes its full-gather fallback and the
+    # "tail exchange was used" assertion below cannot hold.
     if layout == 'thd':
-        packed = _packed_params([4 * cp_size, 12 * cp_size], device)
-        total, batch = 16 * cp_size, 1
+        unit = 2 * cp_size * 11
+        packed = _packed_params([2 * unit, 3 * unit], device)
+        total, batch = 5 * unit, 1
     else:
-        packed, total, batch = None, 16 * cp_size, 2
+        packed, total, batch = None, 32 * cp_size, 2
     hidden = torch.randn(total, batch, width, generator=generator).to(device)
     probe = torch.randn(total, batch, width, generator=generator).to(device)
     input_ids = torch.randint(0, 64, (batch, total), generator=generator).to(device)
@@ -91,20 +96,37 @@ def _run_cp(layer, hidden, probe, input_ids, packed):
     cu = None if packed is None else packed.cu_seqlens_q
     local_hidden = split_cp_inputs(hidden, cu, dim=0).detach().clone().requires_grad_(True)
     local_ids = split_cp_inputs(input_ids, cu, dim=1)
-    layer.zero_grad(set_to_none=True)
-    local_out = layer(local_hidden, local_ids, packed)
-    (local_out * split_cp_inputs(probe, cu, dim=0)).sum().backward()
+    exchanges = []
+    exchange = layer._exchange_halo
+
+    def spy(*args, **kwargs):
+        exchanges.append(1)
+        return exchange(*args, **kwargs)
+
+    layer._exchange_halo = spy
+    try:
+        layer.zero_grad(set_to_none=True)
+        local_out = layer(local_hidden, local_ids, packed)
+        (local_out * split_cp_inputs(probe, cu, dim=0)).sum().backward()
+    finally:
+        layer._exchange_halo = exchange
+    assert exchanges, 'the windowed forward must use the tail exchange path'
     param_grads = {name: param.grad.detach().clone() for name, param in layer.named_parameters()}
     for grad in param_grads.values():
         dist.all_reduce(grad, group=parallel_state.get_context_parallel_group())
     return local_out.detach(), local_hidden.grad, param_grads
 
 
-def _local_slice_backward_gather(input_, tensor_parallel_output_grad=True, group=None, **kwargs):
-    return _megatron_gather(input_, tensor_parallel_output_grad=False, group=group, **kwargs)
+class _NoHalo(torch.autograd.Function):
+    """Negative control: publish zeros instead of the preceding rank's tail."""
 
+    @staticmethod
+    def forward(ctx, tails, group):
+        return tails.new_zeros((dist.get_world_size(group), ) + tuple(tails.shape))
 
-_megatron_gather = ple_module.gather_from_sequence_parallel_region
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output[0], None
 
 
 def _cp_grad_worker(rank, world_size, init_file):
@@ -114,7 +136,9 @@ def _cp_grad_worker(rank, world_size, init_file):
     try:
         torch.cuda.set_device(rank)
         device = torch.device('cuda', rank)
-        dist.init_process_group(backend='nccl', init_method=f'file://{init_file}', rank=rank, world_size=world_size)
+        dist.init_process_group(
+            backend='nccl', init_method=f'file://{init_file}', rank=rank, world_size=world_size,
+            timeout=timedelta(seconds=120))
         parallel_state.initialize_model_parallel(context_parallel_size=world_size)
         for layout, fused in itertools.product(('sbhd', 'thd'), ('1', '0')):
             os.environ['PLE_FUSED_KERNEL'] = fused
@@ -141,18 +165,27 @@ def _cp_grad_worker(rank, world_size, init_file):
                 torch.testing.assert_close(
                     param_grads[name], ref_grads[name], atol=1e-4, rtol=1e-4, msg=lambda m: f'{case} {name}: {m}')
 
-            # Negative control: a local-slice gather backward must lose the cross-shard gradient.
-            ple_module.gather_from_sequence_parallel_region = _local_slice_backward_gather
+            # Negative control: without the predecessor's tail the boundary rows lose
+            # their left context, so the cross-shard gradient must be lost too.
+            original = ple_module._PleHaloGather
+            ple_module._PleHaloGather = _NoHalo
             try:
                 _, bad_hidden_grad, _ = _run_cp(layer, hidden, probe, input_ids, packed)
             finally:
-                ple_module.gather_from_sequence_parallel_region = _megatron_gather
+                ple_module._PleHaloGather = original
             error = (bad_hidden_grad - ref_hidden_grad).abs().max()
             dist.all_reduce(error, op=dist.ReduceOp.MAX)
-            assert error > 1e-2, f'{case}: negative control did not fail (max error {error.item():.3e})'
+            # The control only has to lift the result off the numerical noise floor (1e-5..1e-6);
+            # the context path is damped by the grouped RMSNorm, so its absolute size is small.
+            assert error > 1e-3, f'{case}: negative control did not fail (max error {error.item():.3e})'
             if rank == 0:
                 print(f'{case}: ok, negative-control max hidden-grad error {error.item():.3e}')
     finally:
+        if dist.is_initialized():
+            try:
+                dist.barrier()
+            except RuntimeError:
+                pass  # a peer already failed; do not mask its error
         if parallel_state.model_parallel_is_initialized():
             parallel_state.destroy_model_parallel()
         if dist.is_initialized():
