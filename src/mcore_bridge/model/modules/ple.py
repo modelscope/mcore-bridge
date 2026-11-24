@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.extensions.transformer_engine import TELinear
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
@@ -475,6 +476,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def __init__(self, config, ple_layer_index: int, pg_collection=None):
         super().__init__()
         self.config = config
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         self.hidden_size = int(config.hidden_size)
         self.hc_count = int(config.hc_count)
@@ -548,21 +551,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
                         bool(config.sequence_parallel) and self.sp_size == 1)
 
     @property
-    def _tp_group(self):
-        return self.pg_collection.tp if self.pg_collection is not None else parallel_state.get_tensor_model_parallel_group(
-        )
-
-    @property
-    def _cp_group(self):
-        return self.pg_collection.cp if self.pg_collection is not None else parallel_state.get_context_parallel_group()
-
-    @property
     def tp_size(self) -> int:
-        return self._tp_group.size()
+        return self.pg_collection.tp.size()
 
     @property
     def cp_size(self) -> int:
-        return self._cp_group.size()
+        return self.pg_collection.cp.size()
 
     @property
     def sp_size(self) -> int:
@@ -571,11 +565,11 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
     @property
     def tp_rank(self) -> int:
-        return self._tp_group.rank() if self.sp_size > 1 else 0
+        return self.pg_collection.tp.rank() if self.sp_size > 1 else 0
 
     @property
     def cp_rank(self) -> int:
-        return self._cp_group.rank() if self.cp_size > 1 else 0
+        return self.pg_collection.cp.rank() if self.cp_size > 1 else 0
 
     @property
     def tp_cp_stride(self) -> int:
