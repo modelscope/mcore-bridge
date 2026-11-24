@@ -543,9 +543,9 @@ class Qwen4ExpTextPLELayer(nn.Module):
             if name.startswith(replicated_prefixes) or name.endswith('norm.weight'):
                 # Sharded compute leaves a partial gradient per rank: SUM. Duplicated
                 # compute (SP off) already has the whole one: AVG, or SUM inflates it by tp.
-                setattr(param, 'sequence_parallel', self.tp_sharded)
+                setattr(param, 'sequence_parallel', self.sp_size > 1)
                 setattr(param, 'average_gradients_across_tp_domain',
-                        bool(config.sequence_parallel) and not self.tp_sharded)
+                        bool(config.sequence_parallel) and self.sp_size == 1)
 
     @property
     def _tp_group(self):
@@ -557,34 +557,29 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
     @property
     def tp_size(self) -> int:
-        """Rows are split over TP only under sequence parallelism."""
-        return self._tp_group.size() if self.config.sequence_parallel else 1
+        return self._tp_group.size()
 
     @property
     def cp_size(self) -> int:
-        """Rows are always split over CP."""
         return self._cp_group.size()
 
     @property
-    def tp_sharded(self) -> bool:
-        return self.tp_size > 1
-
-    @property
-    def cp_sharded(self) -> bool:
-        return self.cp_size > 1
+    def sp_size(self) -> int:
+        """Rows each rank holds over TP: TP only splits the sequence under sequence parallelism."""
+        return self.tp_size if self.config.sequence_parallel else 1
 
     @property
     def tp_rank(self) -> int:
-        return self._tp_group.rank() if self.tp_sharded else 0
+        return self._tp_group.rank() if self.sp_size > 1 else 0
 
     @property
     def cp_rank(self) -> int:
-        return self._cp_group.rank() if self.cp_sharded else 0
+        return self._cp_group.rank() if self.cp_size > 1 else 0
 
     @property
     def tp_cp_stride(self) -> int:
         """The tp-cp group is laid out tp-fastest, so a rank's index is tp_rank + tp * cp_rank."""
-        return self.tp_size
+        return self.sp_size
 
     def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Training variant of transformers `_short_conv` (no conv state cache):
@@ -689,7 +684,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         remains the full-sequence reference and serves short, unsharded inputs.
         """
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
-        if not (self.tp_sharded or self.cp_sharded) and self._impl_rows(
+        if self.sp_size == 1 and self.cp_size == 1 and self._impl_rows(
                 packed_seq_params, hidden_states.shape[0], thd) <= ple_chunk_tokens(hidden_states.shape[-1]):
             return self._forward_impl(hidden_states, input_ids, packed_seq_params)
         return self._forward_windowed(hidden_states, input_ids, packed_seq_params, thd)
@@ -727,11 +722,11 @@ class Qwen4ExpTextPLELayer(nn.Module):
                     tp_rank: Optional[int] = None) -> List[tuple]:
         """``[(local_start, run_len, global_start, slot), ...]`` in local row order: the TP slice of
         the CP-local tensor intersected with the per-document chunks."""
-        if total % (self.tp_size * self.cp_size):
+        if total % (self.sp_size * self.cp_size):
             raise ValueError(f'PLE needs the gathered sequence length {total} to be divisible by '
-                             f'tp*cp={self.tp_size * self.cp_size}.')
+                             f'sp*cp={self.sp_size * self.cp_size}.')
         tp_rank = self.tp_rank if tp_rank is None else tp_rank
-        local_len = total // (self.tp_size * self.cp_size)
+        local_len = total // (self.sp_size * self.cp_size)
         k0 = tp_rank * local_len
         offsets = self._cp_local_offsets(documents)
         runs = []
@@ -748,7 +743,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def _owner_of(self, token: int, total: int, documents: List[tuple]) -> tuple:
         """``(tp_rank, cp_rank, slot)`` owning global ``token``, i.e. the tail that ends after it."""
         offsets = self._cp_local_offsets(documents)
-        local_len = total // (self.tp_size * self.cp_size)
+        local_len = total // (self.sp_size * self.cp_size)
         for doc_index, (doc_start, doc_end) in enumerate(documents):
             if token >= doc_end:
                 continue
@@ -767,8 +762,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def _halo_shortfall(self, total: int, documents: List[tuple]) -> Optional[str]:
         """Why the tail exchange cannot be used for this microbatch, ``None`` when it can.
         Geometry only, so every rank picks the same branch (different collectives would deadlock)."""
-        local_len = total // (self.tp_size * self.cp_size)
-        shortest = min(run[1] for tp_rank in range(self.tp_size)
+        local_len = total // (self.sp_size * self.cp_size)
+        shortest = min(run[1] for tp_rank in range(self.sp_size)
                        for run in self._local_runs(total, documents, tp_rank))
         if shortest < self.context_rows:
             return (f'the shortest run is {shortest} rows, below the {self.context_rows}-row window '
@@ -811,10 +806,10 @@ class Qwen4ExpTextPLELayer(nn.Module):
 
     def _gather_full(self, hidden_states: torch.Tensor, packed_seq_params) -> torch.Tensor:
         """Materialise the whole sequence: the fallback when a local block is shorter than one window."""
-        if self.tp_sharded:
+        if self.sp_size > 1:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=True, group=self.pg_collection.tp)
-        if self.cp_sharded:
+        if self.cp_size > 1:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=True, group=parallel_state.get_context_parallel_group())
             hidden_states = _undo_attention_load_balancing(hidden_states,
@@ -826,7 +821,7 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """The full, unsharded ids: windows are indexed by global position, so a CP-sharded copy is rebuilt."""
         if input_ids.shape[-1] == total:
             return input_ids
-        if self.cp_sharded:
+        if self.cp_size > 1:
             ids = reconstruct_tensor_cp(input_ids, packed_seq_params, dim=1,
                                         cp_partition_mode=self._cp_partition_mode(packed_seq_params))
             if ids.shape[-1] == total:
@@ -846,24 +841,24 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def _forward_windowed(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params,
                           thd: bool) -> torch.Tensor:
         rows = hidden_states.shape[0]
-        total = rows * self.tp_size * self.cp_size
+        total = rows * self.sp_size * self.cp_size
         psp = packed_seq_params if thd else None
         if thd:
             # The data pipeline may hand over a cu without its leading 0 or with a per-batch
             # offset; align it once against the gathered total for the gather and the ids.
             psp = copy.copy(packed_seq_params)
             psp.cu_seqlens_q = self._normalize_cu_seqlens(packed_seq_params.cu_seqlens_q, total)
-        if self.cp_sharded and self._cp_partition_mode(psp) != 'zigzag':
+        if self.cp_size > 1 and self._cp_partition_mode(psp) != 'zigzag':
             raise NotImplementedError(f'PLE windowed forward supports the zigzag CP partition only, got '
                                       f'cp_partition_mode={self._cp_partition_mode(psp)!r}.')
         ids = self._global_input_ids(input_ids, psp, total)
         documents = self._document_bounds(psp, total)
         runs = self._local_runs(total, documents)
 
-        sharded = self.tp_sharded or self.cp_sharded
+        sharded = self.sp_size > 1 or self.cp_size > 1
         # SP off with TP > 1 duplicates the compute, so every copy would consume the same tail and
         # the reduce-scatter would count its gradient tp times.
-        tp_duplicated = self.config.tensor_model_parallel_size > 1 and not self.tp_sharded
+        tp_duplicated = self.tp_size > 1 and self.sp_size == 1
         shortfall = self._halo_shortfall(total, documents) if sharded and not tp_duplicated else None
         if sharded and shortfall is None and not tp_duplicated:
             source, halo, source_is_global = hidden_states, self._exchange_halo(hidden_states, runs, documents), False
