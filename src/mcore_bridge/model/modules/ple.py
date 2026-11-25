@@ -5,18 +5,19 @@ import torch
 import torch.nn.functional as F
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import TELinear
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import _undo_attention_load_balancing
 from megatron.core.tensor_parallel import VocabParallelEmbedding
-from megatron.core.tensor_parallel.mappings import (gather_from_sequence_parallel_region,
-                                                    scatter_to_sequence_parallel_region)
+from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.utils import (ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint,
                                              sharded_state_dict_default)
 from torch import nn
-from typing import List, Optional
+from torch.utils.checkpoint import checkpoint
+from typing import List, NamedTuple, Optional
 
-from ...utils import get_env_args, get_logger
+from ...utils import get_env_args, get_logger, use_ngram_embedding_cpu_offload
 from ...utils.constants import EXPORT_CHUNK_BYTES
-from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
+from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
 
@@ -24,19 +25,24 @@ _MASK64 = (1 << 64) - 1
 # Cap the per-all_reduce GPU buffer when exporting the (potentially huge) ngram
 # table.
 _EXPORT_CHUNK_BYTES = EXPORT_CHUNK_BYTES
+# The gate/conv chain keeps ~16 B per (token x width) alive, so the chunk length follows from a
+# 1 GiB budget instead of a token count.
+_PLE_CHUNK_BYTES = 1 << 30
+_PLE_CHUNK_BYTES_PER_ELEM = 16
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
 _SPLITMIX_M1 = 0xBF58476D1CE4E5B9
 _SPLITMIX_M2 = 0x94D049BB133111EB
 _PRIME_1 = 10007
 
 
-def use_ple_cpu_offload() -> bool:
-    return get_env_args('PLE_CPU_OFFLOAD', bool, False)
-
-
 def use_ple_fused_kernel() -> bool:
     # On by default; PLE_FUSED_KERNEL=0 forces the eager chain.
     return get_env_args('PLE_FUSED_KERNEL', bool, True)
+
+
+def ple_chunk_tokens(width: int) -> int:
+    """Tokens of one chunked PLE call, from a byte budget over ``width`` (= hc*hidden)."""
+    return max(1, _PLE_CHUNK_BYTES // max(1, width * _PLE_CHUNK_BYTES_PER_ELEM))
 
 
 def _splitmix64(value: int) -> int:
@@ -158,12 +164,12 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         ngram_vocab_divisor = config.make_ngram_vocab_size_divisible_by
         padded_vocab_size = math.ceil(self.total_vocab_size / ngram_vocab_divisor) * ngram_vocab_divisor
         self.padded_vocab_size = padded_vocab_size
-        self.cpu_offload = use_ple_cpu_offload()
+        self.cpu_offload = use_ngram_embedding_cpu_offload()
         if self.cpu_offload:
             # Warn rather than raise: whether this is safe depends on the train type,
-            # which the model config does not carry (see use_ple_cpu_offload).
-            get_logger().warning_once('PLE_CPU_OFFLOAD=1: the n-gram table is host-resident and receives no '
-                                      'gradient, so it stays frozen.')
+            # which the model config does not carry (see use_ngram_embedding_cpu_offload).
+            get_logger().warning_once('NGRAM_EMBEDDING_CPU_OFFLOAD=1: the n-gram table is host-resident '
+                                      'and receives no gradient, so it stays frozen.')
             self._init_host_table(config, padded_vocab_size, head_dim_per_ngram)
         else:
             # mcore-specific: TP-sharded table (a replicated nn.Embedding would be ~80GB).
@@ -311,7 +317,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
     def export_table_to_hf(self, hf_state_dict, prefix=''):
         """Reverse of ``fill_table_from_hf``: write the current table back as HF
         shards so a full-parameter checkpoint is self-contained. Works for both
-        the host-resident (``PLE_CPU_OFFLOAD=1``) table and the TP-sharded
+        the host-resident (``NGRAM_EMBEDDING_CPU_OFFLOAD=1``) table and the TP-sharded
         ``VocabParallelEmbedding`` (the default, which receives gradients and so
         must not be silently dropped from the checkpoint). Bulk API: consumes
         :meth:`iter_export_table_to_hf` into ``hf_state_dict``.
@@ -407,6 +413,39 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         return rows.flatten(-2)
 
 
+class _PlePiece(NamedTuple):
+    """Rows ``[start, end)`` of the local block, plus the tail slot that supplies its left context."""
+    run_local_start: int
+    start: int
+    end: int
+    global_start: int
+    owner: int
+    slot: int
+
+
+class _PleHaloGather(torch.autograd.Function):
+    """All-gather the per-rank tails along the outermost axis.
+
+    A tail has at most one consumer, so the backward is a plain reduce-scatter to its owner.
+    """
+
+    @staticmethod
+    def forward(ctx, tails: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        world = torch.distributed.get_world_size(group)
+        gathered = tails.new_empty((world, ) + tuple(tails.shape))
+        torch.distributed.all_gather_into_tensor(gathered, tails.contiguous(), group=group)
+        return gathered
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
+        world = grad_output.shape[0]
+        flat = grad_output.reshape(world, -1).contiguous()
+        reduced = torch.empty_like(flat[:1])
+        torch.distributed.reduce_scatter_tensor(reduced, flat, group=ctx.group)
+        return reduced.view(grad_output.shape[1:]), None
+
+
 class Qwen4ExpTextPLELayer(nn.Module):
     """Inject hashed n-gram features into every hyper-connection stream;
     mirrors transformers ``Qwen4ExpTextPLELayer`` (training variant without
@@ -437,6 +476,8 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def __init__(self, config, ple_layer_index: int, pg_collection=None):
         super().__init__()
         self.config = config
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
         self.hidden_size = int(config.hidden_size)
         self.hc_count = int(config.hc_count)
@@ -445,7 +486,10 @@ class Qwen4ExpTextPLELayer(nn.Module):
         self.ple_embedding = Qwen4ExpTextNGramEmbedding(config, ple_layer_index)
         conv_kernel_size = int(config.ple_conv_kernel_size)
         conv_dilation = int(config.ngram_size)
+        self.ngram_size = conv_dilation
         self.short_conv_state_len = (conv_kernel_size - 1) * conv_dilation
+        # The conv's receptive field plus the n-gram warm-up its first rows need for their ids.
+        self.context_rows = self.short_conv_state_len + self.ngram_size - 1
         # Replicated projections in params_dtype.
         self.key_proj = TELinear(
             input_size=ple_embed_dim,
@@ -500,11 +544,37 @@ class Qwen4ExpTextPLELayer(nn.Module):
         replicated_prefixes = ('key_proj', 'value_proj', 'norm_key', 'norm_query', 'norm_conv', 'conv1d')
         for name, param in self.named_parameters():
             if name.startswith(replicated_prefixes) or name.endswith('norm.weight'):
-                # The SP forward gathers the full sequence, so every TP rank already
-                # produces the complete gradient: sync the replicas with AVG instead of
-                # the SP SUM, which would amplify the grads by tp_size.
-                setattr(param, 'sequence_parallel', False)
-                setattr(param, 'average_gradients_across_tp_domain', config.sequence_parallel)
+                # Sharded compute leaves a partial gradient per rank: SUM. Duplicated
+                # compute (SP off) already has the whole one: AVG, or SUM inflates it by tp.
+                setattr(param, 'sequence_parallel', self.sp_size > 1)
+                setattr(param, 'average_gradients_across_tp_domain',
+                        bool(config.sequence_parallel) and self.sp_size == 1)
+
+    @property
+    def tp_size(self) -> int:
+        return self.pg_collection.tp.size()
+
+    @property
+    def cp_size(self) -> int:
+        return self.pg_collection.cp.size()
+
+    @property
+    def sp_size(self) -> int:
+        """Rows each rank holds over TP: TP only splits the sequence under sequence parallelism."""
+        return self.tp_size if self.config.sequence_parallel else 1
+
+    @property
+    def tp_rank(self) -> int:
+        return self.pg_collection.tp.rank() if self.sp_size > 1 else 0
+
+    @property
+    def cp_rank(self) -> int:
+        return self.pg_collection.cp.rank() if self.cp_size > 1 else 0
+
+    @property
+    def tp_cp_stride(self) -> int:
+        """The tp-cp group is laid out tp-fastest, so a rank's index is tp_rank + tp * cp_rank."""
+        return self.sp_size
 
     def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Training variant of transformers `_short_conv` (no conv state cache):
@@ -520,7 +590,14 @@ class Qwen4ExpTextPLELayer(nn.Module):
     def compute(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         """Mirrors transformers ``Qwen4ExpTextPLELayer.forward`` (training
         variant); hidden_states/input_ids: [rows, L, nH]/[rows, L]."""
-        embeddings = self.ple_embedding(input_ids)  # mcore-specific: no past_key_values cache arg
+        return self._mix(hidden_states, self.ple_embedding(input_ids))  # mcore-specific: no past_key_values cache arg
+
+    def _mix(self, hidden_states: torch.Tensor, embeddings: torch.Tensor) -> torch.Tensor:
+        """Gate + short conv + residual on precomputed embeddings.
+
+        Split out of ``compute`` so the table lookup (a TP all-reduce) happens once per block
+        instead of once per document: a differing collective count across ranks deadlocks.
+        """
         if use_ple_fused_kernel() and embeddings.device.type != 'cpu':
             fused = self._compute_fused(hidden_states, embeddings)
             if fused is not None:
@@ -595,60 +672,319 @@ class Qwen4ExpTextPLELayer(nn.Module):
         """hidden_states: [s, b, nH] (bsh) or thd [T, 1, nH]; input_ids: [b, s] or [1, T].
 
         mcore-specific wrapper (no counterpart in transformers): TP needs no
-        special handling (replicated weights, full-width hidden between
-        blocks); under SP/CP the shard is gathered to the full sequence
-        (undoing SP first, then the CP zigzag), ``compute`` runs on the full
-        sequence, and the additive output is scattered back.
+        special handling (replicated weights, full-width hidden between blocks).
+
+        The increment is token-local up to a left window, so shards are not gathered: each rank
+        computes its rows plus ``context_rows`` published by the preceding rank. ``_forward_impl``
+        remains the full-sequence reference and serves short, unsharded inputs.
         """
-        sp_on = (
-            self.pg_collection is not None and self.config.sequence_parallel
-            and self.config.tensor_model_parallel_size > 1)
-        cp_on = self.config.context_parallel_size > 1
-        if not (sp_on or cp_on):
-            return self._forward_impl(hidden_states, input_ids, packed_seq_params)
-
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
+        if self.sp_size == 1 and self.cp_size == 1 and self._impl_rows(
+                packed_seq_params, hidden_states.shape[0], thd) <= ple_chunk_tokens(hidden_states.shape[-1]):
+            return self._forward_impl(hidden_states, input_ids, packed_seq_params)
+        return self._forward_windowed(hidden_states, input_ids, packed_seq_params, thd)
 
-        # ---- gather the shard into the full sequence (SP shard is innermost) ----
-        if sp_on:
+    @staticmethod
+    def _impl_rows(packed_seq_params, rows: int, thd: bool) -> int:
+        """Rows ``_forward_impl`` materialises: it pads every document to ``max_seqlen_q``."""
+        if not thd:
+            return rows
+        max_seqlen_q = packed_seq_params.max_seqlen_q
+        max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
+        return get_num_samples(packed_seq_params) * max_len
+
+    def _cp_chunks(self, doc_length: int) -> List[tuple]:
+        """``(slot, cp-local offset, global offset, length)`` of this rank's two halves of a
+        document: CP splits it into ``2*cp`` chunks and keeps ``cp_rank`` / ``2*cp-1-cp_rank``."""
+        if self.cp_size == 1:
+            return [(0, 0, 0, doc_length)]
+        if doc_length % (2 * self.cp_size):
+            raise ValueError(f'PLE cannot shard a document of {doc_length} tokens into '
+                             f'2*cp={2 * self.cp_size} CP chunks.')
+        piece = doc_length // (2 * self.cp_size)
+        return [(0, 0, self.cp_rank * piece, piece), (1, piece, (2 * self.cp_size - 1 - self.cp_rank) * piece, piece)]
+
+    def _cp_local_offsets(self, documents: List[tuple]) -> List[int]:
+        """Offset of each document inside the CP-local tensor."""
+        offsets, cursor = [], 0
+        for doc_start, doc_end in documents:
+            offsets.append(cursor)
+            cursor += sum(chunk[3] for chunk in self._cp_chunks(doc_end - doc_start))
+        return offsets
+
+    def _local_runs(self, total: int, documents: List[tuple], tp_rank: Optional[int] = None) -> List[tuple]:
+        """``[(local_start, run_len, global_start, slot), ...]`` in local row order: the TP slice of
+        the CP-local tensor intersected with the per-document chunks."""
+        if total % (self.sp_size * self.cp_size):
+            raise ValueError(f'PLE needs the gathered sequence length {total} to be divisible by '
+                             f'sp*cp={self.sp_size * self.cp_size}.')
+        tp_rank = self.tp_rank if tp_rank is None else tp_rank
+        local_len = total // (self.sp_size * self.cp_size)
+        k0 = tp_rank * local_len
+        offsets = self._cp_local_offsets(documents)
+        runs = []
+        for doc_index, (doc_start, doc_end) in enumerate(documents):
+            for slot, local_offset, global_offset, piece in self._cp_chunks(doc_end - doc_start):
+                cp_start = offsets[doc_index] + local_offset
+                lo, hi = max(k0, cp_start), min(k0 + local_len, cp_start + piece)
+                if hi > lo:
+                    runs.append((lo - k0, hi - lo, doc_start + global_offset + (lo - cp_start), 2 * doc_index + slot))
+        runs.sort(key=lambda run: run[0])
+        return runs
+
+    def _owner_of(self, token: int, total: int, documents: List[tuple]) -> tuple:
+        """``(tp_rank, cp_rank, slot)`` owning global ``token``, i.e. the tail that ends after it."""
+        offsets = self._cp_local_offsets(documents)
+        local_len = total // (self.sp_size * self.cp_size)
+        for doc_index, (doc_start, doc_end) in enumerate(documents):
+            if token >= doc_end:
+                continue
+            offset = token - doc_start
+            if self.cp_size == 1:
+                cp_rank, half, cp_local = 0, 0, offsets[doc_index] + offset
+            else:
+                piece = (doc_end - doc_start) // (2 * self.cp_size)
+                chunk = offset // piece
+                half = 0 if chunk < self.cp_size else 1
+                cp_rank = chunk if half == 0 else 2 * self.cp_size - 1 - chunk
+                cp_local = offsets[doc_index] + half * piece + offset % piece
+            return cp_local // local_len, cp_rank, 2 * doc_index + half
+        raise ValueError(f'PLE: global token {token} lies outside the documents.')
+
+    def _halo_shortfall(self, total: int, documents: List[tuple]) -> Optional[str]:
+        """Why the tail exchange cannot be used for this microbatch, ``None`` when it can.
+        Geometry only, so every rank picks the same branch (different collectives would deadlock)."""
+        local_len = total // (self.sp_size * self.cp_size)
+        shortest = min(run[1] for tp_rank in range(self.sp_size) for run in self._local_runs(total, documents, tp_rank))
+        if shortest < self.context_rows:
+            return (
+                f'the shortest run is {shortest} rows, below the {self.context_rows}-row window '
+                f'(a packed document needs about {2 * self.cp_size * self.context_rows} tokens for cp={self.cp_size})')
+        slots = 2 * len(documents) * self.context_rows
+        if slots > local_len:
+            return f'the {2 * len(documents)} published tails ({slots} rows) exceed the {local_len}-row local block'
+        return None
+
+    def _cp_local_pieces(self, documents: List[tuple]) -> List[tuple]:
+        """This CP rank's chunks as ``(cp_local_start, length, global_start)``."""
+        offsets = self._cp_local_offsets(documents)
+        pieces = []
+        for doc_index, (doc_start, doc_end) in enumerate(documents):
+            for _slot, local_offset, global_offset, piece_len in self._cp_chunks(doc_end - doc_start):
+                pieces.append((offsets[doc_index] + local_offset, piece_len, doc_start + global_offset))
+        return pieces
+
+    @staticmethod
+    def _cp_partition_mode(packed_seq_params) -> str:
+        """CP split layout. It rides on the batch (mcore's ``PackedSeqParams`` has no such field,
+        ms-swift attaches it); the geometry below is zigzag only, so contiguous must be rejected."""
+        return getattr(packed_seq_params, 'cp_partition_mode', 'zigzag')
+
+    @staticmethod
+    def _document_start(token: int, documents: List[tuple]) -> int:
+        for doc_start, doc_end in documents:
+            if token < doc_end:
+                return doc_start
+        raise ValueError(f'PLE: global token {token} lies outside the documents.')
+
+    def _exchange_halo(self, hidden_states: torch.Tensor, runs: List[tuple], documents: List[tuple]) -> torch.Tensor:
+        """Publish each local run's trailing ``context_rows`` rows -> ``[tp*cp, 2*docs, rows, ...]``."""
+        tails = hidden_states.new_zeros((2 * len(documents), self.context_rows) + tuple(hidden_states.shape[1:]))
+        for local_start, run_len, _global_start, slot in runs:
+            take = min(self.context_rows, run_len)
+            tails[slot, self.context_rows - take:] = hidden_states[local_start + run_len - take:local_start + run_len]
+        return _PleHaloGather.apply(tails, parallel_state.get_tensor_and_context_parallel_group())
+
+    def _gather_full(self, hidden_states: torch.Tensor, packed_seq_params) -> torch.Tensor:
+        """Materialise the whole sequence: the fallback when a local block is shorter than one window."""
+        if self.sp_size > 1:
             hidden_states = gather_from_sequence_parallel_region(
-                hidden_states, tensor_parallel_output_grad=False, group=self.pg_collection.tp)
-        if cp_on:
-            # For packed (thd) inputs the data pipeline (swift get_batch_on_this_cp_rank)
-            # zigzag-splits hidden/input_ids per sample via cu_seqlens_q while keeping
-            # packed_seq_params itself global, so the undo uses the same cu.
-            psp_for_cp = packed_seq_params if thd else None
+                hidden_states, tensor_parallel_output_grad=True, group=self.pg_collection.tp)
+        if self.cp_size > 1:
             hidden_states = gather_from_sequence_parallel_region(
                 hidden_states, tensor_parallel_output_grad=True, group=parallel_state.get_context_parallel_group())
             hidden_states = _undo_attention_load_balancing(hidden_states,
-                                                           parallel_state.get_context_parallel_world_size(), psp_for_cp)
-            # The data pipeline may hand us either a CP-sharded or a full copy of
-            # input_ids; re-align only when the lengths disagree.
-            if input_ids.shape[-1] != hidden_states.shape[0]:
-                input_ids = reconstruct_tensor_cp(input_ids, psp_for_cp, dim=1)
-        elif input_ids.shape[-1] != hidden_states.shape[0]:
-            raise ValueError(f'PLE input_ids length {input_ids.shape[-1]} does not match the gathered '
-                             f'sequence length {hidden_states.shape[0]} under sequence parallelism; '
-                             'gpt_model is expected to pass the full, unsharded input_ids.')
+                                                           parallel_state.get_context_parallel_world_size(),
+                                                           packed_seq_params)
+        return hidden_states
 
+    def _global_input_ids(self, input_ids: torch.Tensor, packed_seq_params, total: int) -> torch.Tensor:
+        """The full, unsharded ids: windows are indexed by global position, so a CP-sharded copy is rebuilt."""
+        if input_ids.shape[-1] == total:
+            return input_ids
+        if self.cp_size > 1:
+            ids = reconstruct_tensor_cp(
+                input_ids, packed_seq_params, dim=1, cp_partition_mode=self._cp_partition_mode(packed_seq_params))
+            if ids.shape[-1] == total:
+                return ids
+        raise ValueError(f'PLE needs the full (unsharded) input_ids: got {input_ids.shape[-1]} tokens for a '
+                         f'gathered sequence of {total}. gpt_model is expected to pass the full input_ids.')
+
+    def _document_bounds(self, packed_seq_params, total: int) -> List[tuple]:
+        """Per-document ``[start, end)`` global token ranges (both the n-gram shift
+        and the short conv restart at a document boundary)."""
+        cu = getattr(packed_seq_params, 'cu_seqlens_q', None) if packed_seq_params is not None else None
+        if cu is None:
+            return [(0, total)]
+        bounds = self._normalize_cu_seqlens(cu, total).tolist()
+        return [(int(start), int(end)) for start, end in zip(bounds[:-1], bounds[1:]) if int(end) > int(start)]
+
+    def _forward_windowed(self, hidden_states: torch.Tensor, input_ids: torch.Tensor, packed_seq_params,
+                          thd: bool) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        total = rows * self.sp_size * self.cp_size
+        psp = packed_seq_params if thd else None
         if thd:
-            # SP keeps one global cu_seqlens copy per rank; normalize padded/offset
-            # forms against the gathered total so cu indexes the full sequence.
-            # copy.copy (not dataclasses.replace) preserves dynamically attached
-            # fields such as `num_samples` that the data pipeline relies on.
-            cu = self._normalize_cu_seqlens(getattr(packed_seq_params, 'cu_seqlens_q', None), hidden_states.shape[0])
+            # The data pipeline may hand over a cu without its leading 0 or with a per-batch
+            # offset; align it once against the gathered total for the gather and the ids.
             psp = copy.copy(packed_seq_params)
-            psp.cu_seqlens_q = cu
-            packed_seq_params = psp
+            psp.cu_seqlens_q = self._normalize_cu_seqlens(packed_seq_params.cu_seqlens_q, total)
+        if self.cp_size > 1 and self._cp_partition_mode(psp) != 'zigzag':
+            raise NotImplementedError(f'PLE windowed forward supports the zigzag CP partition only, got '
+                                      f'cp_partition_mode={self._cp_partition_mode(psp)!r}.')
+        ids = self._global_input_ids(input_ids, psp, total)
+        documents = self._document_bounds(psp, total)
+        runs = self._local_runs(total, documents)
 
-        out = self._forward_impl(hidden_states, input_ids, packed_seq_params)
+        sharded = self.sp_size > 1 or self.cp_size > 1
+        # SP off with TP > 1 duplicates the compute, so every copy would consume the same tail and
+        # the reduce-scatter would count its gradient tp times.
+        tp_duplicated = self.tp_size > 1 and self.sp_size == 1
+        shortfall = self._halo_shortfall(total, documents) if sharded and not tp_duplicated else None
+        if sharded and shortfall is None and not tp_duplicated:
+            source, halo, source_is_global = hidden_states, self._exchange_halo(hidden_states, runs, documents), False
+        elif sharded:
+            reason = shortfall if shortfall is not None else (
+                f'sequence parallelism is off while tp={self.config.tensor_model_parallel_size} duplicates the '
+                'compute, so the tail exchange would count its gradient tp times')
+            get_logger().warning_once(
+                f'PLE windowed forward falls back to the full-sequence gather: {reason}. The PLE block keeps '
+                'an O(sequence) peak in this step; pad or merge the short documents of the pack (or keep '
+                'sequence_parallel on) to get the windowed path back.',
+                hash_id='ple-halo-shortfall')
+            source, halo, source_is_global = self._gather_full(hidden_states, psp), None, True
+        else:
+            source, halo, source_is_global = hidden_states, None, True
 
-        # ---- scatter the additive output back to the caller's shard ----
-        if cp_on:
-            out = split_cp_inputs(out, getattr(packed_seq_params, 'cu_seqlens_q', None) if thd else None, dim=0)
-        if sp_on:
-            out = scatter_to_sequence_parallel_region(out, group=self.pg_collection.tp)
-        return out
+        plan = []
+        for local_start, run_len, global_start, _slot in runs:
+            owner = slot = 0
+            if halo is not None and global_start > 0:
+                owner_tp, owner_cp, slot = self._owner_of(global_start - 1, total, documents)
+                owner = owner_tp + self.tp_cp_stride * owner_cp
+            for doc_start, doc_end in documents:
+                if doc_end <= global_start:
+                    continue
+                if doc_start >= global_start + run_len:
+                    break
+                start = local_start + max(0, doc_start - global_start)
+                end = local_start + min(run_len, doc_end - global_start)
+                if start >= end:
+                    continue
+                plan.append(
+                    _PlePiece(
+                        run_local_start=local_start,
+                        start=start,
+                        end=end,
+                        global_start=global_start,
+                        owner=owner,
+                        slot=slot))
+
+        # One lookup for the whole CP-local block: the vocabulary-parallel lookup all-reduces over
+        # TP, so every TP rank must feed the same ids, and each piece is preceded by the
+        # `ngram_size - 1` eos ids that keep documents from leaking into each other's hash.
+        eos = self.ple_embedding.eos_token_id
+        cp_pieces = self._cp_local_pieces(documents)
+        blocks, window_starts = [], []
+        for cp_start, piece_len, global_start in cp_pieces:
+            context = min(self.context_rows, global_start - self._document_start(global_start, documents))
+            window_starts.append(global_start - context)
+            blocks.append(
+                torch.cat([
+                    ids.new_full((ids.shape[0], self.ngram_size - 1), eos),
+                    ids[:, global_start - context:global_start + piece_len]
+                ],
+                          dim=1))
+        width = sum(block.shape[1] for block in blocks)
+        capacity = total // self.cp_size + 2 * len(documents) * (self.context_rows + self.ngram_size - 1)
+        if width > capacity:
+            raise ValueError(f'PLE windowed block ({width} rows) exceeds its geometry bound ({capacity}).')
+        feed = blocks + ([ids.new_full((ids.shape[0], capacity - width), eos)] if width < capacity else [])
+        embeddings = self.ple_embedding(torch.cat(feed, dim=1))
+
+        # A piece belongs to the CP chunk containing its first row; windows overlap by
+        # `context_rows`, so matching on the window would hit two chunks.
+        chunk_rows = ple_chunk_tokens(hidden_states.shape[-1])
+        tp_base = self.tp_rank * rows
+        located = []
+        embedding_offset = 0
+        # Rows still holding fp32 kernel state. `_PLEGateConv` saves `conv_pre` per call, so the
+        # *total* has to stay in budget: a pack of short documents would otherwise never checkpoint.
+        retained = 0
+        for (cp_start, piece_len, _global_start), block, window_start in zip(cp_pieces, blocks, window_starts):
+            window = embeddings[:, embedding_offset:embedding_offset + block.shape[1]].contiguous()
+            embedding_offset += block.shape[1]
+            for piece in plan:
+                if not cp_start <= piece.start + tp_base < cp_start + piece_len:
+                    continue
+                tensor, retained = self._compute_piece(source, window, halo, piece, chunk_rows, source_is_global,
+                                                       window_start, retained)
+                located.append((piece.start, tensor))
+        if sorted(start for start, _bytes in located) != [piece.start for piece in plan]:
+            raise ValueError(f'PLE matched {len(located)} pieces to the lookup blocks, expected the {len(plan)} '
+                             'planned pieces exactly once.')
+        located.sort(key=lambda item: item[0])
+        expected = 0
+        for start, tensor in located:
+            if start != expected:
+                raise ValueError(f'PLE pieces do not tile the row block: expected row {expected}, got {start}.')
+            expected += tensor.shape[0]
+        if expected != rows:
+            raise ValueError(f'PLE pieces cover {expected} of {rows} rows.')
+        pieces = [tensor for _start, tensor in located]
+        return pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0)
+
+    def _compute_piece(self, source: torch.Tensor, embeddings: torch.Tensor, halo, piece: _PlePiece, chunk_rows: int,
+                       source_is_global: bool, window_global_start: int, retained: int) -> tuple:
+        """Chunk one piece, each chunk with the ``context_rows`` window the full-sequence path sees.
+
+        ``retained`` is how many rows this rank already holds un-recomputed fp32 state for; a chunk
+        is checkpointed once keeping it would exceed ``chunk_rows``. Returns ``(output, retained)``.
+        """
+        source_base = piece.global_start if source_is_global else piece.run_local_start
+        outs = []
+        position = piece.start
+        while position < piece.end:
+            chunk_end = min(piece.end, position + chunk_rows)
+            checkpointed = retained + (chunk_end - position) > chunk_rows
+            if not checkpointed:
+                retained += chunk_end - position
+            global_position = piece.global_start + (position - piece.run_local_start)
+            # Never reach back past the document start: that is where the full-sequence path
+            # zero-pads the conv and restarts the hash with eos.
+            context = min(self.context_rows, global_position - window_global_start)
+            available = global_position if source_is_global else position - piece.run_local_start
+            owned = min(context, available)
+            window_start = source_base + (position - piece.run_local_start - owned)
+            window_end = source_base + (chunk_end - piece.run_local_start)
+            state = source[window_start:window_end]
+            if halo is not None:
+                # Tails are right-aligned in their slot, so the missing rows are its last
+                # `context - owned` entries (offsetting by `context` only holds when `owned == 0`).
+                tail = halo[piece.owner, piece.slot, self.context_rows - (context - owned):]
+                # Cat even when empty: autograd drops the backward of an unused node, so a rank
+                # needing no tail would skip the reduce-scatter and deadlock the others.
+                state = torch.cat([tail, state], dim=0)
+            embedding_start = self.ngram_size - 1 + (global_position - context - window_global_start)
+            window = embeddings[:, embedding_start:embedding_start + context + (chunk_end - position)]
+            state = state.transpose(0, 1)
+            if checkpointed:
+                result = checkpoint(self._mix, state, window, use_reentrant=False)
+            else:
+                result = self._mix(state, window)
+            outs.append(result[:, context:].transpose(0, 1))
+            position = chunk_end
+        return (outs[0] if len(outs) == 1 else torch.cat(outs, dim=0)), retained
 
     def _forward_impl(
         self,

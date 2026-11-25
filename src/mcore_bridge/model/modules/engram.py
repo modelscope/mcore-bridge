@@ -1,11 +1,12 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """DeepSeek-V4.1 adapters for NVIDIA Megatron-Core's optional Engram modules."""
 
+import copy
 import dataclasses
 import torch
 from torch import Tensor
 
-from ...utils import gc_collect, get_logger
+from ...utils import gc_collect, get_logger, use_ngram_embedding_cpu_offload
 from ...utils.megatron_utils import split_cp_inputs
 from .engram_fp8 import Fp8EngramEmbedding, fp8_quant_declared
 
@@ -202,6 +203,20 @@ def _positions_in_segment(cu_seqlens: Tensor | None, sequence_length: int, devic
     return positions - boundaries[segment_index]
 
 
+def to_sequence_major(embedded: Tensor) -> Tensor:
+    """Reorder ``[B, S, D]`` embedding output to ``[S, B, D]`` with canonical strides.
+
+    ``embedded.transpose(0, 1).contiguous()`` looks equivalent, but for ``B == 1`` the size-1
+    dimension is ignored by the contiguity check, so ``.contiguous()`` (and a same-shape
+    ``.reshape``) is a no-op and the stale ``(D, S * D, 1)`` stride survives. Feeding that into
+    ``nn.Linear`` makes some backends take a broadcasting path and allocate ``S x out_features x
+    in_features`` per call (observed 53-217 GiB on MUSA for DeepSeek-V4.1 Engram). Going through
+    the 2-D view forces a real copy whenever the layout is not canonical.
+    """
+    batch, seq, dim = embedded.shape
+    return embedded.movedim(0, 1).reshape(-1, dim).view(seq, batch, dim)
+
+
 def _build_ngram_hashes(
     input_ids: Tensor,
     tokenizer_remap: Tensor | None,
@@ -245,10 +260,24 @@ def _build_ngram_hashes(
 class DeepseekV41Engram(Engram):
     """DeepSeek V4.1 Engram without projection bias or the Qwen short-conv branch."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, config, *args, **kwargs):
         if EngramConfig is None:
             raise RuntimeError('The installed Megatron-Core does not provide Engram.')
-        super().__init__(*args, **kwargs)
+        cpu_offload = use_ngram_embedding_cpu_offload()
+        init_config = copy.copy(config) if cpu_offload else config
+        if cpu_offload:
+            init_config.use_cpu_initialization = True
+        super().__init__(init_config, *args, **kwargs)
+        if cpu_offload:
+            from .engram_cpu import retain_tables_on_cpu
+            retain_tables_on_cpu(self.embedding)
+            get_logger().warning_once('DeepSeek-V4.1 Engram embedding tables are frozen on CPU; '
+                                      'only requested rows are transferred to the accelerator.')
+            self.config = self.embedding.config = config
+            for table in self.embedding.tables:
+                table.config = config
+            if not config.use_cpu_initialization:
+                self.to(device=torch.cuda.current_device())
         # PR #7231's DeepSeek variant predates the released V4.1 checkpoint layout.
         # Keep its initialized weights but remove parameters absent from that checkpoint.
         self.value_projection.register_parameter('bias', None)
@@ -259,6 +288,8 @@ class DeepseekV41Engram(Engram):
 
     def _maybe_use_fp8_tables(self) -> None:
         """Swap the bf16 row shards for the fp8-resident store when the checkpoint declares them."""
+        if use_ngram_embedding_cpu_offload():
+            return
         if Fp8EngramEmbedding is None or isinstance(self.embedding, Fp8EngramEmbedding):
             return
         if not fp8_quant_declared(getattr(self, 'config', None)):
@@ -385,7 +416,7 @@ class DeepseekV41Engram(Engram):
 
         nvtx_range_push('engram.lookup')
         try:
-            memory = self.embedding(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
+            memory = to_sequence_major(self.embedding(hash_ids).flatten(start_dim=-2))
         finally:
             nvtx_range_pop('engram.lookup')
         streams = hidden_states.view(hidden_states.shape[0], hidden_states.shape[1], self.num_streams, self.hidden_size)

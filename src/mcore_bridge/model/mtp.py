@@ -61,6 +61,10 @@ class MtpCapabilities:
     has_roll_context: bool = False
     has_mhc_multistream: bool = False
 
+    # 0.20 builds the split e_proj/h_proj only under `enable_mhc_connections` (which also
+    # demands the HybridStack MTP contract); dev selects them from `enable_hyper_connections`.
+    split_projection_from_hyper_connections: bool = False
+
     fingerprint: str = ''
 
     @property
@@ -95,6 +99,12 @@ def get_mtp_capabilities() -> MtpCapabilities:
     ckpt = _params(getattr(McoreMultiTokenPredictionLayer, '_checkpointed_forward', None))
     block_fwd = _params(McoreMultiTokenPredictionBlock.forward)
     has_roll_context = hasattr(_mtp_mod, 'MTPSequenceRollContext')
+    try:
+        layer_init_src = inspect.getsource(McoreMultiTokenPredictionLayer.__init__)
+    except (OSError, TypeError):
+        layer_init_src = ''
+    split_projection_from_hyper_connections = ('self.mhc_enabled = self.config.enable_hyper_connections'
+                                               in layer_init_src)
 
     caps = MtpCapabilities(
         has_detach_heads='mtp_detach_heads' in tc,
@@ -109,12 +119,14 @@ def get_mtp_capabilities() -> MtpCapabilities:
         block_forward_params=block_fwd,
         has_roll_context=has_roll_context,
         has_mhc_multistream='mhc_multistream' in block_fwd,
+        split_projection_from_hyper_connections=split_projection_from_hyper_connections,
         fingerprint=(f'pm={"padding_mask" in layer_fwd} ckpt_pm={"padding_mask" in ckpt} '
                      f'roll_ctx={has_roll_context} mhc={"mhc_multistream" in block_fwd} '
                      f'hybrid_pat={"mtp_hybrid_override_pattern" in tc} '
                      f'early_bwd={"mtp_loss_early_backward" in tc} '
                      f'keep_bf16={"keep_mtp_in_bf16" in tc} '
-                     f'layer_input_mask={"mtp_input_mask" in emb_fwd}'),
+                     f'layer_input_mask={"mtp_input_mask" in emb_fwd} '
+                     f'split_proj={split_projection_from_hyper_connections}'),
     )
     logger.debug(f'MTP capabilities: {caps.fingerprint}')
     return caps

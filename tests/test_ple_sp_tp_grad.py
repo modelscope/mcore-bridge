@@ -1,20 +1,19 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-"""GPU regression test: PLE parameter grads under sequence parallel must not be scaled by TP.
+"""GPU regression test: PLE parameter grads under sequence parallel must be summed over TP.
 
-PLE's SP forward gathers the full sequence, runs ``compute`` and scatters the additive
-output back to the local shard, so every TP rank already produces the complete
-full-sequence gradient for the replicated key_proj/value_proj/norm_*/conv1d parameters.
-The finalizer must therefore sync them with ``average_gradients_across_tp_domain`` (AVG);
-the old ``sequence_parallel`` flag (SUM) multiplied them by tp_size (issue #233).
+PLE's windowed forward computes only this rank's rows, so every TP rank holds a *partial*
+gradient for the replicated key_proj/value_proj/norm_*/conv1d parameters: the finalizer
+must sync them with the SP SUM (``sequence_parallel``). The AVG flag, which was right when
+every rank held the complete gradient, now under-counts by tp_size.
 
 The test drives the real ``Qwen4ExpTextPLELayer.forward`` on real NCCL TP ranks, pushes
 the grads through the real ``finalize_model_grads``, and compares against the same
 layer's full-sequence ``_forward_impl`` (the TP=1, SP=off reference). A negative control
-restores the old flag and must reproduce the tp_size amplification.
+restores the AVG flag and must reproduce the 1/tp_size under-count.
 
 The second test covers LoRA adapters wrapped around the same projections (a pure-LoRA
-setup with frozen base weights): they inherit the base's AVG sync through
-``tuners/lora.py``, so their grads must stay at 1x as well.
+setup with frozen base weights): they inherit the base's sync flag through
+``tuners/lora.py``, so their grads must match the full-sequence ones as well.
 """
 import itertools
 import os
@@ -23,6 +22,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import types
+from datetime import timedelta
 from megatron.core.packed_seq_params import PackedSeqParams
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA')
@@ -119,8 +119,10 @@ def _lora_layer(config, tp_rank, device):
 def _inputs(tp_size, layout, device):
     generator = torch.Generator(device='cpu').manual_seed(7)
     width = 16  # hc_count * hidden_size
+    # 32 rows per rank keeps every run above the 11-row window, so the tail
+    # exchange (not the full-gather fallback) is what gets exercised.
     if layout == 'thd':
-        lengths = [4 * tp_size, 12 * tp_size]
+        lengths = [8 * tp_size, 24 * tp_size]
         boundaries = torch.tensor([0, *itertools.accumulate(lengths)], dtype=torch.int32, device=device)
         packed = PackedSeqParams(
             qkv_format='thd',
@@ -130,7 +132,7 @@ def _inputs(tp_size, layout, device):
             max_seqlen_kv=max(lengths))
         total, batch = sum(lengths), 1
     else:
-        packed, total, batch = None, 16 * tp_size, 2
+        packed, total, batch = None, 32 * tp_size, 2
     hidden = torch.randn(total, batch, width, generator=generator).to(device)
     probe = torch.randn(total, batch, width, generator=generator).to(device)
     input_ids = torch.randint(0, 64, (batch, total), generator=generator).to(device)
@@ -169,12 +171,18 @@ def _worker(rank, tp_size, init_file, layout, fused, lora=False):
     os.environ['PLE_FUSED_KERNEL'] = fused
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
-    dist.init_process_group('nccl', init_method=f'file://{init_file}', rank=rank, world_size=tp_size)
+    dist.init_process_group(
+        'nccl', init_method=f'file://{init_file}', rank=rank, world_size=tp_size, timeout=timedelta(seconds=120))
     from megatron.core import parallel_state
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=tp_size)
     try:
         _run_case(rank, tp_size, device, layout, fused, lora)
     finally:
+        if dist.is_initialized():
+            try:
+                dist.barrier()
+            except RuntimeError:
+                pass  # a peer already failed; do not mask its error
         parallel_state.destroy_model_parallel()
         dist.destroy_process_group()
 
@@ -190,12 +198,12 @@ def _run_case(rank, tp_size, device, layout, fused, lora=False):
     hidden, probe, input_ids, packed = _inputs(tp_size, layout, device)
     local = slice(rank * hidden.shape[0] // tp_size, (rank + 1) * hidden.shape[0] // tp_size)
 
-    # The constructor (and lora.py for the adapters) must sync replicas with AVG, never
-    # with the SP SUM.
+    # The constructor (and lora.py for the adapters) must sync replicas with the SP SUM:
+    # each rank holds one slice of the sequence.
     for name, param in layer.named_parameters():
         if name in checked:
-            assert getattr(param, 'sequence_parallel', False) is False, f'{case} {name}: sequence_parallel'
-            assert getattr(param, 'average_gradients_across_tp_domain', False), \
+            assert getattr(param, 'sequence_parallel', False) is True, f'{case} {name}: sequence_parallel'
+            assert getattr(param, 'average_gradients_across_tp_domain', False) is False, \
                 f'{case} {name}: average_gradients_across_tp_domain'
 
     # --- reference: full-sequence compute on the same layer (== TP=1, SP=off math) ---
@@ -223,15 +231,18 @@ def _run_case(rank, tp_size, device, layout, fused, lora=False):
             _allreduce_non_tensor_model_parallel_grads([chunk], config)
         return out, hidden_grad, _grads(layer)
 
-    # --- the SP forward/backward already produces the complete gradient on every rank ---
+    # --- the SP forward/backward produces one slice of the gradient per rank ---
     out, hidden_grad = sp_backward()
     torch.testing.assert_close(out, full_out[local], rtol=1e-5, atol=1e-5, msg=lambda m: f'{case} forward: {m}')
     torch.testing.assert_close(
         hidden_grad, ref_hidden[local], rtol=1e-5, atol=1e-5, msg=lambda m: f'{case} input grad: {m}')
+    from megatron.core import parallel_state
     pre = _grads(layer)
     for name in checked:
+        summed = pre[name].clone()
+        dist.all_reduce(summed, group=parallel_state.get_tensor_model_parallel_group())
         torch.testing.assert_close(
-            pre[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m: f'{case} pre-finalize {name}: {m}')
+            summed, ref[name], rtol=1e-4, atol=1e-5, msg=lambda m: f'{case} pre-finalize {name}: {m}')
 
     # --- the regression assertion: the real finalizer keeps the grads at 1x ---
     _, _, post = backward_then_finalize()
@@ -239,16 +250,16 @@ def _run_case(rank, tp_size, device, layout, fused, lora=False):
         torch.testing.assert_close(
             post[name], ref[name], rtol=1e-4, atol=1e-5, msg=lambda m: f'{case} post-finalize {name}: {m}')
 
-    # --- negative control: the old flag must reproduce the tp_size amplification ---
+    # --- negative control: AVG over partial gradients under-counts by tp_size ---
     for name, param in layer.named_parameters():
         if name in checked:
-            param.sequence_parallel = True
-            param.average_gradients_across_tp_domain = False
+            param.sequence_parallel = False
+            param.average_gradients_across_tp_domain = True
     _, _, buggy = backward_then_finalize()
     for name in checked:
         torch.testing.assert_close(
             buggy[name],
-            ref[name] * tp_size,
+            ref[name] / tp_size,
             rtol=2e-3,
             atol=1e-4,
             msg=lambda m: f'{case} negative control {name}: {m}')

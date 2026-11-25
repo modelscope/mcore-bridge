@@ -21,7 +21,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.spec_utils import build_module
-from megatron.core.utils import make_viewless_tensor, nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from torch import Tensor, nn
 from transformers import AutoModel, PretrainedConfig
 from typing import Optional, Tuple
@@ -851,6 +851,8 @@ class Gemma4TransformerLayer(TransformerLayer):
         # Optional Layer norm post the cross-attention.
         pre_mlp_layernorm_output = self._forward_pre_mlp_layernorm(hidden_states)
         mlp_output, bias = self.mlp(pre_mlp_layernorm_output, padding_mask=padding_mask)
+        # Recompute hook tensor; the MoE branch below overwrites `mlp_output`.
+        mlp_raw_output = mlp_output
         if self.enable_moe_block:
             mlp_output_1 = self.post_feedforward_layernorm_1(mlp_output)
             mlp_output_2, bias = self.experts_mlp(residual, padding_mask=padding_mask)
@@ -860,10 +862,7 @@ class Gemma4TransformerLayer(TransformerLayer):
             mlp_output = mlp_output_1 + mlp_output_2
 
         mlp_output = self.post_feedforward_layernorm(mlp_output)
-        hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)((mlp_output, bias), residual,
-                                                                                     self.hidden_dropout)
-        output = make_viewless_tensor(inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True)
-        return output
+        return self._mlp_post_step((mlp_output, bias), residual, mlp_raw_output=mlp_raw_output)
 
     def forward(self, hidden_states, *args, **kwargs):
         per_layer_input = kwargs.pop('per_layer_input', None)

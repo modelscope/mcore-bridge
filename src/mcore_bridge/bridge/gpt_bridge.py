@@ -1862,6 +1862,16 @@ class GPTBridge:
         """Extension point for model-specific auxiliary stacks outside standard MTP."""
         return ()
 
+    def patch_export_hf_config(self, hf_config):
+        """Extension point to clean model-specific markers on the EXPORTED HF config.
+
+        Called by the host on a deepcopy of the HF config right before it is saved next to
+        the exported weights, so mutations never touch the live in-memory config. The base
+        implementation is a no-op; models whose source checkpoints carry layout/quantization
+        markers that do not describe the exported BF16 weights override this.
+        """
+        pass
+
     def _convert_hf_state_dict(self, hf_state_dict, to_mcore):
         res = {}
         for k, v in hf_state_dict.items():

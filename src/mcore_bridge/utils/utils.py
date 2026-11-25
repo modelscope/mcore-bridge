@@ -51,6 +51,13 @@ def get_env_args(args_name: str, type_func: Callable[[str], _T], default_value: 
     return value
 
 
+def use_ngram_embedding_cpu_offload() -> bool:
+    """Prefer the shared switch, falling back to the legacy PLE switch."""
+    if 'NGRAM_EMBEDDING_CPU_OFFLOAD' in os.environ:
+        return get_env_args('NGRAM_EMBEDDING_CPU_OFFLOAD', bool, False)
+    return get_env_args('PLE_CPU_OFFLOAD', bool, False)
+
+
 def deep_getattr(obj, attr: str, default=None):
     attrs = attr.split('.')
     for a in attrs:

@@ -217,3 +217,60 @@ def test_swap_keeps_upstream_trainability_on_the_bf16_path():
     assert holder.embedding is upstream
     # A bf16 checkpoint keeps upstream's semantics: the run's own policy decides whether to freeze.
     assert all(table.weight.requires_grad for table in holder.embedding.tables)
+
+
+def test_cpu_offload_survives_complete_engram_initialization(monkeypatch):
+    from mcore_bridge.model.modules.engram_cpu import CPUShardedEmbedding
+
+    monkeypatch.setenv('NGRAM_EMBEDDING_CPU_OFFLOAD', '1')
+    config = _config(fp8_declared=True)
+    config.enable_hyper_connections = False
+    config.hidden_size = 4
+    config.layernorm_epsilon = 1e-6
+    config.init_method = lambda value: value
+    engram_config = SimpleNamespace(
+        tokenizer_remap=None,
+        multipliers=lambda layer: (1, 3),
+        table_sizes=lambda layer: SIZES,
+        head_dim=32,
+        total_memory_dim=64,
+        kernel_size=1,
+        max_ngram_order=2,
+        variant_spec=SimpleNamespace(projection_bias=False, zero_centered_gamma=False))
+    module = DeepseekV41Engram(
+        config,
+        engram_config=engram_config,
+        layer_number=1,
+        pg_collection=SimpleNamespace(tp=None, ep=None, expt_dp=None))
+    assert isinstance(module.embedding, CPUShardedEmbedding)
+    for table in module.embedding.tables:
+        table.weight.fill_(1)
+    module.float()
+    rows = module.embedding(torch.zeros((2, 2), dtype=torch.long)).flatten(-2)
+    assert rows.dtype == module.value_projection.weight.dtype == torch.float32
+    module.value_projection(rows).sum().backward()
+    torch.testing.assert_close(module.value_projection.weight.grad, torch.full_like(module.value_projection.weight, 2))
+    state = {k: v.clone().requires_grad_() for k, v in module.embedding.state_dict().items()}
+    module.embedding.load_state_dict(state)
+    assert all(t.weight.device.type == 'cpu' and not t.weight.requires_grad for t in module.embedding.tables)
+    assert not list(module.embedding.parameters())
+    state['tables.0.weight'] = state['tables.0.weight'].detach().to(torch.float8_e4m3fn)
+    state['tables.0.weight_scale_inv'] = torch.ones(SIZES[0], 1)
+    with pytest.raises(RuntimeError, match='requires dequantized'):
+        module.embedding.load_state_dict(state, strict=False)
+    pointers = [t.weight.data_ptr() for t in module.embedding.tables]
+    module.to(device='meta')
+    assert pointers == [t.weight.data_ptr() for t in module.embedding.tables]
+
+
+@pytest.mark.parametrize('shared,legacy,expected', [(None, None, False), (None, '1', True), ('0', '1', False),
+                                                    ('1', '0', True)])
+def test_offload_switch_precedence(monkeypatch, shared, legacy, expected):
+    from mcore_bridge.utils import use_ngram_embedding_cpu_offload
+
+    for name, value in [('NGRAM_EMBEDDING_CPU_OFFLOAD', shared), ('PLE_CPU_OFFLOAD', legacy)]:
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    assert use_ngram_embedding_cpu_offload() is expected

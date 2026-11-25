@@ -26,12 +26,14 @@ from peft.utils.other import transpose
 from transformers.utils import is_torch_npu_available
 from typing import Any, List, Optional, Tuple
 
-from mcore_bridge.utils import get_current_device
+from mcore_bridge.utils import get_current_device, get_logger
 
 from .npu_lora import NpuGroupedLoraLinear, is_expert_layer
 from .utils import tuners_sharded_state_dict
 
 peft_019 = version.parse(peft.__version__) >= version.parse('0.19.0')
+
+logger = get_logger()
 
 
 def _build_local_te_linear(input_size: int, output_size: int, bias: bool, **kwargs):
@@ -139,6 +141,50 @@ class LoraParallelLinear(MegatronModule, LoraLayer):
         )
 
         self.is_target_conv_1d_layer = False
+
+    def get_weight_for_absorption(self) -> torch.Tensor:
+        """Effective weight for consumers that read a weight instead of calling ``forward()``.
+
+        Absorbed MLA reshapes ``.weight``, which stays the frozen base by adapter contract. Mirrors
+        ``forward()``'s merged/disabled handling. ``lora_bias`` is rejected (an additive term cannot be
+        folded into a weight); training-time ``lora_dropout`` is skipped with a one-time warning, since it
+        only regularizes activations and aborting training over it is disproportionate.
+        """
+        if self.is_grouped:
+            raise AttributeError(f'{self.__class__.__name__} exposes weight{{i}} per gemm, not a single weight')
+        if self.fan_in_fan_out:
+            raise NotImplementedError(f'{self.__class__.__name__} stores a transposed weight; absorption needs B @ A')
+        if self.disable_adapters and self.merged:
+            self.unmerge()  # `forward()` unmerges first, so both paths must start from the base weight
+        base = self.get_base_layer().weight
+        if self.disable_adapters or self.merged:
+            return base
+        for adapter in self.active_adapters:
+            if adapter not in self.lora_A.keys():
+                continue
+            bias_a = getattr(self.lora_A[adapter], 'bias', None)
+            bias_b = getattr(self.lora_B[adapter], 'bias', None)
+            # TE keeps an empty (0,) tensor for `bias=False`, so test numel rather than None.
+            if (bias_a is not None and bias_a.numel() > 0) or (bias_b is not None and bias_b.numel() > 0):
+                raise NotImplementedError('absorbed MLA represents the adapter as a weight, so a lora_bias term '
+                                          'cannot be applied; disable lora_bias for this projection')
+            if not self.training or adapter not in self.lora_dropout:
+                continue
+            dropout = self.lora_dropout[adapter]
+            if isinstance(dropout, nn.Dropout) and dropout.p > 0:
+                logger.warning_once('absorbed MLA reads a static weight, so lora_dropout is ignored for that '
+                                    'projection (it behaves as 0); set lora_dropout=0 to make this explicit.')
+        delta = None
+        for adapter in self.active_adapters:
+            if adapter not in self.lora_A.keys():
+                continue
+            weight_a, weight_b = self.lora_A[adapter].weight, self.lora_B[adapter].weight
+            update = (weight_b.float() @ weight_a.float()) * self.scaling[adapter]
+            delta = update if delta is None else delta + update
+        if delta is None:
+            return base
+        # One rounding of the sum, like `merge()`'s `base += delta`: a sub-half-ulp delta is lost either way.
+        return (base + delta).to(base.dtype)
 
     def update_layer(self, adapter_name, r, *, lora_alpha, **kwargs):
         if peft_019 and 'config' in kwargs:
