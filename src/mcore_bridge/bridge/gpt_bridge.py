@@ -292,8 +292,8 @@ class GPTBridge:
     def _expert_export_mode(self, to_mcore: bool, is_mtp: bool):
         """Pick the one-shot expert export that can build this layer, else ``None``.
 
-        ``'views'`` slices the gathered buffer (one HF key per expert); ``'stacked'`` converts
-        each rank's own shard first, then gathers into the stacked HF layout. Excluded: FP8 /
+        ``'ungrouped'`` slices the gathered buffer (one HF key per expert); ``'grouped'`` converts
+        each rank's own shard first, then gathers into the grouped HF layout. Excluded: FP8 /
         NVFP4 packed params, PEFT deltas, CPU export, MTP layers, and expert bias with ETP>1
         (Megatron rejects that combination at config time).
         """
@@ -309,12 +309,12 @@ class GPTBridge:
             return None
         hf_grouped, is_gate_up = self._get_hf_experts_attr(is_mtp)
         if hf_grouped and is_gate_up:
-            return 'stacked'
+            return 'grouped'
         if not hf_grouped and not is_gate_up and not self.config.add_bias_linear:
-            return 'views'
+            return 'ungrouped'
         return None
 
-    def _export_experts_direct(self, mg_experts):
+    def _export_experts_ungrouped(self, mg_experts):
         """Export all routed experts with one collective and no per-expert copy.
 
         Megatron keeps each local expert in its own parameter, so the local concat is
@@ -335,13 +335,13 @@ class GPTBridge:
             out[f'experts.{expert}.down_proj.weight'] = fc2[expert]
         return out
 
-    def _export_experts_stacked(self, mg_experts):
-        """Export the stacked HF expert tensors; each rank converts its own shard first."""
+    def _export_experts_grouped(self, mg_experts):
+        """Export the grouped HF expert tensors; each rank converts its own shard first."""
         out = {
             'experts.gate_up_proj':
-            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc1', stacked=True)),
+            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc1', grouped=True)),
             'experts.down_proj':
-            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc2', stacked=True)),
+            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc2', grouped=True)),
         }
         if self.config.add_bias_linear:
             out['experts.gate_up_proj_bias'] = self._share_experts_across_pp(
@@ -353,11 +353,11 @@ class GPTBridge:
             return {}
         return out
 
-    def _gather_expert_tensor(self, mg_experts, mg_key: str, stacked: bool = False):
+    def _gather_expert_tensor(self, mg_experts, mg_key: str, grouped: bool = False):
         """All experts of one linear, gathered across ETP then EP.
 
         Returns ``None`` on a pipeline stage that does not own the layer; the caller then
-        receives the owning stage's tensor. ``stacked`` applies the HF layout conversion
+        receives the owning stage's tensor. ``grouped`` applies the HF layout conversion
         (transpose, gpt_oss gate/up interleave) before the EP gather, so the gather output is
         the final tensor rather than a full-size intermediate.
         """
@@ -377,7 +377,7 @@ class GPTBridge:
                 local = local.view(2 * num_local, -1, local.shape[-1])
             local = self._all_gather_tp(local, 1, is_expert=True)
         local = local.view(num_local, -1, local.shape[-1])
-        if stacked:
+        if grouped:
             if self._get_need_transpose():
                 local = local.transpose(1, 2)
             local = local.contiguous()
@@ -988,10 +988,10 @@ class GPTBridge:
                                      to_mcore)
         mode = self._expert_export_mode(to_mcore, is_mtp)
         mg_experts = None if mg_mlp is None else mg_mlp.experts
-        if mode == 'views':
-            hf_state_dict.update(self._export_experts_direct(mg_experts))
-        elif mode == 'stacked':
-            hf_state_dict.update(self._export_experts_stacked(mg_experts))
+        if mode == 'ungrouped':
+            hf_state_dict.update(self._export_experts_ungrouped(mg_experts))
+        elif mode == 'grouped':
+            hf_state_dict.update(self._export_experts_grouped(mg_experts))
         else:
             for ep_rank in range(self.ep_size):
                 mg_experts = None if mg_mlp is None else mg_mlp.experts

@@ -1,16 +1,24 @@
 """Parity tests for the MoE expert-export fast paths in ``gpt_bridge``.
 
 ``_store_ep_shard`` replaces the O(ep_size^2) accumulate-then-concat of the grouped HF layout, and
-the one-shot gathers in ``_export_experts_direct`` / ``_export_experts_stacked`` replace the
+the one-shot gathers in ``_export_experts_ungrouped`` / ``_export_experts_grouped`` replace the
 per-EP-rank broadcast plus per-expert clone. All of them must stay bit-identical to the paths they
 replace, including under pipeline / expert-tensor parallelism.
+
+Each topology needs its own world size, so the parallel case is selected by env and run once per
+size:
+
+    MOE_EXPORT_TOPOLOGY=pp2     torchrun --nproc_per_node=2 -m pytest tests/test_moe_expert_export.py -k parallel
+    MOE_EXPORT_TOPOLOGY=ep2     torchrun --nproc_per_node=2 -m pytest tests/test_moe_expert_export.py -k parallel
+    MOE_EXPORT_TOPOLOGY=etp2    torchrun --nproc_per_node=2 -m pytest tests/test_moe_expert_export.py -k parallel
+    MOE_EXPORT_TOPOLOGY=pp2ep2  torchrun --nproc_per_node=4 -m pytest tests/test_moe_expert_export.py -k parallel
+    MOE_EXPORT_TOPOLOGY=etp2ep2 torchrun --nproc_per_node=4 -m pytest tests/test_moe_expert_export.py -k parallel
 """
 
 import os
-import uuid
-
 import pytest
 import torch
+import uuid
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required')
 
@@ -153,16 +161,16 @@ def test_store_ep_shard_writes_slots_in_ep_order():
     assert torch.equal(state['w'], torch.concat(shards, dim=0))
 
 
-def test_direct_expert_export_matches_legacy_path():
-    """One all-gather plus views must equal the per-EP broadcast plus per-expert clone."""
+def test_ungrouped_expert_export_matches_legacy_path():
+    """One all-gather plus per-expert views must equal the broadcast plus per-expert clone."""
     _init_parallel()
-    _assert_fast_matches_legacy(False, 'views')
+    _assert_fast_matches_legacy(False, 'ungrouped')
 
 
-def test_stacked_expert_export_matches_legacy_path():
-    """The stacked layout (transpose + gpt_oss interleave before the gather) must match too."""
+def test_grouped_expert_export_matches_legacy_path():
+    """The grouped layout (transpose + gpt_oss interleave before the gather) must match too."""
     _init_parallel()
-    _assert_fast_matches_legacy(True, 'stacked')
+    _assert_fast_matches_legacy(True, 'grouped')
 
 
 def test_packed_param_formats_take_the_legacy_path():
@@ -172,14 +180,14 @@ def test_packed_param_formats_take_the_legacy_path():
     bridge = config.bridge
     if not hasattr(config, 'fp4_param'):
         pytest.skip('this megatron build has no fp4_param')
-    assert bridge._expert_export_mode(False, False) == 'views'
+    assert bridge._expert_export_mode(False, False) == 'ungrouped'
 
     config.fp4_param = True
     try:
         assert bridge._expert_export_mode(False, False) is None
     finally:
         config.fp4_param = False
-    assert bridge._expert_export_mode(False, False) == 'views'
+    assert bridge._expert_export_mode(False, False) == 'ungrouped'
 
 
 def test_parallel_expert_export_matches_legacy_path():
@@ -187,10 +195,10 @@ def test_parallel_expert_export_matches_legacy_path():
     topology = os.environ.get('MOE_EXPORT_TOPOLOGY', 'pp2')
     tp, pp, ep, etp = PARALLEL_CASES[topology]
     _init_parallel(tp, pp, ep, etp)
-    _assert_fast_matches_legacy(False, 'views', tp=tp, pp=pp, ep=ep, etp=etp)
-    # stacked covers gpt_oss (bias + interleave) and, with etp>1, the llama4-style layout
+    _assert_fast_matches_legacy(False, 'ungrouped', tp=tp, pp=pp, ep=ep, etp=etp)
+    # grouped covers gpt_oss (bias + interleave) and, with etp>1, the llama4-style layout
     # (grouped without bias) that expert-TP sharding keeps on the fast path.
-    _assert_fast_matches_legacy(True, 'stacked', bias=etp == 1, tp=tp, pp=pp, ep=ep, etp=etp)
+    _assert_fast_matches_legacy(True, 'grouped', bias=etp == 1, tp=tp, pp=pp, ep=ep, etp=etp)
 
 
 def test_save_weights_grouped_matches_export(tmp_path):
