@@ -66,8 +66,16 @@ class Glm4MLP(MLP):
         """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
+        # post_mlp_layernorm is a TENorm (no sharded_state_dict of its own), so it falls through to
+        # make_sharded_tensors_for_checkpoint. That helper only resolves a default tp_group when BOTH
+        # tp_group and dp_cp_group are None; here metadata already carries dp_cp_group, so an omitted
+        # tp_group stays None and get_pg_rank(None)==0 on every TP rank -> identical replica_id ->
+        # duplicate sharding at save time under TP>1. Pass the module's TP group explicitly, exactly
+        # as SelfAttention.sharded_state_dict does for post_self_attn_layernorm.
+        tp_group = self.tp_group
         for name, module in self._modules.items():
-            sub_sd = sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(module, f'{prefix}{name}.', sharded_offsets, metadata,
+                                                tp_group=tp_group)
             if self.config.gated_linear_unit and name == 'linear_fc1':
                 for k, v in sub_sd.items():
                     if k in (f'{prefix}{name}.weight', f'{prefix}{name}.bias'):
