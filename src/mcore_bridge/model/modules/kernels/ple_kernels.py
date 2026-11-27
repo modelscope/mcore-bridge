@@ -18,6 +18,28 @@ try:
 except Exception:  # pragma: no cover - triton absent
     HAVE_TRITON = False
 
+# Bound the three FP32 gate-gradient partials; norm-weight reduction needs two
+# such tiles. Required input/output gradients are not included in this budget.
+_PLE_BACKWARD_WORKSPACE_BYTES = 64 * 1024 * 1024
+
+
+def _ple_backward_chunk_rows(width):
+    return max(1, _PLE_BACKWARD_WORKSPACE_BYTES // max(1, 3 * width * 4))
+
+
+def _ple_norm_weight_gradient(gated, dnormed, rstd, groups, dtype):
+    """Accumulate the norm weight gradient without a token-sized FP32 product."""
+    total, width = gated.shape
+    channels = width // groups
+    gradient = torch.zeros(width, dtype=torch.float32, device=gated.device)
+    chunk = _ple_backward_chunk_rows(width)
+    for start in range(0, total, chunk):
+        end = min(start + chunk, total)
+        normalized = gated[start:end].reshape(-1, groups, channels) * rstd[start:end].unsqueeze(-1)
+        gradient.add_((dnormed[start:end] * normalized.flatten(-2)).sum(dim=0))
+    return gradient.to(dtype)
+
+
 if HAVE_TRITON:
 
     @triton.jit
@@ -477,46 +499,52 @@ if HAVE_TRITON:
             # The convolution backward has consumed the recomputed norm output.
             del normed
 
-            # norm_conv backward: dwc on host, dx via kernel (fp32).
-            x_hat = (gated.view(T, n, C) * rstdc.unsqueeze(-1)).view(T, W)
-            dwc = (dnormed * x_hat).sum(dim=0).to(wc.dtype)
-            del x_hat
-            dgated_norm = torch.empty(T, W, dtype=torch.float32, device=dev)
+            dwc = _ple_norm_weight_gradient(gated, dnormed, rstdc, n, wc.dtype)
             if T > 0:
-                _ple_norm_bwd_kernel[(T * n, )](gated, wc, rstdc, dnormed, dgated_norm, T, N=n, C=C, BLOCK_C=block_c)
-            dgated += dgated_norm
-            # Release token-sized FP32 temporaries before gate gradient buffers.
-            del gated, dnormed, dgated_norm
+                # Each program owns one token/group and reads its whole input
+                # row before writing, so the norm input gradient can reuse it.
+                _ple_norm_bwd_kernel[(T * n, )](gated, wc, rstdc, dnormed, dnormed, T, N=n, C=C, BLOCK_C=block_c)
+            dgated += dnormed
+            del gated, dnormed
 
             dkey = torch.empty_like(key)
             dquery = torch.empty_like(hc_state)
-            dvalue_pern = torch.empty(T, n, C, dtype=torch.float32, device=dev)
-            dwk_part = torch.empty(T, W, dtype=torch.float32, device=dev)
-            dwq_part = torch.empty(T, W, dtype=torch.float32, device=dev)
-            if T > 0:
-                _ple_gate_bwd_kernel[(T * n, )](
-                    dgated,
-                    key,
-                    hc_state,
-                    value,
+            dvalue = torch.empty_like(value)
+            dwk = torch.zeros_like(wk, dtype=torch.float32)
+            dwq = torch.zeros_like(wq, dtype=torch.float32)
+            chunk = _ple_backward_chunk_rows(W)
+            for start in range(0, T, chunk):
+                end = min(start + chunk, T)
+                rows = end - start
+                dvalue_pern = torch.empty(rows, n, C, dtype=torch.float32, device=dev)
+                dwk_part = torch.empty(rows, W, dtype=torch.float32, device=dev)
+                dwq_part = torch.empty(rows, W, dtype=torch.float32, device=dev)
+                _ple_gate_bwd_kernel[(rows * n, )](
+                    dgated[start:end],
+                    key[start:end],
+                    hc_state[start:end],
+                    value[start:end],
                     wk,
                     wq,
-                    gate,
-                    rstdk,
-                    rstdq,
-                    dkey,
-                    dquery,
+                    gate[start:end],
+                    rstdk[start:end],
+                    rstdq[start:end],
+                    dkey[start:end],
+                    dquery[start:end],
                     dvalue_pern,
                     dwk_part,
                     dwq_part,
-                    T,
+                    rows,
                     N=n,
                     C=C,
                     SQRTC=_math.sqrt(C),
                     BLOCK_C=block_c)
-            dvalue = dvalue_pern.sum(dim=1).to(value.dtype)
-            dwk = dwk_part.sum(dim=0).to(wk.dtype)
-            dwq = dwq_part.sum(dim=0).to(wq.dtype)
+                dvalue[start:end] = dvalue_pern.sum(dim=1).to(value.dtype)
+                dwk.add_(dwk_part.sum(dim=0))
+                dwq.add_(dwq_part.sum(dim=0))
+                del dvalue_pern, dwk_part, dwq_part
+            dwk = dwk.to(wk.dtype)
+            dwq = dwq.to(wq.dtype)
             dconv_w = dconvw.view(convw2d.shape).view(W, 1, Kk).to(conv_w_dtype)
 
             return (dquery, dkey, dvalue, dwk, dwq, dwc, dconv_w, None, None, None, None)
