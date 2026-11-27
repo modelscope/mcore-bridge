@@ -2,6 +2,7 @@
 import json
 import os
 from functools import partial
+from pathlib import Path
 from safetensors.torch import safe_open, save_file
 from typing import Literal
 
@@ -118,8 +119,18 @@ class StreamingSafetensorSaver:
         self.weight_map = {}
         self.is_save_rank = is_master() if save_rank == 'master' else is_last_rank()
         self.peft_format = peft_format
+        self._previous_export_files = set()
         if self.is_save_rank:
             os.makedirs(save_dir, exist_ok=True)
+            if not self.peft_format:
+                # A sharded export written by an earlier run may still be in this
+                # directory. safetensors loaders prefer the index file over
+                # `model.safetensors`, so leftovers from a larger export would keep
+                # being read after a re-export that fits in fewer shards.
+                index_path = Path(save_dir) / 'model.safetensors.index.json'
+                self._previous_export_files = set(Path(save_dir).glob('model*.safetensors'))
+                if index_path.exists():
+                    self._previous_export_files.add(index_path)
 
     def add_tensor(self, name, tensor):
         if not self.is_save_rank:
@@ -158,6 +169,25 @@ class StreamingSafetensorSaver:
         if self.peft_format:
             return
         total_shards = self.shard_index - 1
+
+        # Drop files of the previous export in this directory that this save does
+        # not overwrite. Loaders prefer `model.safetensors.index.json` over
+        # `model.safetensors`, so a leftover sharded export would keep being read
+        # after a re-export that fits in fewer shards.
+        if total_shards > 1:
+            current_files = {
+                Path(self.save_dir) / f'model-{i:05d}-of-{total_shards:05d}.safetensors'
+                for i in range(1, total_shards + 1)
+            }
+            current_files.add(Path(self.save_dir) / 'model.safetensors.index.json')
+        elif total_shards == 1:
+            current_files = {Path(self.save_dir) / 'model.safetensors'}
+        else:
+            # Nothing was written; leave a previous export in place untouched.
+            return
+        for stale_path in self._previous_export_files - current_files:
+            stale_path.unlink(missing_ok=True)
+
         # rename `?????`
         for i in range(1, total_shards + 1):
             old_path = os.path.join(self.save_dir, f'model-{i:05d}-of-?????.safetensors')
@@ -167,7 +197,7 @@ class StreamingSafetensorSaver:
                 new_name = f'model-{i:05d}-of-{total_shards:05d}.safetensors'
             new_path = os.path.join(self.save_dir, new_name)
             if os.path.exists(old_path):
-                os.rename(old_path, new_path)
+                os.replace(old_path, new_path)
 
         if total_shards > 1:
             updated_weight_map = {}
