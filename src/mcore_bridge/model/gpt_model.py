@@ -28,7 +28,7 @@ from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 
 from mcore_bridge.config import ModelConfig
-from mcore_bridge.utils import get_logger, roll_tensor, split_cp_inputs
+from mcore_bridge.utils import get_logger, roll_tensor
 from .rope import dynamic_rope_update, get_rope_inv_freq
 
 logger = get_logger()
@@ -346,8 +346,12 @@ class GPTModel(McoreGPTModel):
         if full_attention_mask is not None:
             assert packed_seq_params is None
             padding_mask = full_attention_mask.all(dim=(1, 2))
-            if self.config.context_parallel_size > 1:
-                padding_mask = split_cp_inputs(padding_mask, None, 1)
+            # The dense mask arrives ALREADY CP-sharded: the data pipeline (twinkle
+            # InputProcessor.split_cp, 33cfa33e) cuts it with the same zigzag on the query and key
+            # axis as input_ids, so padding_mask derived from it is CP-local too. Re-splitting it
+            # here (the dd87143-era cut, added when the pipeline still delivered a full mask) is a
+            # DOUBLE split: it halves an already-local sequence and crashes whenever the local
+            # length is not itself divisible by 2*cp (e.g. full 44 -> local 22 -> view [2,4,5]).
             tp_size = self.config.tensor_model_parallel_size
             if self.config.sequence_parallel and tp_size > 1:
                 assert padding_mask.shape[1] % tp_size == 0, f'padding_mask.shape: {padding_mask.shape}'
