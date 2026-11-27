@@ -18,6 +18,7 @@ class LLMModelType:
 
 
 class MLLMModelType:
+    inkling2_loop = 'inkling2_loop'
     qwen2_vl = 'qwen2_vl'
     qwen2_5_vl = 'qwen2_5_vl'
     qwen3_vl = 'qwen3_vl'

@@ -464,6 +464,27 @@ def hf_to_mcore_config(hf_config: PretrainedConfig) -> Dict[str, Any]:
         if _missing:
             raise ValueError(f'qwen4_exp config is missing required fields: {_missing}. '
                              'They must be provided by the model config.json.')
+    elif hf_model_type == 'inkling2_loop':
+        text_config = hf_config.text_config
+        res.update(
+            position_embedding_type='none',
+            max_position_embeddings=text_config.max_position_embeddings,
+            add_qkv_bias=False,
+            add_bias_linear=False,
+            qk_layernorm=False,
+            moe_ffn_hidden_size=text_config.moe_intermediate_size,
+            num_moe_experts=text_config.n_routed_experts,
+            moe_router_topk=text_config.num_experts_per_tok,
+            moe_router_score_function='sigmoid',
+            moe_router_topk_scaling_factor=text_config.route_scale,
+            moe_router_enable_expert_bias=False,
+            moe_router_load_balancing_type='none',
+            moe_shared_expert_intermediate_size=None,
+            use_te_activation_func=True,
+            inkling_loop_start=text_config.loop_layer_index_start,
+            inkling_loop_end=text_config.loop_layer_index_end,
+            inkling_loop_num_passes=text_config.loop_num_passes,
+        )
     elif llm_model_type == 'minimax_m2':
         res['add_qkv_bias'] = False
     elif llm_model_type == 'olmoe':
