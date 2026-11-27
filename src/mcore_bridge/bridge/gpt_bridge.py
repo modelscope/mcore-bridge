@@ -266,6 +266,162 @@ class GPTBridge:
         except ImportError:
             return False
 
+    def _reduce_lora_flag(self, is_lora: bool, is_expert: bool = False) -> bool:
+        if not self._peft_format:
+            return False
+        is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
+        if is_expert and self.ep_pp_size > 1:
+            dist.all_reduce(is_lora, group=self.ep_pp_group)
+        elif not is_expert and self.pp_size > 1:
+            dist.all_reduce(is_lora, group=self.pp_group)
+        return bool(is_lora.item())
+
+    def _store_ep_shard(self, hf_state_dict, key: str, shard: torch.Tensor, ep_rank: int):
+        """Write one EP shard into its slot of the layer tensor, allocated on first use.
+
+        ``torch.concat`` cannot grow in place, so accumulating shards re-copies every earlier
+        one each round; slots make it one copy per shard.
+        """
+        rows = shard.shape[0]
+        slot = hf_state_dict.get(key)
+        if slot is None:
+            slot = hf_state_dict[key] = shard.new_empty((rows * self.ep_size, *shard.shape[1:]))
+        assert slot.shape[1:] == shard.shape[1:], f'{key}: EP shards disagree on shape {shard.shape}'
+        slot[ep_rank * rows:(ep_rank + 1) * rows].copy_(shard)
+
+    def _expert_export_mode(self, to_mcore: bool, is_mtp: bool):
+        """Pick the one-shot expert export that can build this layer, else ``None``.
+
+        ``'ungrouped'`` slices the gathered buffer (one HF key per expert); ``'grouped'`` converts
+        each rank's own shard first, then gathers into the grouped HF layout. Excluded: FP8 /
+        NVFP4 packed params, PEFT deltas, CPU export, MTP layers, and expert bias with ETP>1
+        (Megatron rejects that combination at config time).
+        """
+        if to_mcore or is_mtp or self._peft_format or self._target_device is not None:
+            return None
+        # fp4_param is absent on older megatron builds. NVFP4 experts must be dequantized per
+        # shard inside _get_weight first, and this path reads the packed parameters directly.
+        if (self.config.num_moe_experts is None or self.config.fp8_param or getattr(self.config, 'fp4_param', False)):
+            return None
+        if self.config.add_bias_linear and self.etp_size > 1:
+            # Megatron rejects this combination at config time ("Bias in Moe is only supported
+            # when ETP==1"); kept so the gate stays explicit if that ever changes.
+            return None
+        hf_grouped, is_gate_up = self._get_hf_experts_attr(is_mtp)
+        if hf_grouped and is_gate_up:
+            return 'grouped'
+        if not hf_grouped and not is_gate_up and not self.config.add_bias_linear:
+            return 'ungrouped'
+        return None
+
+    def _export_experts_ungrouped(self, mg_experts):
+        """Export all routed experts with one collective and no per-expert copy.
+
+        Megatron keeps each local expert in its own parameter, so the local concat is
+        unavoidable; everything after the gather is a view into the layer buffer.
+        """
+        num_experts = self.config.num_moe_experts
+        fc1 = self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc1'))
+        fc2 = self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc2'))
+        assert fc1 is not None and fc2 is not None, 'the owning stage must hold the layer when pp=1'
+        if self._only_master_rank and not is_master():
+            return {}
+        fc1 = fc1.view(num_experts, 2, -1, fc1.shape[-1])
+        fc2 = fc2.view(num_experts, -1, fc2.shape[-1])
+        out = {}
+        for expert in range(num_experts):
+            out[f'experts.{expert}.gate_proj.weight'] = fc1[expert, 0]
+            out[f'experts.{expert}.up_proj.weight'] = fc1[expert, 1]
+            out[f'experts.{expert}.down_proj.weight'] = fc2[expert]
+        return out
+
+    def _export_experts_grouped(self, mg_experts):
+        """Export the grouped HF expert tensors; each rank converts its own shard first."""
+        out = {
+            'experts.gate_up_proj':
+            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc1', grouped=True)),
+            'experts.down_proj':
+            self._share_experts_across_pp(self._gather_expert_tensor(mg_experts, 'linear_fc2', grouped=True)),
+        }
+        if self.config.add_bias_linear:
+            out['experts.gate_up_proj_bias'] = self._share_experts_across_pp(
+                self._gather_expert_bias(mg_experts, 'linear_fc1', gate_up=True))
+            out['experts.down_proj_bias'] = self._share_experts_across_pp(
+                self._gather_expert_bias(mg_experts, 'linear_fc2', gate_up=False))
+        assert all(value is not None for value in out.values()), 'the owning stage must hold the layer when pp=1'
+        if self._only_master_rank and not is_master():
+            return {}
+        return out
+
+    def _gather_expert_tensor(self, mg_experts, mg_key: str, grouped: bool = False):
+        """All experts of one linear, gathered across ETP then EP.
+
+        Returns ``None`` on a pipeline stage that does not own the layer; the caller then
+        receives the owning stage's tensor. ``grouped`` applies the HF layout conversion
+        (transpose, gpt_oss gate/up interleave) before the EP gather, so the gather output is
+        the final tensor rather than a full-size intermediate.
+        """
+        if mg_experts is None:
+            return None
+        num_local = self.config.num_moe_experts // self.ep_size
+        linear = getattr(mg_experts, mg_key)
+        if isinstance(linear, LoraParallelLinear):
+            linear = linear.base_layer
+        weight0 = getattr(linear, 'weight0')
+        is_nvfp4 = getattr(self, '_is_nvfp4_param', None)  # defined only on the NVFP4 branch
+        assert not (self._is_fp8_param(weight0) or (is_nvfp4 is not None and is_nvfp4(weight0))), \
+            f'{mg_key}: packed expert params need the legacy path'
+        local = torch.concat([getattr(linear, f'weight{i}').data for i in range(num_local)], dim=0)
+        if self.etp_size > 1:
+            if mg_key == 'linear_fc1':
+                local = local.view(2 * num_local, -1, local.shape[-1])
+            local = self._all_gather_tp(local, 1, is_expert=True)
+        local = local.view(num_local, -1, local.shape[-1])
+        if grouped:
+            if self._get_need_transpose():
+                local = local.transpose(1, 2)
+            local = local.contiguous()
+            if self.llm_model_type == 'gpt_oss' and mg_key == 'linear_fc1':
+                local = self._interleave_gate_up(local)
+        if self.ep_size == 1:
+            return local
+        gathered = local.new_empty((self.config.num_moe_experts, *local.shape[1:]))
+        dist.all_gather_into_tensor(gathered, local, group=self.ep_group)
+        return gathered
+
+    def _gather_expert_bias(self, mg_experts, mg_key: str, gate_up: bool):
+        """Expert bias counterpart of ``_gather_expert_tensor`` (ETP-sharded bias is excluded)."""
+        if mg_experts is None:
+            return None
+        num_local = self.config.num_moe_experts // self.ep_size
+        linear = getattr(mg_experts, mg_key)
+        if isinstance(linear, LoraParallelLinear):
+            linear = linear.base_layer
+        local = torch.concat([getattr(linear, f'bias{i}').data for i in range(num_local)], dim=0)
+        local = local.view(num_local, -1)
+        if gate_up and self.llm_model_type == 'gpt_oss':
+            local = self._interleave_gate_up(local)
+        if self.ep_size == 1:
+            return local
+        gathered = local.new_empty((self.config.num_moe_experts, *local.shape[1:]))
+        dist.all_gather_into_tensor(gathered, local, group=self.ep_group)
+        return gathered
+
+    def _share_experts_across_pp(self, tensor):
+        """Ship the owning stage's expert tensor to the rest (every rank yields every layer)."""
+        if self.pp_size == 1:
+            return tensor
+        return self._broadcast_ep_pp(tensor, is_expert=False)
+
+    @staticmethod
+    def _interleave_gate_up(tensor: torch.Tensor) -> torch.Tensor:
+        """Turn stacked ``[gate; up]`` into the alternating layout gpt_oss checkpoints use."""
+        gate, up = tensor.chunk(2, dim=-1)
+        out = torch.empty_like(tensor)
+        out[..., ::2] = gate
+        out[..., 1::2] = up
+        return out
+
     def _set_module(self, mg_module, hf_state_dict, hf_prefix: str, to_mcore: bool):
         if to_mcore:
             if mg_module is None:
@@ -703,11 +859,8 @@ class GPTBridge:
             kv_dim = kv_channels
             q_block = q_dim // self.fp8_block_size
             kv_block = kv_dim // self.fp8_block_size
-            is_lora = False if mg_attn is None else isinstance(mg_attn.linear_qkv,
-                                                               LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-            if self.pp_size > 1:
-                dist.all_reduce(is_lora, group=self.pp_group)
+            is_lora = self._reduce_lora_flag(False if mg_attn is
+                                             None else isinstance(mg_attn.linear_qkv, LoraParallelLinear))
             if is_lora:
                 lora_A, _ = self._get_weight(
                     None if mg_attn is None else mg_attn.linear_qkv.lora_A[self._adapter_name].weight.data,
@@ -833,24 +986,31 @@ class GPTBridge:
             if self.config.moe_shared_expert_gate:
                 self._set_state_dict(mg_mlp, 'shared_experts.gate_weight', hf_state_dict, 'shared_expert_gate.weight',
                                      to_mcore)
-        for ep_rank in range(self.ep_size):
-            mg_experts = None if mg_mlp is None else mg_mlp.experts
-            expert_available = ep_rank == self.ep_rank
-            if not expert_available:
-                if to_mcore:
-                    continue
-                else:
-                    mg_experts = None
-            hf_state_dict.update(
-                self._set_mlp_state(
-                    mg_experts,
-                    hf_state_dict,
-                    'experts.',
-                    layer_idx,
-                    to_mcore,
-                    ep_rank=ep_rank,
-                    is_mtp=is_mtp,
-                ))
+        mode = self._expert_export_mode(to_mcore, is_mtp)
+        mg_experts = None if mg_mlp is None else mg_mlp.experts
+        if mode == 'ungrouped':
+            hf_state_dict.update(self._export_experts_ungrouped(mg_experts))
+        elif mode == 'grouped':
+            hf_state_dict.update(self._export_experts_grouped(mg_experts))
+        else:
+            for ep_rank in range(self.ep_size):
+                mg_experts = None if mg_mlp is None else mg_mlp.experts
+                expert_available = ep_rank == self.ep_rank
+                if not expert_available:
+                    if to_mcore:
+                        continue
+                    else:
+                        mg_experts = None
+                hf_state_dict.update(
+                    self._set_mlp_state(
+                        mg_experts,
+                        hf_state_dict,
+                        'experts.',
+                        layer_idx,
+                        to_mcore,
+                        ep_rank=ep_rank,
+                        is_mtp=is_mtp,
+                    ))
         if to_mcore:
             hf_state_dict = {}
         else:
@@ -1072,13 +1232,8 @@ class GPTBridge:
                     self._set_weight(
                         fc1_bias, gate_up_proj_bias, 'linear_fc1.bias', is_expert=is_expert, hf_scale_inv=None)
         else:
-            is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc1,
-                                                              LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-            if is_expert and self.ep_pp_size > 1:
-                dist.all_reduce(is_lora, group=self.ep_pp_group)
-            elif not is_expert and self.pp_size > 1:
-                dist.all_reduce(is_lora, group=self.pp_group)
+            is_lora = self._reduce_lora_flag(
+                False if mg_mlp is None else isinstance(mg_mlp.linear_fc1, LoraParallelLinear), is_expert=is_expert)
             if is_lora:
                 if hf_grouped:
                     logger.warning_once(
@@ -1159,38 +1314,33 @@ class GPTBridge:
                             if hf_grouped:
                                 if need_transpose:
                                     gate_up_proj_weight = gate_up_proj_weight.transpose(1, 2)
-                                if 'gate_up_proj' in hf_state_dict:
-                                    gate_up_proj_weight = torch.concat(
-                                        [hf_state_dict['gate_up_proj'], gate_up_proj_weight], dim=0)
-                                is_last_ckpt = gate_up_proj_weight.shape[0] == config.num_moe_experts
+                                self._store_ep_shard(hf_state_dict, 'gate_up_proj', gate_up_proj_weight, ep_rank)
+                                is_last_ckpt = ((ep_rank + 1) * gate_up_proj_weight.shape[0] == config.num_moe_experts)
                                 if self.llm_model_type == 'gpt_oss' and is_last_ckpt:
-                                    gate_proj_weight, up_proj_weight = gate_up_proj_weight.chunk(2, dim=2)
-                                    new_gate_up_proj_weight = torch.empty_like(gate_up_proj_weight)
+                                    # Interleave gate/up along the last dim once the tensor is
+                                    # complete, exactly like the previous accumulate-then-interleave
+                                    # path, so the layout stays bit-identical.
+                                    gate_proj_weight, up_proj_weight = hf_state_dict['gate_up_proj'].chunk(2, dim=2)
+                                    new_gate_up_proj_weight = torch.empty_like(hf_state_dict['gate_up_proj'])
                                     new_gate_up_proj_weight[..., ::2] = gate_proj_weight
                                     new_gate_up_proj_weight[..., 1::2] = up_proj_weight
-                                    gate_up_proj_weight = new_gate_up_proj_weight
+                                    hf_state_dict['gate_up_proj'] = new_gate_up_proj_weight
                                     del new_gate_up_proj_weight, gate_proj_weight, up_proj_weight
-                                hf_state_dict['gate_up_proj'] = gate_up_proj_weight.clone()
                                 if scale_inv is not None:
                                     if need_transpose:
                                         scale_inv = scale_inv.transpose(1, 2)
-                                    if 'gate_up_proj_scale_inv' in hf_state_dict:
-                                        scale_inv = torch.concat([hf_state_dict['gate_up_proj_scale_inv'], scale_inv],
-                                                                 dim=0)
-                                    hf_state_dict['gate_up_proj_scale_inv'] = scale_inv.clone()
+                                    self._store_ep_shard(hf_state_dict, 'gate_up_proj_scale_inv', scale_inv, ep_rank)
 
                                 if gate_up_proj_bias is not None:
-                                    if 'gate_up_proj_bias' in hf_state_dict:
-                                        gate_up_proj_bias = torch.concat(
-                                            [hf_state_dict['gate_up_proj_bias'], gate_up_proj_bias], dim=0)
+                                    self._store_ep_shard(hf_state_dict, 'gate_up_proj_bias', gate_up_proj_bias, ep_rank)
                                     if self.llm_model_type == 'gpt_oss' and is_last_ckpt:
-                                        gate_proj_bias, up_proj_bias = gate_up_proj_bias.chunk(2, dim=1)
-                                        new_gate_up_proj_bias = torch.empty_like(gate_up_proj_bias)
+                                        gate_proj_bias, up_proj_bias = hf_state_dict['gate_up_proj_bias'].chunk(
+                                            2, dim=1)
+                                        new_gate_up_proj_bias = torch.empty_like(hf_state_dict['gate_up_proj_bias'])
                                         new_gate_up_proj_bias[:, ::2] = gate_proj_bias
                                         new_gate_up_proj_bias[:, 1::2] = up_proj_bias
-                                        gate_up_proj_bias = new_gate_up_proj_bias
+                                        hf_state_dict['gate_up_proj_bias'] = new_gate_up_proj_bias
                                         del new_gate_up_proj_bias, gate_proj_bias, up_proj_bias
-                                    hf_state_dict['gate_up_proj_bias'] = gate_up_proj_bias.clone()
                             else:
                                 for i in range(num_local_experts):
                                     hf_i = i + ep_rank * num_local_experts
@@ -1310,13 +1460,8 @@ class GPTBridge:
                         self._set_weight(
                             fc2_bias, down_proj_bias, 'linear_fc2.bias', is_expert=is_expert, hf_scale_inv=None)
             else:
-                is_lora = False if mg_mlp is None else isinstance(mg_mlp.linear_fc2,
-                                                                  LoraParallelLinear) and self._peft_format
-                is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-                if is_expert and self.ep_pp_size > 1:
-                    dist.all_reduce(is_lora, group=self.ep_pp_group)
-                elif not is_expert and self.pp_size > 1:
-                    dist.all_reduce(is_lora, group=self.pp_group)
+                is_lora = self._reduce_lora_flag(
+                    False if mg_mlp is None else isinstance(mg_mlp.linear_fc2, LoraParallelLinear), is_expert=is_expert)
                 if is_lora:
                     if hf_grouped:
                         logger.warning_once(
@@ -1365,20 +1510,13 @@ class GPTBridge:
                         if hf_grouped:
                             if need_transpose:
                                 down_proj_weight = down_proj_weight.transpose(1, 2)
-                            if 'down_proj' in hf_state_dict:
-                                down_proj_weight = torch.concat([hf_state_dict['down_proj'], down_proj_weight], dim=0)
-                            hf_state_dict['down_proj'] = down_proj_weight.clone()
+                            self._store_ep_shard(hf_state_dict, 'down_proj', down_proj_weight, ep_rank)
                             if scale_inv is not None:
                                 if need_transpose:
                                     scale_inv = scale_inv.transpose(1, 2)
-                                if 'down_proj_scale_inv' in hf_state_dict:
-                                    scale_inv = torch.concat([hf_state_dict['down_proj_scale_inv'], scale_inv], dim=0)
-                                hf_state_dict['down_proj_scale_inv'] = scale_inv.clone()
+                                self._store_ep_shard(hf_state_dict, 'down_proj_scale_inv', scale_inv, ep_rank)
                             if config.add_bias_linear:
-                                if 'down_proj_bias' in hf_state_dict:
-                                    down_proj_bias = torch.concat([hf_state_dict['down_proj_bias'], down_proj_bias],
-                                                                  dim=0)
-                                hf_state_dict['down_proj_bias'] = down_proj_bias.clone()
+                                self._store_ep_shard(hf_state_dict, 'down_proj_bias', down_proj_bias, ep_rank)
                         else:
                             for i in range(num_local_experts):
                                 hf_i = i + ep_rank * num_local_experts
@@ -1459,11 +1597,8 @@ class GPTBridge:
                     mg_attn.in_proj_qkvz.weight, in_proj_weight, 'in_proj_qkvz.weight', hf_scale_inv=in_scale_inv)
         else:
             qkv_dim = key_dim * 2 + value_dim
-            is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj_qkvz,
-                                                               LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-            if self.pp_size > 1:
-                dist.all_reduce(is_lora, group=self.pp_group)
+            is_lora = self._reduce_lora_flag(False if mg_attn is
+                                             None else isinstance(mg_attn.in_proj_qkvz, LoraParallelLinear))
             if is_lora:
                 lora_A, _ = self._get_weight(
                     None if mg_attn is None else mg_attn.in_proj_qkvz.lora_A[self._adapter_name].weight.data,
@@ -1526,11 +1661,8 @@ class GPTBridge:
                 self._set_weight(mg_attn.in_proj_ba.weight, in_proj_weight, 'in_proj_ba.weight')
         else:
             a_dim = config.linear_num_value_heads // num_key_heads
-            is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj_ba,
-                                                               LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-            if self.pp_size > 1:
-                dist.all_reduce(is_lora, group=self.pp_group)
+            is_lora = self._reduce_lora_flag(False if mg_attn is
+                                             None else isinstance(mg_attn.in_proj_ba, LoraParallelLinear))
             if is_lora:
                 lora_A, _ = self._get_weight(
                     None if mg_attn is None else mg_attn.in_proj_ba.lora_A[self._adapter_name].weight.data,
@@ -1594,11 +1726,8 @@ class GPTBridge:
             qkv_dim = key_dim * 2 + value_dim
             z_dim = value_dim
             a_dim = config.linear_num_value_heads // num_key_heads
-            is_lora = False if mg_attn is None else isinstance(mg_attn.in_proj,
-                                                               LoraParallelLinear) and self._peft_format
-            is_lora = torch.tensor([is_lora], dtype=torch.bool, device='cuda')
-            if self.pp_size > 1:
-                dist.all_reduce(is_lora, group=self.pp_group)
+            is_lora = self._reduce_lora_flag(False if mg_attn is
+                                             None else isinstance(mg_attn.in_proj, LoraParallelLinear))
             if is_lora:
                 lora_A, _ = self._get_weight(
                     None if mg_attn is None else mg_attn.in_proj.lora_A[self._adapter_name].weight.data,
